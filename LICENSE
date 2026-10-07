@@ -1,0 +1,70 @@
+PROPRIETARY SOFTWARE LICENSE
+
+Copyright (c) 2026 NightLabs. All rights reserved.
+
+1. OWNERSHIP
+
+   This software, including all source code, configuration, templates,
+   documentation, and associated materials (the "Software"), is the
+   confidential and proprietary property of NightLabs ("Licensor"). The
+   Software is protected by copyright law and international treaty
+   provisions. Title, ownership rights, and all intellectual property rights
+   in and to the Software remain with Licensor at all times.
+
+2. NO LICENSE GRANTED
+
+   No license, express or implied, is granted by this document. No person or
+   entity may use, copy, reproduce, modify, adapt, merge, publish, distribute,
+   sublicense, sell, lease, transmit, display, perform, or create derivative
+   works from the Software, in whole or in part, without the prior written
+   permission of Licensor.
+
+3. CONFIDENTIALITY
+
+   The Software constitutes a trade secret of Licensor. Any person granted
+   access to the Software shall maintain it in strict confidence, shall not
+   disclose it to any third party, and shall use it solely for purposes
+   expressly authorized in writing by Licensor.
+
+4. NO REVERSE ENGINEERING
+
+   The Software may not be decompiled, disassembled, or reverse engineered,
+   nor may any attempt be made to derive its source code, structure, or
+   organization, except to the extent such restriction is expressly prohibited
+   by applicable law.
+
+5. THIRD-PARTY COMPONENTS
+
+   The Software interoperates with third-party software, including but not
+   limited to Ansible and its collections, Kubernetes, k3s, containerd,
+   Cilium, Longhorn, cert-manager, kube-vip, containerlab, clabernetes, and
+   the Helm charts and Python packages declared as dependencies. Such
+   components are not covered by this license and remain subject to the terms
+   of their respective licensors. Nothing in this document modifies those
+   terms.
+
+6. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. THE SOFTWARE
+   INSTALLS AND RECONFIGURES SYSTEM SOFTWARE AS ROOT, FORMATS DISKS, AND IS
+   BUILT FOR A LABORATORY ENVIRONMENT. IT MUST NOT BE RUN AGAINST PRODUCTION
+   SYSTEMS, AND NO CHANGE IT APPLIES MAY BE RELIED UPON WITHOUT INDEPENDENT
+   REVIEW.
+
+7. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+   FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE, INCLUDING WITHOUT LIMITATION ANY LOSS OF SERVICE,
+   LOSS OF DATA, OR SYSTEM OUTAGE.
+
+8. TERMINATION
+
+   Any authorization to access or use the Software terminates automatically
+   upon breach of any term of this license. Upon termination, all copies of
+   the Software must be destroyed.
+
+For licensing enquiries, contact NightLabs at licensing@nightlabs.io.

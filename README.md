@@ -122,3 +122,8 @@ without an image being re-tagged or a consumer edited.
 
 `docs/OPERATIONS.md` covers the prerequisites and how to run a target, and
 `docs/necropolis.md` walks through the cluster build phase by phase.
+
+## License
+
+Proprietary. Copyright (c) 2026 NightLabs. All rights reserved. No license is
+granted; see [`LICENSE`](LICENSE). Third-party components keep their own terms.

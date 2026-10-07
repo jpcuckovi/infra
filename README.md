@@ -43,6 +43,7 @@ roles/<capability>/  tasks/main.yml, tasks/verify.yml      how each capability i
 charts/values/       static Helm values                    workload requirements
 docs/ARCHITECTURE.md                                       decisions, with rejected alternatives
 docs/OPERATIONS.md                                         prerequisites and how to run a target
+docs/necropolis.md                                         how the kubeadm cluster is built, phase by phase
 ```
 
 **Roles are named for capabilities.** A host playbook lists the roles that
@@ -119,5 +120,5 @@ without an image being re-tagged or a consumer edited.
 | `roles/nut/tasks/verify.yml`                 | Gates that read through the protocol                                     |
 | `docs/ARCHITECTURE.md`                       | The decisions, each with what was rejected                               |
 
-`docs/OPERATIONS.md` covers the prerequisites and how to run a target. The
-cluster build plan is kept with the private source and is not published.
+`docs/OPERATIONS.md` covers the prerequisites and how to run a target, and
+`docs/necropolis.md` walks through the cluster build phase by phase.

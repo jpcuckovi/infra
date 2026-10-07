@@ -6,7 +6,7 @@
 #
 # Three phases are composed: prepared nodes with their Longhorn disks mounted
 # (host layer), one control plane formed across them (host layer), and the
-# addons that make it usable (cluster layer).
+# addons that make it usable (cluster layer). docs/necropolis.md describes each.
 #
 # This file declares WHAT necropolis composes. HOW the two layers run lives in
 # ../_layers.yml, stated once for the whole estate.

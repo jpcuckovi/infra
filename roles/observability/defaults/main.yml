@@ -1,0 +1,139 @@
+# Jaeger for traces, kube-prometheus-stack for metrics, and the discovery
+# contract that lets the agent repos find both.
+#
+# Absorbed from k8s-obs-stack. That repository's central claim — "neither repo
+# installs or owns any of it any more; this one does" — survives the move
+# unchanged, with this role as the single owner and single writer.
+---
+observability_namespace: observability
+
+# ---- what this host runs, versus what it sends elsewhere -------------------
+# All three default to true, so the shared services cluster — the host that
+# actually serves these to everyone — needs none of them set. A lab node that
+# reloads routinely turns them off in its own host_vars, with its own reason.
+#
+# The shape is deliberate: each guards a thing that should exist ONCE in the
+# estate, not once per cluster.
+
+# One Jaeger, on the durable box. templates/jaeger.yaml.j2 makes the argument —
+# "tracing must not compete for resources with the thing being traced, and a lab
+# node is redeployed often". A second instance also means traces for one system
+# split across two UIs by which machine happened to emit them.
+observability_jaeger_enabled: true
+
+# One Grafana, likewise. Every cluster's Prometheus remote-writes to the same
+# VictoriaMetrics carrying a unique `cluster` external label, and the shared
+# Grafana already has that store as its default datasource — so a second cluster
+# is visible there the moment it starts writing, filtered by that label, with no
+# second Grafana to log into and nothing to lose when the node is rebuilt.
+#
+# Rendered into the chart values as grafana.enabled. A host that sets this false
+# keeps prometheus-operator, Prometheus, node-exporter and kube-state-metrics;
+# its Prometheus UI stays on its NodePort for live debugging when remote-write
+# lag matters.
+observability_grafana_enabled: true
+
+# The two files under observability_config_dir carry no host in their names,
+# because they answer "where should an agent send telemetry" — one answer for
+# the estate, not one per machine. Exactly one host may write them; see the
+# comment above the tasks that do.
+observability_write_discovery_contract: true
+
+# Helm release name, and it matches the chart name on purpose.
+#
+# kube-prometheus-stack builds every resource name from Helm's fullname template,
+# which prefixes the release name UNLESS the release name already contains the
+# chart name. So `monitoring` produced monitoring-kube-prometheus-prometheus,
+# while this produces kube-prometheus-stack-prometheus — the same string
+# gpu-bench's harness already queries.
+#
+# The previous value was `monitoring`, defended by "if adopting an existing
+# install, use ITS name". That was true while phantom carried a k8s-obs-stack
+# release nobody wanted to recreate. Phantom was rebuilt from scratch, so helm
+# created that release because this file asked for it, not because anything was
+# being adopted — the condition that made the name unchangeable had quietly
+# stopped holding, and the name outlived its own reason.
+#
+# The original warning still stands and is why this is a default rather than
+# something to change casually: renaming a release renames every generated
+# resource and breaks any selector matching release=<old>. Changing it means
+# `helm uninstall` and a rebuild, plus deleting the StatefulSet's orphaned PVC by
+# hand. Adopting a genuinely pre-existing install still means using ITS name.
+observability_release: kube-prometheus-stack
+
+# ---- where this cluster ships its history ---------------------------------
+# Discriminated by group membership, never by hostname. The cluster that runs
+# the store writes to it over the in-cluster Service — shorter path, no
+# NodePort, no hairpin. Every other cluster reaches it through the CNAME.
+prometheus_remote_write_url: >-
+  {{ ('http://' ~ victoriametrics_name ~ '.' ~ victoriametrics_namespace
+      ~ '.svc:' ~ victoriametrics_port ~ '/api/v1/write')
+     if 'metrics_stores' in group_names
+     else ('http://' ~ metrics_alias ~ ':' ~ victoriametrics_node_port
+           ~ '/api/v1/write') }}
+
+# ---- local Prometheus ------------------------------------------------------
+# A scrape buffer, not an archive. Sized for the retention window rather than
+# for history, which lives in VictoriaMetrics.
+prometheus_retention: 24h
+prometheus_retention_size: 15GB
+prometheus_storage_size: 20Gi
+
+# The class Prometheus's volume is provisioned from. local-path is what every
+# k3s host in this estate has, and it is the right default for a scrape buffer:
+# the data is disposable and node-local storage is the cheapest way to hold it.
+#
+# Overridden per host where a cluster was built elsewhere and adopted, because a
+# StatefulSet's volume claim cannot be changed in place. Declaring the wrong
+# class there is not drift that reconciles on the next run — it is a helm
+# upgrade that fails, or an operator that deletes and recreates the StatefulSet
+# underneath a running Prometheus.
+prometheus_storage_class: local-path
+
+prometheus_resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+prometheus_operator_resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+
+grafana_resources:
+  requests:
+    cpu: 50m
+    # Matched to the ~300Mi steady state. A request set well below actual usage
+    # is not conservative — it makes the scheduler under-count the pod and
+    # overcommit a node that has little to spare.
+    memory: 256Mi
+  limits:
+    # Grafana's steady state is ~300Mi with the two dashboard sidecars, so the
+    # chart's 256Mi default is already below normal operation — an OOMKill
+    # waiting for the next dashboard load rather than a tuning nicety.
+    memory: 512Mi
+
+# ---- Jaeger ----------------------------------------------------------------
+jaeger_storage_size: 20Gi
+jaeger_resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    # Badger memory-maps its store, so this is more generous than an in-memory
+    # configuration would need.
+    memory: 1500Mi
+
+# ---- the discovery contract ------------------------------------------------
+# Written on the WORKSTATION, because the readers are agent repos running there.
+# This role is the only writer of these two files.
+observability_config_dir: "{{ lookup('env', 'XDG_CONFIG_HOME') | default(lookup('env', 'HOME') ~ '/.config', true) }}/diag-agents"
+
+# Where the rendered per-host values overlay is written before helm is handed
+# it. Inside the repo's gitignored .ansible/ rather than a temp file: when a
+# chart install fails on a values problem, the exact file helm received is the
+# first thing worth reading, and a deleted tempfile cannot be.
+observability_render_dir: "{{ role_path }}/../../.ansible"
+observability_values_render_path: "{{ observability_render_dir }}/host-values-{{ inventory_hostname }}.yaml"

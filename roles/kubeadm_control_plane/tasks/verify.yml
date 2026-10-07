@@ -1,0 +1,206 @@
+# Gates for the control plane.
+#
+# Per node: membership, kube-vip on admin credentials rather than super-admin.
+# Once, through the API: every node registered as a control plane and
+# schedulable, etcd at full membership, the VIP lease held, no kubelet serving
+# request left pending — and the API reachable from the workstation by NAME,
+# which proves the certificate SAN and the DNS record together.
+#
+# Nodes are expected NotReady until the cluster layer installs a CNI, so
+# readiness is deliberately not a gate here.
+---
+- name: Check for this node's cluster membership
+  ansible.builtin.stat:
+    path: "{{ kubeadm_control_plane_kubelet_conf }}"
+  register: kubeadm_control_plane_member
+
+- name: Assert this node is a member
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_member.stat.exists
+    fail_msg: >-
+      {{ inventory_hostname }} has no {{ kubeadm_control_plane_kubelet_conf }}:
+      it never completed init or join. Run playbooks/necropolis/main.yml.
+    success_msg: "{{ inventory_hostname }} is a member"
+
+# super-admin.conf's user is kubernetes-super-admin, bound to system:masters.
+# kube-vip carrying it after bootstrap is the exposure the swap exists to end.
+- name: Read kube-vip's kubeconfig
+  ansible.builtin.slurp:
+    src: "{{ kubeadm_control_plane_vip_conf }}"
+  register: kubeadm_control_plane_vip_conf_read
+  no_log: true
+
+- name: Assert kube-vip runs on admin credentials, through loopback
+  ansible.builtin.assert:
+    that:
+      - "'kubernetes-super-admin' not in kubeadm_control_plane_vip_conf_text"
+      # A block scalar on purpose: inline, the `server: ` inside the pattern is a
+      # YAML key separator and the item parses as a mapping.
+      - >-
+        kubeadm_control_plane_vip_conf_text is search('(?m)^\s*server: https://127\.0\.0\.1:')
+    fail_msg: >-
+      {{ kubeadm_control_plane_vip_conf }} on {{ inventory_hostname }} is either
+      still super-admin.conf's credentials — system:masters, left on disk and
+      mounted into a pod — or not pointed at loopback. Run
+      playbooks/necropolis/main.yml, which rewrites it from admin.conf and
+      recreates the pod.
+    success_msg: "kube-vip: admin credentials, loopback server"
+  vars:
+    kubeadm_control_plane_vip_conf_text: "{{ kubeadm_control_plane_vip_conf_read.content | b64decode }}"
+
+# ---- through the API, once --------------------------------------------------------
+
+- name: Read the nodes
+  ansible.builtin.command: "{{ kubeadm_control_plane_kubectl }} get nodes -o json"
+  register: kubeadm_control_plane_nodes
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+- name: Assert every node is a schedulable control plane
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_registered | sort == ansible_play_hosts_all | sort
+      - kubeadm_control_plane_cp | sort == ansible_play_hosts_all | sort
+      - kubeadm_control_plane_tainted | length == 0
+    fail_msg: >-
+      Expected nodes {{ ansible_play_hosts_all | sort | join(', ') }}, all
+      control-plane, none tainted. Registered: {{ kubeadm_control_plane_registered | join(', ') }};
+      control-plane: {{ kubeadm_control_plane_cp | join(', ') }};
+      still tainted: {{ kubeadm_control_plane_tainted | join(', ') or 'none' }}.
+
+      A node missing entirely did not join. One present but not control-plane
+      joined as a worker. A taint left behind means the untaint step did not
+      run, and nothing but the control plane will schedule there.
+    success_msg: "{{ kubeadm_control_plane_registered | join(', ') }}: control plane, schedulable"
+  run_once: true
+  vars:
+    kubeadm_control_plane_node_doc: "{{ kubeadm_control_plane_nodes.stdout | from_json }}"
+    kubeadm_control_plane_registered: >-
+      {{ kubeadm_control_plane_node_doc['items'] | map(attribute='metadata.name') | list }}
+    # Single quotes around the query, so the label name can sit in plain
+    # double quotes. Written as "...\"label\"..." the backslashes reach
+    # JMESPath literally and it rejects the expression.
+    kubeadm_control_plane_cp: >-
+      {{ kubeadm_control_plane_node_doc
+         | community.general.json_query('items[?metadata.labels."node-role.kubernetes.io/control-plane" != null].metadata.name') }}
+    kubeadm_control_plane_tainted: >-
+      {{ kubeadm_control_plane_node_doc
+         | community.general.json_query("items[?spec.taints[?key=='node-role.kubernetes.io/control-plane']].metadata.name") }}
+
+# etcd's own view, through its static pod on this node. Exec works without a
+# CNI: the pod is on the host network.
+- name: Read the etcd membership
+  ansible.builtin.command: >-
+    {{ kubeadm_control_plane_kubectl }} -n kube-system exec etcd-{{ inventory_hostname }} --
+    etcdctl --endpoints=https://127.0.0.1:2379
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt
+    --cert=/etc/kubernetes/pki/etcd/server.crt
+    --key=/etc/kubernetes/pki/etcd/server.key
+    member list -w json
+  register: kubeadm_control_plane_etcd
+  run_once: true
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert etcd has a started member on every node
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_etcd.rc == 0
+      - kubeadm_control_plane_etcd_started | sort == ansible_play_hosts_all | sort
+    fail_msg: >-
+      etcd members started: {{ kubeadm_control_plane_etcd_started | join(', ') or 'none' }};
+      expected {{ ansible_play_hosts_all | sort | join(', ') }}.
+      {{ kubeadm_control_plane_etcd.stderr | default('') }}
+
+      Quorum is 2 of 3. With two members the cluster runs and one more failure
+      stops it; a member listed without a name was added but never started, and
+      `etcdctl member remove` is the way out before re-joining that node.
+    success_msg: "etcd members: {{ kubeadm_control_plane_etcd_started | join(', ') }}"
+  run_once: true
+  vars:
+    kubeadm_control_plane_etcd_started: >-
+      {{ (kubeadm_control_plane_etcd.stdout | default('{}') | from_json).members | default([])
+         | selectattr('name', 'defined') | map(attribute='name') | select | list }}
+
+- name: Read the kube-vip leader lease
+  ansible.builtin.command: >-
+    {{ kubeadm_control_plane_kubectl }} -n kube-system get lease plndr-cp-lock
+    -o jsonpath={.spec.holderIdentity}
+  register: kubeadm_control_plane_lease
+  run_once: true
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert a node holds the VIP lease
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_lease.stdout in ansible_play_hosts_all
+    fail_msg: >-
+      plndr-cp-lock is held by '{{ kubeadm_control_plane_lease.stdout }}'
+      {{ kubeadm_control_plane_lease.stderr | default('') }}. With no holder
+      nothing answers ARP for the VIP; `crictl ps | grep kube-vip` and
+      `crictl logs` on each node show why.
+    success_msg: "VIP held by {{ kubeadm_control_plane_lease.stdout }}"
+  run_once: true
+
+- name: Read the certificate signing requests
+  ansible.builtin.command: "{{ kubeadm_control_plane_kubectl }} get csr -o json"
+  register: kubeadm_control_plane_csr
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+- name: Assert no kubelet serving request from a node is pending
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_csr_pending | length == 0
+    fail_msg: >-
+      Pending kubelet serving requests: {{ kubeadm_control_plane_csr_pending | join(', ') }}.
+      Until approved, anything verifying kubelet's certificate — metrics-server,
+      Prometheus, `kubectl logs` — fails against those nodes. A run of
+      playbooks/necropolis/main.yml approves requests whose names match their
+      node; one it leaves pending asked for a name that is not the node's, and
+      deserves reading with `kubectl get csr <name> -o yaml` before approving.
+    success_msg: "no pending kubelet serving requests"
+  run_once: true
+  vars:
+    kubeadm_control_plane_csr_pending: >-
+      {{ (kubeadm_control_plane_csr.stdout | from_json)['items']
+         | selectattr('spec.signerName', 'equalto', 'kubernetes.io/kubelet-serving')
+         | rejectattr('status.conditions', 'defined')
+         | selectattr('spec.username', 'in',
+                      ansible_play_hosts_all | map('regex_replace', '^', 'system:node:') | list)
+         | map(attribute='metadata.name') | list }}
+
+# From the workstation, by name, through the merged context. The one check that
+# exercises the DNS record, the certificate SAN and roles/kubeconfig together.
+- name: Reach the API from the workstation by name
+  ansible.builtin.command: "kubectl --context {{ kubeconfig_context }} get --raw /readyz"
+  register: kubeadm_control_plane_workstation
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the workstation reaches the API by name
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_workstation.rc == 0
+      - kubeadm_control_plane_workstation.stdout | trim == 'ok'
+    fail_msg: >-
+      `kubectl --context {{ kubeconfig_context }} get --raw /readyz` from the
+      workstation returned rc={{ kubeadm_control_plane_workstation.rc }}:
+      {{ kubeadm_control_plane_workstation.stdout }}{{ kubeadm_control_plane_workstation.stderr }}
+
+      A TLS error naming {{ kubeadm_control_plane_endpoint }} means the name is
+      missing from the API certificate's SANs. A resolution error means the
+      workstation cannot resolve it. No such context means roles/kubeconfig did
+      not merge it.
+    success_msg: "https://{{ kubeadm_control_plane_endpoint }}:{{ kubeadm_control_plane_port }} ready"
+  run_once: true

@@ -1,0 +1,466 @@
+# Form, or extend, a kubeadm HA control plane across every host in the play.
+#
+# The play's hosts are the cluster's nodes. The first of them initialises when
+# no cluster exists; every node that is not yet a member joins as a control
+# plane, one at a time. On a converged cluster every task here is a no-op.
+#
+# ORDER IS THE WHOLE POINT, as it was in k8s-aio's lib/kubeadm.sh:
+#
+#   init node   certs + kubeconfigs -> kube-vip (super-admin, loopback)
+#               -> the rest of init -> kube-vip (admin, loopback)
+#   the others  join (the init node already holds the VIP) -> kube-vip (admin)
+#
+# Since Kubernetes 1.29 init's admin.conf has no cluster-admin binding until
+# init completes; kube-vip mounting it during bootstrap crash-loops on RBAC and
+# init hangs waiting for a VIP that never comes. super-admin.conf is bound to
+# system:masters, which is why it is swapped out the moment init finishes.
+#
+# Nodes end NotReady. That is correct: there is no CNI until the cluster layer
+# installs Cilium.
+---
+# ---- where things are ----------------------------------------------------------
+
+- name: Assert the cluster declares its API endpoint
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_endpoint | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} forms a kubeadm cluster but no
+      kubeadm_control_plane_endpoint is set. It is the DNS name of the API VIP,
+      and belongs in the cluster's group_vars (inventory/group_vars/<cluster>.yml).
+    success_msg: "API endpoint: {{ kubeadm_control_plane_endpoint }}"
+
+# The node's address and interface are facts: the ones carrying the default
+# route, which on a single-NIC wired node is the LAN.
+- name: Settle this node's address and interface
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_node_ip: "{{ ansible_facts['default_ipv4']['address'] }}"
+    kubeadm_control_plane_interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+
+# Resolved on the node, which is what will be reaching it.
+- name: Resolve the API endpoint
+  ansible.builtin.command: "getent ahostsv4 {{ kubeadm_control_plane_endpoint }}"
+  register: kubeadm_control_plane_getent
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Settle the VIP address
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_vip: >-
+      {{ ((kubeadm_control_plane_getent.stdout_lines | first | default('')).split()
+          + [''])[0] }}
+
+- name: Assert the VIP is resolved and is no node's own address
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_getent.rc == 0
+      - kubeadm_control_plane_vip | length > 0
+      - kubeadm_control_plane_vip not in kubeadm_control_plane_node_ips
+    fail_msg: >-
+      {{ kubeadm_control_plane_endpoint }} resolves to
+      '{{ kubeadm_control_plane_vip }}' from {{ inventory_hostname }}
+      (getent rc={{ kubeadm_control_plane_getent.rc }}).
+
+      It must be an A record for the VIP: a free address on the nodes' subnet,
+      outside the DHCP range, that nothing but kube-vip will ever answer for,
+      and not any node's own address ({{ kubeadm_control_plane_node_ips | join(', ') }}).
+      Create or fix the record at the router.
+    success_msg: "{{ kubeadm_control_plane_endpoint }} -> {{ kubeadm_control_plane_vip }}"
+  vars:
+    kubeadm_control_plane_node_ips: >-
+      {{ ansible_play_hosts_all
+         | map('extract', hostvars, ['ansible_facts', 'default_ipv4', 'address'])
+         | list }}
+
+# ARP only reaches the local segment. A VIP behind a router would be announced
+# into a network that never sees it.
+- name: Read the route to the VIP
+  ansible.builtin.command: "ip -4 route get {{ kubeadm_control_plane_vip }}"
+  register: kubeadm_control_plane_vip_route
+  changed_when: false
+  check_mode: false
+
+- name: Assert the VIP is on this node's own subnet
+  ansible.builtin.assert:
+    that:
+      - "' via ' not in kubeadm_control_plane_vip_route.stdout"
+    fail_msg: >-
+      The route to {{ kubeadm_control_plane_vip }} goes through a gateway:
+      {{ kubeadm_control_plane_vip_route.stdout }}
+
+      kube-vip announces the VIP with ARP, which only reaches the node's own
+      segment. Choose an address on the same subnet as the nodes.
+    success_msg: "VIP on-link"
+
+# ---- what already exists -------------------------------------------------------
+
+# kubelet.conf is written by init and by join, and by nothing else. Its
+# presence is membership.
+#
+# Including after a FAILED init: the kubeconfig phase writes it early, so a
+# node whose init died later looks like a member that serves nothing. The
+# recovery is `kubeadm reset -f` on that node, then run again. Detecting a
+# half-formed node automatically would mean guessing which half, and a wrong
+# guess here re-initialises a cluster.
+- name: Check for this node's cluster membership
+  ansible.builtin.stat:
+    path: "{{ kubeadm_control_plane_kubelet_conf }}"
+  register: kubeadm_control_plane_member
+
+# A plain TCP connect, from the node. wait_for would do the same, but its
+# timeout is indistinguishable from success once failed_when is overridden;
+# an exit code is not.
+- name: Check whether the API answers on the VIP
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - "3"
+      - bash
+      - -c
+      - "</dev/tcp/{{ kubeadm_control_plane_vip }}/{{ kubeadm_control_plane_port }}"
+  register: kubeadm_control_plane_api
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The first host of the play initialises — by position, which names no machine.
+# Position alone is unsafe: under --limit the first host is whoever was named.
+# So formation also requires that no node in the play is a member AND that
+# nothing answers on the VIP. A live API means a cluster exists, and a node
+# that is not a member then joins it rather than founding a second one.
+- name: Settle the cluster's state
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_init_host: "{{ ansible_play_hosts_all | first }}"
+    kubeadm_control_plane_members: "{{ kubeadm_control_plane_member_hosts }}"
+    kubeadm_control_plane_forming: >-
+      {{ kubeadm_control_plane_member_hosts | length == 0
+         and kubeadm_control_plane_api.rc != 0 }}
+  vars:
+    kubeadm_control_plane_member_hosts: >-
+      {{ ansible_play_hosts_all
+         | zip(ansible_play_hosts_all
+               | map('extract', hostvars, ['kubeadm_control_plane_member', 'stat', 'exists'])
+               | list)
+         | selectattr('1') | map(attribute='0') | list }}
+
+- name: Assert the run can reach an existing member
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_forming or kubeadm_control_plane_members | length > 0
+    fail_msg: >-
+      The API answers on {{ kubeadm_control_plane_vip }}, so a cluster exists,
+      but no host in this run is a member of it. Joining needs a member to issue
+      a token and certificate key. Include at least one existing node — run
+      without --limit, or add a member to it.
+    success_msg: >-
+      {{ 'forming a new cluster on ' ~ kubeadm_control_plane_init_host
+         if kubeadm_control_plane_forming
+         else 'members in this run: ' ~ kubeadm_control_plane_members | join(', ') }}
+
+# Before init only. With no cluster and no API, nothing should answer on the
+# VIP at all. Something that does is another machine holding the address, and
+# kube-vip would fight it for ARP.
+- name: Check that the VIP is unclaimed
+  ansible.builtin.command: "ping -c 1 -W 1 {{ kubeadm_control_plane_vip }}"
+  register: kubeadm_control_plane_vip_ping
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - kubeadm_control_plane_forming
+    - inventory_hostname == kubeadm_control_plane_init_host
+
+- name: Assert the VIP is unclaimed
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_vip_ping.rc != 0
+    fail_msg: >-
+      {{ kubeadm_control_plane_vip }} answers ping, but no cluster exists yet.
+      Another machine holds the address, and kube-vip would contend with it for
+      ARP — the API would work from some clients and not others. Find the holder
+      (`arp -n {{ kubeadm_control_plane_vip }}` names its MAC), or move
+      {{ kubeadm_control_plane_endpoint }} to a free address.
+    success_msg: "{{ kubeadm_control_plane_vip }} is unclaimed"
+  when:
+    - kubeadm_control_plane_forming
+    - inventory_hostname == kubeadm_control_plane_init_host
+
+# ---- init ------------------------------------------------------------------------
+# In phases, and this is a departure from k8s-aio made on purpose. It rendered
+# kube-vip from super-admin.conf BEFORE `kubeadm init`, through `sed ... | tee`
+# — but super-admin.conf does not exist until init writes it, so sed failed,
+# tee wrote an empty file, and the pipe reported success.
+#
+# Here the certificates and kubeconfigs are generated first, kube-vip's
+# loopback kubeconfig is rendered from a super-admin.conf that now exists, and
+# init then runs with those phases skipped. Every other phase, including the
+# wait for the VIP, runs exactly as a plain init would.
+
+- name: Initialise the cluster
+  when:
+    - kubeadm_control_plane_forming
+    - inventory_hostname == kubeadm_control_plane_init_host
+    - not ansible_check_mode
+  block:
+    - name: Render the kubeadm init configuration
+      ansible.builtin.template:
+        src: kubeadm-init.yaml.j2
+        dest: "{{ kubeadm_control_plane_init_config }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Generate the cluster certificates
+      ansible.builtin.command: >-
+        kubeadm init phase certs all --config {{ kubeadm_control_plane_init_config }}
+      changed_when: true
+
+    - name: Generate the kubeconfigs
+      ansible.builtin.command: >-
+        kubeadm init phase kubeconfig all --config {{ kubeadm_control_plane_init_config }}
+      changed_when: true
+
+    - name: Read super-admin.conf
+      ansible.builtin.slurp:
+        src: "{{ kubeadm_control_plane_super_admin_conf }}"
+      register: kubeadm_control_plane_super_admin
+
+    - name: Point kube-vip at super-admin.conf, through loopback
+      ansible.builtin.include_tasks: kube_vip.yml
+      vars:
+        kubeadm_control_plane_vip_source: "{{ kubeadm_control_plane_super_admin.content | b64decode }}"
+
+    # addon/kube-proxy skipped because Cilium replaces kube-proxy entirely;
+    # installing it and removing it later leaves stale iptables rules behind.
+    - name: Run the rest of kubeadm init
+      ansible.builtin.command: >-
+        kubeadm init --config {{ kubeadm_control_plane_init_config }}
+        --upload-certs
+        --skip-phases=certs,kubeconfig,addon/kube-proxy
+      changed_when: true
+
+# ---- joins -----------------------------------------------------------------------
+
+- name: Settle which member issues join credentials
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_issuer: >-
+      {{ kubeadm_control_plane_init_host if kubeadm_control_plane_forming
+         else kubeadm_control_plane_members | first }}
+    kubeadm_control_plane_joining: >-
+      {{ not kubeadm_control_plane_member.stat.exists
+         and not (kubeadm_control_plane_forming
+                  and inventory_hostname == kubeadm_control_plane_init_host) }}
+
+- name: Join the remaining nodes
+  when:
+    - ansible_play_hosts_all
+      | map('extract', hostvars, 'kubeadm_control_plane_joining')
+      | select | list | length > 0
+    - not ansible_check_mode
+  block:
+    # Once, for every joiner. `upload-certs` re-encrypts the cluster's CA
+    # material under a NEW key on every call, so generating one per node would
+    # invalidate the key the previous node was given.
+    #
+    # Fresh each run: bootstrap tokens expire after 24 h and the certificate key
+    # after 2 h, so nothing from init's own output can be reused later.
+    - name: Issue a bootstrap token
+      ansible.builtin.command: kubeadm token create --print-join-command --ttl 1h
+      register: kubeadm_control_plane_join_command
+      delegate_to: "{{ kubeadm_control_plane_issuer }}"
+      run_once: true
+      changed_when: true
+      no_log: true
+
+    - name: Upload the certificates under a fresh key
+      ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+      register: kubeadm_control_plane_upload_certs
+      delegate_to: "{{ kubeadm_control_plane_issuer }}"
+      run_once: true
+      changed_when: true
+      no_log: true
+
+    - name: Settle the join credentials
+      ansible.builtin.set_fact:
+        kubeadm_control_plane_join_token: >-
+          {{ kubeadm_control_plane_join_command.stdout | regex_search('--token\s+(\S+)', '\1') | first }}
+        kubeadm_control_plane_join_ca_hash: >-
+          {{ kubeadm_control_plane_join_command.stdout
+             | regex_search('--discovery-token-ca-cert-hash\s+(\S+)', '\1') | first }}
+        kubeadm_control_plane_join_cert_key: "{{ kubeadm_control_plane_upload_certs.stdout_lines | last | trim }}"
+      no_log: true
+
+    # The VIP can blink here: init's final kube-vip swap recreates the pod on
+    # the init node, and with one kube-vip there is no one else to hold it.
+    - name: Wait for the API on the VIP
+      ansible.builtin.wait_for:
+        host: "{{ kubeadm_control_plane_vip }}"
+        port: "{{ kubeadm_control_plane_port }}"
+        timeout: 120
+      when: kubeadm_control_plane_joining
+
+    - name: Render the join configuration
+      ansible.builtin.template:
+        src: kubeadm-join.yaml.j2
+        dest: "{{ kubeadm_control_plane_join_config }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: kubeadm_control_plane_joining
+      no_log: true
+
+    # One node at a time. Each control-plane join adds an etcd member, and etcd
+    # adds members one at a time; two concurrent joins can leave the second
+    # waiting on a quorum the first has not finished changing.
+    - name: Join as a control-plane node
+      ansible.builtin.command: kubeadm join --config {{ kubeadm_control_plane_join_config }}
+      throttle: 1
+      when: kubeadm_control_plane_joining
+      changed_when: true
+
+    - name: Remove the join configuration
+      ansible.builtin.file:
+        path: "{{ kubeadm_control_plane_join_config }}"
+        state: absent
+      when: kubeadm_control_plane_joining
+
+# ---- kube-vip, on every node --------------------------------------------------------
+# admin.conf everywhere now: on the init node this is the swap away from
+# super-admin.conf; on a joiner it is kube-vip's first appearance. On a
+# converged node it renders identical bytes and nothing restarts.
+
+- name: Check for admin.conf
+  ansible.builtin.stat:
+    path: "{{ kubeadm_control_plane_admin_conf }}"
+  register: kubeadm_control_plane_admin
+
+# A control-plane join writes admin.conf. k8s-aio regenerated it when missing,
+# with `kubeadm init phase kubeconfig admin` and no configuration — which
+# writes one against kubeadm's defaults rather than this cluster's endpoint.
+# Refusing is the honest outcome.
+- name: Assert admin.conf exists
+  ansible.builtin.assert:
+    that:
+      - kubeadm_control_plane_admin.stat.exists
+    fail_msg: >-
+      {{ kubeadm_control_plane_admin_conf }} is missing on {{ inventory_hostname }}
+      after init or join. kube-vip mounts a kubeconfig derived from it and
+      cannot start without one. Check the join output; the node may have joined
+      as a worker rather than as a control plane.
+    success_msg: "admin.conf present"
+  when: not ansible_check_mode
+
+- name: Read admin.conf
+  ansible.builtin.slurp:
+    src: "{{ kubeadm_control_plane_admin_conf }}"
+  register: kubeadm_control_plane_admin_content
+  when: kubeadm_control_plane_admin.stat.exists
+
+- name: Point kube-vip at admin.conf, through loopback
+  ansible.builtin.include_tasks: kube_vip.yml
+  vars:
+    kubeadm_control_plane_vip_source: "{{ kubeadm_control_plane_admin_content.content | b64decode }}"
+  when: kubeadm_control_plane_admin.stat.exists
+
+# ---- cluster-wide, once ------------------------------------------------------------
+# Through the API, from one member, with the admin credentials on that node.
+
+- name: Settle which member runs cluster-wide tasks
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_api_host: >-
+      {{ kubeadm_control_plane_init_host if kubeadm_control_plane_forming
+         else kubeadm_control_plane_members | first }}
+
+- name: Read the nodes
+  ansible.builtin.command: "{{ kubeadm_control_plane_kubectl }} get nodes -o json"
+  register: kubeadm_control_plane_nodes
+  delegate_to: "{{ kubeadm_control_plane_api_host }}"
+  run_once: true
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode or not kubeadm_control_plane_forming
+
+# All three are schedulable by design: with three machines, reserving them for
+# the control plane would leave nowhere to run workloads. Only nodes that still
+# carry the taint are touched, so a converged cluster reports no change — where
+# k8s-aio ran `taint --all ... || true` and could not tell.
+- name: Remove the control-plane taint
+  ansible.builtin.command: >-
+    {{ kubeadm_control_plane_kubectl }} taint node {{ item }}
+    node-role.kubernetes.io/control-plane:NoSchedule-
+  loop: >-
+    {{ (kubeadm_control_plane_nodes.stdout | default('{"items": []}') | from_json)
+       | community.general.json_query("items[?spec.taints[?key=='node-role.kubernetes.io/control-plane']].metadata.name") }}
+  delegate_to: "{{ kubeadm_control_plane_api_host }}"
+  run_once: true
+  changed_when: true
+
+# ---- kubelet serving certificates ------------------------------------------------------
+# serverTLSBootstrap has each kubelet request its serving certificate through
+# the CSR API. The cluster does not approve these by itself, because nothing in
+# it can verify that a node owns the addresses it asks for. This role can: it
+# gathered every node's addresses as facts.
+#
+# Approved ONLY when the requester is system:node:<name> for a node in this
+# play, and every IP and DNS name requested belongs to that node. Anything else
+# stays Pending for a human. A CSR that arrives after this runs is picked up by
+# the next run, and the verify gate reports it until then.
+
+- name: Read the certificate signing requests
+  ansible.builtin.command: "{{ kubeadm_control_plane_kubectl }} get csr -o json"
+  register: kubeadm_control_plane_csr
+  delegate_to: "{{ kubeadm_control_plane_api_host }}"
+  run_once: true
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode or not kubeadm_control_plane_forming
+
+- name: Settle the pending kubelet serving requests from known nodes
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_csr_pending: >-
+      {{ (kubeadm_control_plane_csr.stdout | default('{"items": []}') | from_json)['items']
+         | selectattr('spec.signerName', 'equalto', 'kubernetes.io/kubelet-serving')
+         | rejectattr('status.conditions', 'defined')
+         | selectattr('spec.username', 'in',
+                      ansible_play_hosts_all | map('regex_replace', '^', 'system:node:') | list)
+         | list }}
+  run_once: true
+
+# The request is PEM inside base64. Decoded here, read by openssl on the node,
+# where it is installed.
+- name: Read the names each pending request asks for
+  ansible.builtin.command:
+    cmd: openssl req -noout -text
+    stdin: "{{ item.spec.request | b64decode }}"
+  loop: "{{ kubeadm_control_plane_csr_pending }}"
+  loop_control:
+    label: "{{ item.metadata.name }} ({{ item.spec.username }})"
+  register: kubeadm_control_plane_csr_text
+  delegate_to: "{{ kubeadm_control_plane_api_host }}"
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+- name: Approve the requests whose names belong to their node
+  ansible.builtin.command: >-
+    {{ kubeadm_control_plane_kubectl }} certificate approve {{ item.item.metadata.name }}
+  loop: "{{ kubeadm_control_plane_csr_text.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.metadata.name }} ({{ item.item.spec.username }})"
+  when:
+    - kubeadm_control_plane_csr_ips | length > 0
+    - kubeadm_control_plane_csr_ips | difference(kubeadm_control_plane_csr_node_ips) | length == 0
+    - kubeadm_control_plane_csr_dns | difference(kubeadm_control_plane_csr_node_names) | length == 0
+  delegate_to: "{{ kubeadm_control_plane_api_host }}"
+  run_once: true
+  changed_when: true
+  vars:
+    kubeadm_control_plane_csr_node: "{{ item.item.spec.username | regex_replace('^system:node:', '') }}"
+    kubeadm_control_plane_csr_ips: "{{ item.stdout | regex_findall('IP Address:([0-9.]+)') }}"
+    kubeadm_control_plane_csr_dns: "{{ item.stdout | regex_findall('DNS:([^,\\s]+)') }}"
+    kubeadm_control_plane_csr_node_ips: "{{ hostvars[kubeadm_control_plane_csr_node]['ansible_facts']['all_ipv4_addresses'] }}"
+    kubeadm_control_plane_csr_node_names: >-
+      {{ [kubeadm_control_plane_csr_node,
+          hostvars[kubeadm_control_plane_csr_node]['ansible_facts']['hostname'],
+          hostvars[kubeadm_control_plane_csr_node]['ansible_facts']['fqdn']] | unique }}

@@ -1,0 +1,54 @@
+# clabernetes on a single-node k3s server.
+#
+# Four departures from the chart defaults, each forced by this cluster rather
+# than preferred.
+
+manager:
+  # One replica.
+  #
+  # The default runs three with preferred anti-affinity, which on a one-node
+  # cluster lands all three on that node and leaves two in leader-election
+  # standby. High availability of a controller whose cluster is destroyed by an
+  # OS reload is not a property worth the memory.
+  replicaCount: 1
+
+globalConfig:
+  # overwrite, not merge.
+  #
+  # "merge" copies only fields ABSENT from an existing Config resource, so a
+  # value changed here after the first install would be written to the bootstrap
+  # ConfigMap and then quietly ignored — the settings below would read correctly
+  # in git and be inert on the cluster.
+  #
+  # That is the same shape as a version pin sitting in group_vars while every
+  # host runs something else. roles/clabernetes/tasks/verify.yml asserts the
+  # Config actually carries these, which is what turns this comment into a check.
+  mergeMode: overwrite
+
+  imagePull:
+    # The launcher's image pull is directed at the node's CRI. On k3s that is
+    # containerd, which already knows registry.lan from
+    # /etc/rancher/k3s/registries.yaml — written by roles/registry_mirror — so
+    # the private, plain-HTTP registry needs no credential and no second
+    # configuration here.
+    #
+    # "always" rather than "auto": auto may fall back to a direct pull, which
+    # would NOT know the registry, and a fallback that silently works for public
+    # images while failing for local ones hides a broken CRI path until the one
+    # image that matters is the one that cannot be fetched.
+    imagePullThroughMode: always
+    criSockOverride: /run/k3s/containerd/containerd.sock
+    # k3s renders registries.yaml into a containerd hosts directory HERE rather
+    # than at the conventional /etc/containerd/certs.d. Without this the
+    # pull-through pod succeeds and the launcher's own client does not.
+    criHostsDir: /var/lib/rancher/k3s/agent/etc/containerd/certs.d
+
+  deployment:
+    # A floor, not a budget. Individual topologies declare what their nodes
+    # actually need — a cEOS node wants roughly twenty times this — and a
+    # topology that declares nothing should still be schedulable rather than
+    # unbounded.
+    resourcesDefault:
+      requests:
+        memory: 512Mi
+        cpu: 200m

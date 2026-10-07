@@ -1,0 +1,94 @@
+# A containerlab host: the network topologies, and the kernel that carries them.
+#
+# Ported from frr-diag-agent/scripts/bootstrap-pi.sh, which is the only place
+# this ever existed as code. Four things in that script were wrong for an estate
+# rather than for one machine, and each is corrected below with its reason.
+#
+# What this role does NOT do: run a topology. containerlab labs are the
+# experiment, and an experiment belongs to the repository that varies it. This
+# role converges a host to the state a lab needs and stops there — the same seam
+# that separates infra from gpu-bench.
+---
+
+# ---- container runtime -------------------------------------------------------
+# podman, not docker.io.
+#
+# The bootstrap script installed docker.io and added the login user to the
+# `docker` group. Neither belongs here:
+#
+#   - The estate already standardised on podman. phantom serves the registry
+#     from a podman container under a systemd unit, and every k3s host runs
+#     containerd. Adding a third runtime to one machine means a third set of
+#     failure modes nobody else on the estate has seen.
+#   - Membership of the `docker` group is root-equivalent: the socket accepts
+#     requests that mount the host filesystem into a privileged container. That
+#     is a real grant, made silently, on a box whose whole purpose is to run
+#     other people's network images.
+#
+# Rootless podman needs no group, so the grant disappears rather than moving.
+containerlab_packages:
+  - podman
+  - ca-certificates
+
+# ---- containerlab ------------------------------------------------------------
+# Pinned, and installed from the release .deb.
+#
+# The bootstrap script ran `bash -c "$(curl -sL https://get.containerlab.dev)"`,
+# which fetches and executes whatever that endpoint serves today. Every other
+# version in this repository is pinned deliberately — k3s, the NVIDIA driver,
+# the container toolkit, every chart — and a lab tool that silently changes
+# version between two runs makes the topologies it launches unreproducible,
+# which is the one property a fault-injection lab cannot do without.
+#
+# The .deb also gives dpkg a record of what is installed. `curl | bash` leaves a
+# binary in /usr/bin that no package manager knows about, so nothing can report
+# its version but the binary itself, and nothing can remove it cleanly.
+containerlab_version: "0.79.0"
+containerlab_deb_url: >-
+  https://github.com/srl-labs/containerlab/releases/download/v{{ containerlab_version }}/containerlab_{{ containerlab_version }}_linux_{{ containerlab_deb_arch }}.deb
+
+# ---- kernel modules ----------------------------------------------------------
+# These belong to THIS role rather than to base, and the test is the same one
+# that put iw in wifi_link: a machine that runs no topologies needs none of
+# them. They are a property of the capability, not of the estate.
+#
+#   sch_netem   tc impairment — loss, delay, jitter, rate limiting. The L1/L2
+#               fault catalogue is built entirely on it.
+#   mpls_router MPLS forwarding, for the LDP and segment-routing scenarios.
+#   vrf         VRF separation.
+#   veth        virtual ethernet pairs — containerlab's link primitive, so
+#               without it no topology comes up at all.
+containerlab_kernel_modules:
+  - sch_netem
+  - mpls_router
+  - vrf
+  - veth
+
+# Empty, because on the Ubuntu this estate runs there is no such package.
+#
+# bootstrap-pi.sh installed `linux-modules-extra-raspi` and exited 1 demanding a
+# reboot. That was correct for the Ubuntu it was written against, where the
+# raspi kernel shipped a reduced module set and the rest lived in an extra
+# package. On 26.04 the split is gone: `apt-cache search linux-modules | grep
+# raspi` returns only `linux-modules-<version>-raspi` and a zfs package, and all
+# four modules above ship in the base set —
+#
+#   modinfo -n sch_netem
+#   /lib/modules/7.0.0-1017-raspi/kernel/net/sched/sch_netem.ko.zst
+#
+# Naming a package that no longer exists cost a playbook run: apt reported "No
+# package matching 'linux-modules-extra-raspi' is available" three times through
+# the retry budget before failing. A value carried in from an older release,
+# whose justification had expired — the same shape as the k3s pin that named a
+# version no host had ever run.
+#
+# Set it to a package name on a host that genuinely needs one. The test is
+# `modinfo -n <module>`: a path means the module is present and this stays
+# empty, "not found" means something has to supply it.
+containerlab_modules_extra_package: ""
+
+# Named for the role rather than for the host. The bootstrap script wrote
+# /etc/modules-load.d/netlab.conf, taking its name from an ssh alias for one
+# machine — the same function-in-a-name mistake that made `pi4-k3s` wrong, and
+# it would read as a stray file on any second containerlab host.
+containerlab_modules_conf: /etc/modules-load.d/containerlab.conf

@@ -1,0 +1,58 @@
+# phantom — the durable box.
+#
+# Holds the shared services every other machine consumes: the image registry,
+# the observability stack, and the long-term metrics store. Nothing here is
+# deliberately broken; failure injection lives on revenant, which is reloaded
+# routinely and where a namespace can be wrecked without consequence.
+#
+# That durability is the reason this host is built first. Revenant's k3s cannot
+# start correctly without registries.yaml already naming a registry that
+# answers, so phantom is the dependency root of the estate.
+
+# ---- cluster identity ------------------------------------------------------
+# A kubeconfig context names a CLUSTER, which is a separate namespace from host
+# names — `pi4-k3s` was wrong as both. `services` describes what the cluster is
+# for and stays correct if it is ever rehomed.
+#
+# It must be explicit and must never be `default`: a context called `default` is
+# what gets applied to when nobody thought about it, which is how an
+# observability stack once landed on a production cluster.
+kubeconfig_context: services
+
+# ---- observability ---------------------------------------------------------
+observability_namespace: observability
+
+# Identifies this cluster's series in the shared long-term store. REQUIRED, and
+# deliberately without a default in the role.
+#
+# Every Prometheus writing to one VictoriaMetrics must carry a unique value.
+# Without it, identically-named series from different boxes interleave into one
+# series — invisible to the eye, and not cleanly separable afterwards. This is
+# the single easiest way to corrupt the whole dataset, so preflight asserts it
+# and verify re-checks it against the live config.
+prometheus_external_labels:
+  cluster: services
+
+# Local retention is short on every box by design: Prometheus here is the
+# scrape buffer, and history lives in VictoriaMetrics. This is about surviving a
+# pod restart mid-diagnosis, not about hoarding.
+prometheus_retention: 24h
+
+# local-path enforces no quota — the PVC's declared size is advisory, and
+# Prometheus will happily write past it until the disk fills. Retention is the
+# real bound, so it is set explicitly rather than trusted to the volume.
+prometheus_retention_size: 15GB
+
+# ---- long-term metrics -----------------------------------------------------
+# Months. Three kube-prometheus-stack clusters produce well under a gigabyte a
+# day after VictoriaMetrics' compression, so two years is comfortable on the
+# terabyte set aside for it — retention is chosen for how far back a question
+# might reach, not for what fits.
+victoriametrics_retention_period: "24"
+victoriametrics_storage_size: 1000Gi
+
+# ---- registry --------------------------------------------------------------
+# Lives on this box rather than revenant because cEOS images are fetched by hand
+# and cannot be re-pulled from anywhere. Hosting them on the durable machine
+# means a manually-obtained image survives every revenant reload.
+registry_root: /srv/registry

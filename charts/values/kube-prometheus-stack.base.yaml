@@ -1,0 +1,72 @@
+# kube-prometheus-stack — base values, shared by every cluster in the estate.
+#
+# Ported from k8s-obs-stack/charts/values/kube-prometheus-stack.base.yaml when
+# that repository was absorbed. Unchanged: these are requirements of the
+# diagnostic-agent workload, true regardless of which cluster hosts it.
+#
+# What belongs here: workload requirements. What does not: anything that is a
+# fact about a particular host — service type, node ports, resource envelope,
+# storage, retention, cluster identity. Those are rendered per host by
+# roles/observability and applied AFTER this file, so they win.
+#
+# Layering: helm -f base.yaml -f <host-values>.yaml, later file wins.
+
+# Drops the redundant `-prometheus` suffix the chart appends to the operator's
+# Prometheus CR. With the release named for the chart, the StatefulSet was
+# prometheus-kube-prometheus-stack-prometheus — the word three times in one name.
+#
+# Verified by rendering the chart both ways before adopting it: this changes the
+# Prometheus CR name and nothing else. Every Service keeps its name, which
+# matters because the Service is what external consumers address —
+# gpu-bench's harness reaches Prometheus at kube-prometheus-stack-prometheus:9090
+# through the API-server proxy and is unaffected.
+#
+# Nothing in this repository selects those objects by name. roles/observability
+# gates them by label precisely so that naming decisions like this one stay
+# reversible.
+cleanPrometheusOperatorObjectNames: true
+
+# Alertmanager is the NOTIFICATION layer, and notification isn't part of the
+# diagnosis story — nothing here pages anyone. Dropping it saves resources.
+#
+# Rule evaluation is unaffected: Prometheus evaluates PrometheusRules itself and
+# publishes the results as the `ALERTS` metric, which stays queryable. The
+# default rules are therefore kept, deliberately, for two reasons:
+#   - the recording rules among them back the stock Grafana dashboards
+#   - `ALERTS{alertstate="firing"}` is a legitimate signal for a diagnostic
+#     agent to query, and it exists with or without Alertmanager
+alertmanager:
+  enabled: false
+
+grafana:
+  sidecar:
+    datasources:
+      # The chart provisions a Grafana datasource pointing at the Alertmanager
+      # Service by default. With Alertmanager disabled that Service does not
+      # exist, so the datasource is permanently broken — it renders as an error
+      # in Grafana and teaches whoever sees it to distrust the others.
+      alertmanager:
+        enabled: false
+
+prometheus:
+  prometheusSpec:
+    # 15s (vs the 30s default) so fast metric-driven failures — the OOM memory
+    # climb, the worker starvation — are sampled finely enough to see the ramp,
+    # not just the aftermath.
+    scrapeInterval: 15s
+    # Scrape everything in the cluster, not just labelled ServiceMonitors —
+    # simpler for a sandbox where workloads are added ad hoc.
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    walCompression: true
+
+# kube-state-metrics: pod/deployment/replicaset state — needed for several
+# failures. Left entirely to chart defaults.
+#
+# Deliberately absent rather than present-and-empty. A bare `kube-state-metrics:`
+# key parses as null, and Helm passes that null down to the subchart, wiping its
+# defaults — the pod still runs but no ServiceMonitor is created, so Prometheus
+# never scrapes it and every kube_* metric silently disappears.
+
+# node-exporter stays a DaemonSet on ALL nodes (it's tiny) for per-node
+# CPU/memory — required for the OOM and resource-starvation scenarios.

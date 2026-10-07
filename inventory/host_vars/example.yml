@@ -1,0 +1,62 @@
+# Template for a new host. Copy to <hostname>.yml and edit.
+#
+# Committed on purpose, and NOT the old pattern of a .example file seeded into a
+# gitignored sibling. Nothing in here is secret — the estate has no secret store
+# because it has no secrets — so the real host_vars files are committed too, and
+# this one exists to document what each key means and why it exists.
+#
+# What belongs in a host_vars file:
+#
+#   Values that differ between machines and must be DECLARED — retention,
+#   cluster identity, storage sizes, paths, version overrides.
+#
+# What does not:
+#
+#   Anything the machine can report about itself. Architecture, memory, IP
+#   address, distribution and kernel version are gathered as facts. Writing them
+#   down creates a second source of truth that silently goes stale.
+#
+#   Anything routable. Inventory hostnames are ~/.ssh/config aliases, so no
+#   address, username, port or key path is ever recorded here.
+#
+#   Anything shared by every host of a kind — that goes in group_vars/.
+
+# ---- cluster identity ------------------------------------------------------
+# Required on any host running Kubernetes. Names the CLUSTER, not the machine,
+# so it survives the cluster being rehomed. Must never be `default`; preflight
+# refuses to run if it is.
+kubeconfig_context: <cluster-name>
+
+# ---- observability ---------------------------------------------------------
+observability_namespace: observability
+
+# REQUIRED on any host that remote-writes. Must be unique across every
+# Prometheus feeding the shared store, or series from different clusters merge
+# into one and the dataset is quietly corrupted.
+prometheus_external_labels:
+  cluster: <cluster-name>
+
+# Local Prometheus is a scrape buffer; history belongs in VictoriaMetrics.
+prometheus_retention: 24h
+
+# The real bound. local-path enforces no quota, so the PVC size is advisory and
+# retention is what actually stops the disk filling.
+prometheus_retention_size: 15GB
+
+# Where this host ships metrics for long-term storage. Omit on the host that
+# runs the store itself only if it should not record its own history — normally
+# it should, and the default in the observability role points at metrics.lan.
+# prometheus_remote_write_url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/write"
+
+# ---- k3s -------------------------------------------------------------------
+# Defaults come from group_vars/k3s_servers.yml. Override the whole list only
+# when this host genuinely needs different server flags — a GPU node adding
+# runtime configuration, for instance. Do not copy the list to change one entry.
+# k3s_server_args:
+#   - "--secrets-encryption"
+#   - "--disable=traefik"
+
+# ---- registry --------------------------------------------------------------
+# Only on the host that serves the registry. Consumers need nothing: they are
+# configured with registry.lan, which is a CNAME and names no machine.
+# registry_root: /srv/registry

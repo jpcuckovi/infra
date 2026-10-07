@@ -1,0 +1,42 @@
+# Install Longhorn and wait until every node offers its disk.
+#
+# Same shape as the other chart roles: context named, chart pinned, values that
+# are facts about this cluster passed inline.
+---
+- name: Install Longhorn
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ longhorn_release }}"
+    chart_ref: longhorn
+    chart_repo_url: "{{ longhorn_chart_repo_url }}"
+    chart_version: "{{ longhorn_version }}"
+    release_namespace: "{{ longhorn_namespace }}"
+    create_namespace: true
+    values:
+      persistence:
+        defaultClass: "{{ longhorn_default_class | bool }}"
+        defaultClassReplicaCount: "{{ longhorn_replicas | int }}"
+      defaultSettings:
+        # Volumes created outside the StorageClass (from the UI, or restored
+        # from a backup) take their replica count from here, not from the class.
+        defaultReplicaCount: "{{ longhorn_replicas | int }}"
+        defaultDataPath: "{{ longhorn_data_path }}"
+    wait: true
+    wait_timeout: "15m"
+
+# helm's wait covers the Deployments and DaemonSets. Whether each node has
+# registered its disk as schedulable is Longhorn's own record, and it is the
+# thing a volume needs.
+- name: Wait for every node's disk to be schedulable
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: longhorn.io/v1beta2
+    kind: Node
+    namespace: "{{ longhorn_namespace }}"
+  register: longhorn_nodes
+  until: >-
+    longhorn_nodes.resources
+    | community.general.json_query("[?status.conditions[?type=='Schedulable' && status=='True']].metadata.name")
+    | length == cluster_hosts | length
+  retries: 30
+  delay: 10

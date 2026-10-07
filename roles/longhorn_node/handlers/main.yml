@@ -1,0 +1,16 @@
+# Both skip under --check, where the packages that provide these units may
+# only have been simulated. The idiom roles/nut documents.
+---
+- name: Restart iscsid
+  ansible.builtin.systemd_service:
+    name: iscsid.service
+    state: restarted
+  when: not ansible_check_mode
+
+# Reload, not restart: multipathd re-reads its configuration in place, and a
+# restart would briefly release any map it holds.
+- name: Reload multipathd
+  ansible.builtin.systemd_service:
+    name: multipathd.service
+    state: reloaded
+  when: not ansible_check_mode

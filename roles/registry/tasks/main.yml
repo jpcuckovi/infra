@@ -1,0 +1,73 @@
+# The registry service itself — the one host in the estate that serves images.
+#
+# The containerd config that lets a host PULL from it is roles/registry_mirror,
+# composed by every k3s host including this one. The two were one role until the
+# split: serving is a capability one machine has, knowing where to pull from is a
+# capability they all need, and bundled together no host could have the second
+# without also starting a second registry on the LAN.
+#
+# This role has no ordering constraint against k3s_server. registry_mirror does,
+# because registries.yaml is read once at first start — the container being up is
+# not what k3s reads.
+---
+- name: Create the registry storage root
+  ansible.builtin.file:
+    path: "{{ registry_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check whether the registry image is already present
+  ansible.builtin.command: "podman image exists {{ registry_image }}"
+  register: registry_image_present
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Pull the registry image
+  ansible.builtin.command: "podman pull {{ registry_image }}"
+  when: registry_image_present.rc != 0
+  changed_when: true
+
+- name: Install the registry unit
+  ansible.builtin.template:
+    src: local-registry.service.j2
+    dest: "{{ registry_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart local-registry
+
+- name: Enable and start the registry
+  ansible.builtin.systemd_service:
+    name: local-registry
+    state: started
+    enabled: true
+    daemon_reload: true
+  # Under --check the unit above was only simulated, so systemd genuinely has no
+  # local-registry to enable and this fails with "Could not find the requested
+  # service" — on a host where nothing is wrong except that check mode declined
+  # to write the file.
+  #
+  # A dry run that dies partway is worse than one that admits what it cannot
+  # know: the tasks after this never get evaluated, so the operator sees a
+  # failure instead of the plan they asked for. Same idiom as the readiness wait
+  # below, for the same reason.
+  when: not ansible_check_mode
+
+# Applying handlers now rather than at play end: the readiness check below is
+# meaningless if it runs against the pre-restart container.
+- name: Apply pending restarts before checking readiness
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the registry to answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ registry_port }}/v2/"
+    status_code: [200, 401]
+  register: registry_ready
+  retries: 10
+  delay: 2
+  until: registry_ready is succeeded
+  # Under --check nothing was installed, so there is nothing to wait for.
+  when: not ansible_check_mode

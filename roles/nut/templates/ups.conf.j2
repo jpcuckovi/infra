@@ -1,0 +1,6 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nut.
+[{{ nut_ups_name }}]
+  driver = {{ nut_driver }}
+  port = {{ nut_port }}
+  desc = "UPS attached to {{ inventory_hostname }}"

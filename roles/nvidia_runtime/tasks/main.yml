@@ -1,0 +1,252 @@
+# NVIDIA driver and container toolkit. Host layer, BEFORE k3s.
+#
+# Ported from gpu-bench/ops/scripts/lib/install-nvidia.sh:20-73.
+#
+# The ordering against k3s_server is the whole reason this is a separate role
+# rather than tasks inside one. k3s scans PATH for nvidia-container-runtime when
+# it starts and writes the nvidia runtime into its own generated containerd
+# config; the toolkit being installed first means that happens on k3s's very
+# first start. Installed afterwards, the config is regenerated from k3s's
+# template on every restart and the explicit `nvidia-ctk runtime configure` call
+# gpu-bench used to make was simply discarded — which is why that call was
+# removed and the step order changed instead.
+#
+# This role therefore writes NO containerd configuration and generates no CDI.
+# Both were deliberately deleted upstream; see gpu-bench/docs/decisions/0001 and
+# 0002. The nvidia RuntimeClass is likewise created by k3s, not here.
+---
+- name: Install the hardware inspection tools
+  ansible.builtin.apt:
+    name: "{{ nvidia_runtime_packages }}"
+    state: present
+
+# A missing lspci fails exactly like an absent GPU, which would skip the driver
+# install on a machine that has one and report success. The package above is
+# installed first precisely so this probe can only mean one thing.
+- name: Look for an NVIDIA GPU
+  ansible.builtin.command: lspci
+  register: nvidia_lspci
+  changed_when: false
+  check_mode: false
+
+- name: Assert an NVIDIA GPU is present
+  ansible.builtin.assert:
+    that:
+      - nvidia_lspci.stdout is search('(?i)nvidia')
+    fail_msg: >-
+      {{ inventory_hostname }} is in gpu_hosts but lspci reports no NVIDIA
+      device.
+
+      Either the card is absent or not seated, or the host does not belong in
+      that group. This is asserted rather than skipped because a GPU host that
+      silently builds without a GPU passes every later gate that matters — the
+      device plugin advertises nothing, and the first workload to request
+      nvidia.com/gpu simply stays Pending.
+    success_msg: "{{ nvidia_lspci.stdout_lines | select('search', '(?i)nvidia') | first | trim }}"
+
+# --- driver -----------------------------------------------------------------
+- name: Check whether the driver is loaded
+  ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_smi
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Read the installed driver package version
+  ansible.builtin.command: "dpkg-query -W -f='${Version}' {{ nvidia_driver_package }}"
+  register: nvidia_driver_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Guarded on the VERSION, not on whether nvidia-smi answers.
+#
+# The old guard was `when: nvidia_smi.rc != 0` — install only if no driver is
+# loaded. On a host that already had one, this task skipped and whatever the pin
+# said was never applied. That is the k3s `creates:` failure exactly, and it
+# meant an `apt upgrade` could move the driver with the playbook still reporting
+# changed=0 against a host that no longer matched its declaration.
+#
+# Two modes, and the difference is deliberate:
+#
+#   latest      install only when ABSENT. `latest` means "newest at reload
+#               time", not "newest today" — reinstalling on every converge would
+#               chase upstream and defeat the hold below, which is the whole
+#               point of the mode.
+#   <version>   install when the installed version differs, so the declaration
+#               is enforced rather than merely stated. This corrects drift in
+#               both directions, including a downgrade back to a chosen version.
+- name: Install the driver
+  ansible.builtin.apt:
+    name: >-
+      {{ nvidia_driver_package if nvidia_driver_version == 'latest'
+         else nvidia_driver_package ~ '=' ~ nvidia_driver_version }}
+    state: present
+    update_cache: true
+    allow_downgrade: "{{ nvidia_driver_version != 'latest' }}"
+  when: >-
+    nvidia_driver_pkg.rc != 0
+    or (nvidia_driver_version != 'latest'
+        and nvidia_driver_pkg.stdout | trim != nvidia_driver_version)
+  register: nvidia_driver_installed
+
+# modprobe first, because a driver that loads without a reboot saves one. The
+# reboot below is the fallback, not the plan.
+- name: Load the kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: [nvidia, nvidia_modeset, nvidia_drm, nvidia_uvm]
+  loop_control:
+    label: "{{ item }}"
+  when: nvidia_driver_installed is changed
+  failed_when: false
+
+- name: Re-check the driver after loading the modules
+  ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_smi_post
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: nvidia_driver_installed is changed
+
+# Only when the modules did not take. Installing a kernel driver against a
+# running kernel that already had a different one loaded is the case that needs
+# this; a fresh host usually does not.
+- name: Reboot to load the driver
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ nvidia_reboot_timeout }}"
+    msg: "Rebooting to load the NVIDIA driver (ansible, roles/nvidia_runtime)"
+  when:
+    - nvidia_driver_installed is changed
+    - nvidia_smi_post.rc | default(1) != 0
+    - not ansible_check_mode
+
+- name: Read the driver version
+  ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_smi_final
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the driver is loaded and new enough for this hardware
+  ansible.builtin.assert:
+    that:
+      - nvidia_smi_final.rc == 0
+      - nvidia_driver_major | int >= nvidia_driver_min_major | int
+    fail_msg: >-
+      nvidia-smi reports
+      '{{ nvidia_smi_final.stdout | default("nothing") | trim }}'
+      (exit {{ nvidia_smi_final.rc | default("?") }}); this hardware needs
+      R{{ nvidia_driver_min_major }} or newer.
+
+      Below that floor the driver loads, the GPU is schedulable, and CUDA
+      kernels fail at RUNTIME with "no kernel image is available for execution"
+      — which reads as a broken build rather than a driver problem, on a machine
+      where every check here passed.
+    success_msg: "driver {{ nvidia_smi_final.stdout | default('') | trim }}"
+  vars:
+    # Split rather than regex_search: the latter returns None when a version
+    # arrives in an unexpected shape, and the surrounding expression then
+    # dereferences it, crashing the gate instead of failing it.
+    nvidia_driver_major: >-
+      {{ nvidia_smi_final.stdout | default('0') | trim
+         | split('.') | first | default('0', true) }}
+
+# --- container toolkit ------------------------------------------------------
+- name: Check whether the container toolkit is present
+  ansible.builtin.command: nvidia-ctk --version
+  register: nvidia_ctk
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fetch the libnvidia-container signing key
+  ansible.builtin.get_url:
+    url: "{{ nvidia_toolkit_gpgkey_url }}"
+    dest: /tmp/nvidia-container-toolkit.gpgkey
+    mode: "0644"
+  when: nvidia_ctk.rc != 0
+
+- name: Dearmor the signing key into the keyring
+  ansible.builtin.command: >-
+    gpg --dearmor -o {{ nvidia_toolkit_keyring }}
+    /tmp/nvidia-container-toolkit.gpgkey
+  args:
+    creates: "{{ nvidia_toolkit_keyring }}"
+  when: nvidia_ctk.rc != 0
+
+# Templated rather than curl'd and sed'd, so `--check --diff` shows the file
+# that would be written. The architecture is asked of dpkg rather than assumed:
+# gpu-bench hardcodes amd64, which is correct for revenant and wrong for any
+# arm64 host that ever gains a card.
+- name: Determine the package architecture
+  ansible.builtin.command: dpkg --print-architecture
+  register: nvidia_deb_arch
+  changed_when: false
+  check_mode: false
+
+- name: Add the libnvidia-container apt source
+  ansible.builtin.template:
+    src: nvidia-container-toolkit.list.j2
+    dest: "{{ nvidia_toolkit_sources_list }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: nvidia_ctk.rc != 0
+  register: nvidia_toolkit_source
+
+- name: Read the installed toolkit package version
+  ansible.builtin.command: "dpkg-query -W -f='${Version}' {{ nvidia_toolkit_package }}"
+  register: nvidia_toolkit_pkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Same two modes as the driver, and the same correction: this was guarded on
+# `nvidia-ctk` being absent from PATH, so the version was never compared to
+# anything on a host that already had the binary.
+- name: Install the container toolkit
+  ansible.builtin.apt:
+    name: >-
+      {{ nvidia_toolkit_package if nvidia_toolkit_version == 'latest'
+         else nvidia_toolkit_package ~ '=' ~ nvidia_toolkit_version }}
+    state: present
+    update_cache: "{{ nvidia_toolkit_source is changed }}"
+    allow_downgrade: "{{ nvidia_toolkit_version != 'latest' }}"
+  when: >-
+    nvidia_toolkit_pkg.rc != 0
+    or (nvidia_toolkit_version != 'latest'
+        and nvidia_toolkit_pkg.stdout | trim != nvidia_toolkit_version)
+
+# --- freeze what was chosen ---------------------------------------------------
+# The hold is what makes a version mean anything.
+#
+# Without it, `nvidia_driver_version` is a statement about the past: apt is free
+# to move the driver on the next upgrade, and nothing in this repository would
+# notice — the install task skips because a driver is present, and the verify
+# assert only ever checked a minimum major. The declaration and the machine
+# drift apart silently, while gpu-bench artifacts go on recording the version as
+# a fact about the substrate they measured.
+#
+# `hold` is not a preference apt weighs. It refuses to upgrade a held package
+# and says so, so the packages appear in `apt list --upgradable` and are left
+# alone by `apt upgrade` — visible, and deliberate.
+#
+# Only the two metapackages are held. NVIDIA's dependent packages
+# (libnvidia-compute, nvidia-dkms-open, and a dozen more) carry exact-version
+# dependencies on these, so apt keeps the whole set back rather than splitting
+# the tree — holding each one individually would be a list that goes stale the
+# first time upstream changes its packaging. verify.yml cross-checks the running
+# driver against the installed package to catch a split if one ever happens.
+#
+# Security updates are unaffected. These come from NVIDIA's repo, which is not
+# in unattended-upgrades' Allowed-Origins, so the security path could not have
+# touched them either way.
+- name: Freeze the driver and toolkit at the installed versions
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ nvidia_pinned_packages }}"
+  loop_control:
+    label: "{{ item }}"

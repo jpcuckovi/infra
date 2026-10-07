@@ -1,0 +1,311 @@
+# Gates for the observability stack.
+---
+# Selected by LABEL, not by name, for everything the chart generates.
+#
+# Chart-generated names are a function of the release name, the chart name, and
+# chart values — the operator prefixes `prometheus-`, the chart appended
+# `-prometheus` until cleanPrometheusOperatorObjectNames turned it off, and
+# Helm's fullname template drops its prefix when the release name already
+# contains the chart name. Encoding that formula here means the gate breaks every
+# time any input to it changes, and it breaks by reporting a healthy workload
+# ABSENT — which reads as the stack being broken rather than the gate being
+# wrong. That is exactly what happened when the release was renamed.
+#
+# Labels are set by the operator and the chart and do not vary with any of it.
+#
+# Jaeger stays addressed by name because this repository names it: it is applied
+# from roles/observability/templates/jaeger.yaml.j2, so the name is ours to know.
+- name: Read the workloads
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name | default(omit) }}"
+    label_selectors: "{{ item.labels | default(omit) }}"
+    namespace: "{{ observability_namespace }}"
+  register: obs_workloads
+  check_mode: false
+  loop: "{{ obs_expected_workloads }}"
+  loop_control:
+    label: "{{ item.what }}"
+  vars:
+    # Gated on the same three variables tasks/main.yml uses, because a gate that
+    # asserts the presence of something the host was configured NOT to install
+    # fails on a correct machine — which is worse than not checking, since it
+    # trains the reader to ignore the gate.
+    #
+    # Assembled by concatenating literal lists rather than filtering one on a
+    # truthiness attribute: `"{{ some_bool }}"` inside a dict renders to the
+    # STRING "False", and every non-empty string is truthy, so selectattr would
+    # keep exactly the entries it was meant to drop.
+    obs_jaeger_workload:
+      - what: Deployment/jaeger
+        kind: Deployment
+        name: jaeger
+    obs_grafana_workload:
+      - what: Deployment/grafana
+        kind: Deployment
+        labels: ["app.kubernetes.io/name=grafana"]
+    obs_prometheus_workload:
+      - what: StatefulSet/prometheus
+        kind: StatefulSet
+        labels:
+          - "app.kubernetes.io/name=prometheus"
+          - "app.kubernetes.io/managed-by=prometheus-operator"
+    obs_expected_workloads: >-
+      {{ (obs_jaeger_workload if observability_jaeger_enabled | bool else [])
+         + (obs_grafana_workload if observability_grafana_enabled | bool else [])
+         + obs_prometheus_workload }}
+
+# Asserted once over the whole set rather than once per workload.
+#
+# `loop_control.label` shortens a looped task's HEADER but not its result body,
+# and an assert in a loop carries the entire registered result — here, three
+# complete Deployment objects including every managedFields entry. The gate's
+# own one-line verdict ends up several screens below its evidence.
+#
+# Reducing to the missing set first gives one line on success and, on failure,
+# names exactly what is absent.
+- name: Assert every workload exists, exactly once
+  ansible.builtin.assert:
+    that:
+      - obs_missing | length == 0
+      - obs_counts | select('gt', 1) | list | length == 0
+    fail_msg: >-
+      Expected one of each in {{ observability_namespace }}; found
+      {{ obs_census | join(', ') }}.
+
+      A selector matching NOTHING means the workload is absent, or the chart
+      changed the labels this gate gates on.
+
+      A selector matching MORE THAN ONE means two releases are installed in this
+      namespace — the state a rename leaves behind when the old release was never
+      uninstalled. Both Prometheus instances then scrape the same targets and
+      remote-write under the same cluster label, which corrupts the shared store
+      in a way no single query reveals.
+    success_msg: "{{ obs_census | join(', ') }}"
+  vars:
+    # k8s_info returns an empty `resources` list when nothing matched, so
+    # rejectattr on its truthiness selects exactly the absent ones.
+    obs_absent: "{{ obs_workloads.results | rejectattr('resources') | list }}"
+    obs_missing: "{{ obs_absent | map(attribute='item.what') | list }}"
+    obs_counts: "{{ obs_workloads.results | map(attribute='resources') | map('length') | list }}"
+    # Reported as a census rather than only the failures, because the count is
+    # the diagnosis in both directions — 0 and 2 are different faults with
+    # different fixes, and the reader should not have to infer which occurred.
+    # map('string') before joining: zip yields integers, and join needs text.
+    obs_census: >-
+      {{ obs_workloads.results | map(attribute='item.what')
+         | zip(obs_counts | map('string')) | map('join', '=') | list }}
+
+# A StatefulSet's volumeClaimTemplates cannot be modified in place: the operator
+# has to delete and recreate the StatefulSet. When that does not happen,
+# Prometheus keeps running happily on its old emptyDir and every other check
+# still passes — the change is lost in a way that reads as success. This is the
+# check that notices.
+- name: Assert Prometheus storage is a PersistentVolume, not emptyDir
+  ansible.builtin.assert:
+    that:
+      - obs_prom_sts.spec.volumeClaimTemplates | default([]) | length > 0
+    fail_msg: >-
+      The Prometheus StatefulSet has no volumeClaimTemplates, so it is running
+      on an emptyDir. Metrics will vanish on the next pod restart, mid-diagnosis
+      and without an error anywhere.
+
+      volumeClaimTemplates are immutable, so applying storage to a running
+      StatefulSet requires the operator to recreate it. A failed storage change
+      leaves everything else healthy, which is why this is asserted rather than
+      assumed.
+    success_msg: "Prometheus storage is persistent"
+  vars:
+    # Selected by name, not by position. The list above is now assembled
+    # conditionally, so index 2 is the Prometheus StatefulSet on a host that runs
+    # Jaeger and Grafana and does not exist at all on one that runs neither —
+    # and a positional reference into a variable-length list fails with an index
+    # error that names neither the list nor the reason it is short.
+    obs_prom_sts: >-
+      {{ (obs_workloads.results
+          | selectattr('item.what', 'equalto', 'StatefulSet/prometheus')
+          | first).resources | first }}
+
+- name: Read the live Prometheus specification
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: monitoring.coreos.com/v1
+    kind: Prometheus
+    namespace: "{{ observability_namespace }}"
+  register: obs_prom_cr
+  check_mode: false
+
+- name: Assert retention, external labels and remote-write are live
+  ansible.builtin.assert:
+    that:
+      - obs_prom_spec.retention == prometheus_retention
+      - obs_prom_spec.externalLabels.cluster | default('') | length > 0
+      - obs_prom_spec.remoteWrite | default([]) | length > 0
+    fail_msg: >-
+      The live Prometheus does not match the intended configuration.
+
+        retention      {{ obs_prom_spec.retention | default('unset') }}
+                       (expected {{ prometheus_retention }})
+        cluster label  {{ obs_prom_spec.externalLabels.cluster | default('MISSING') }}
+        remote_write   {{ obs_prom_spec.remoteWrite | default([]) | length }} target(s)
+
+      A missing cluster label is the serious one: series from this cluster then
+      merge with identically-named series from every other cluster writing to
+      the same store, which is invisible in a graph and not separable
+      afterwards.
+    success_msg: >-
+      retention {{ obs_prom_spec.retention }},
+      cluster={{ obs_prom_spec.externalLabels.cluster }},
+      {{ obs_prom_spec.remoteWrite | length }} remote_write target(s)
+  vars:
+    obs_prom_spec: "{{ obs_prom_cr.resources[0].spec }}"
+
+# Asked of the cluster rather than read from the contract file, so that the probe
+# below tests the stack itself and the contract can be checked against it
+# independently. Reading the address from the file would make a stale file
+# invisible: both the probe and the assertion would agree, and both would be
+# pointing at the wrong node.
+- name: Ask the cluster for its node address
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+  register: obs_nodes_info
+  check_mode: false
+
+- name: Resolve the node address from the cluster
+  ansible.builtin.set_fact:
+    obs_probe_host: >-
+      {{ obs_nodes_info.resources[0].status.addresses
+         | selectattr('type', 'equalto', 'InternalIP')
+         | map(attribute='address') | first }}
+
+- name: Probe the published endpoints from the workstation
+  ansible.builtin.uri:
+    url: "{{ item.url }}"
+  register: obs_endpoints
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  loop: "{{ obs_expected_endpoints }}"
+  loop_control:
+    label: "{{ item.name }}"
+  vars:
+    # Same gating, same reason, same assembly-by-concatenation as the workload
+    # list above. A host that runs neither Grafana nor Jaeger publishes neither
+    # NodePort, and probing them would fail correctly-built machines.
+    obs_grafana_endpoint:
+      - name: grafana
+        url: "http://{{ obs_probe_host }}:{{ grafana_node_port }}/api/health"
+    obs_jaeger_endpoint:
+      - name: jaeger
+        url: "http://{{ obs_probe_host }}:{{ jaeger_ui_node_port }}/"
+    obs_expected_endpoints: >-
+      {{ [{'name': 'prometheus',
+           'url': 'http://' ~ obs_probe_host ~ ':' ~ prometheus_node_port ~ '/-/ready'}]
+         + (obs_grafana_endpoint if observability_grafana_enabled | bool else [])
+         + (obs_jaeger_endpoint if observability_jaeger_enabled | bool else []) }}
+
+- name: Assert every published endpoint answers
+  ansible.builtin.assert:
+    that:
+      - item.status == 200
+    fail_msg: >-
+      {{ item.item.name }} did not answer at {{ item.item.url }}. The workload
+      may be Ready while its NodePort is not published.
+    success_msg: "{{ item.item.name }} answers"
+  loop: "{{ obs_endpoints.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Read the discovery contract
+  ansible.builtin.stat:
+    path: "{{ observability_config_dir }}/{{ item }}"
+  register: obs_contract_stat
+  check_mode: false
+  delegate_to: localhost
+  loop:
+    - otlp-endpoint
+    - prometheus-url
+  # Only the host that WRITES the contract may assert it. These two files name
+  # the shared services cluster, not this one, so a lab node checking them would
+  # be failing — or passing — on another machine's data.
+  when: observability_write_discovery_contract | bool
+
+- name: Assert both contract files exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.size > 0
+    fail_msg: >-
+      {{ observability_config_dir }}/{{ item.item }} is absent or empty. Three
+      repos resolve the observability stack through these two files, and an
+      agent that cannot resolve them runs WITHOUT telemetry rather than failing
+      — which is the exact silent breakage this contract exists to prevent.
+    success_msg: "{{ item.item }} present"
+  loop: "{{ obs_contract_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  # Only the host that WRITES the contract may assert it. These two files name
+  # the shared services cluster, not this one, so a lab node checking them would
+  # be failing — or passing — on another machine's data.
+  when: observability_write_discovery_contract | bool
+
+- name: Read the recorded endpoints
+  ansible.builtin.slurp:
+    src: "{{ observability_config_dir }}/{{ item }}"
+  register: obs_contract
+  check_mode: false
+  delegate_to: localhost
+  loop:
+    - otlp-endpoint
+    - prometheus-url
+  # Only the host that WRITES the contract may assert it. These two files name
+  # the shared services cluster, not this one, so a lab node checking them would
+  # be failing — or passing — on another machine's data.
+  when: observability_write_discovery_contract | bool
+
+# Catches a contract recorded against an address the node no longer has. The
+# files are written at install time from whatever the cluster reported then, so
+# a node that moved since is recorded wrong — and every consumer silently points
+# at nothing.
+- name: Assert the contract names the address the cluster currently reports
+  ansible.builtin.assert:
+    that:
+      - obs_probe_host in (item.content | b64decode)
+    fail_msg: >-
+      {{ observability_config_dir }}/{{ item.item }} records
+      '{{ item.content | b64decode | trim }}', but the cluster reports its node
+      at {{ obs_probe_host }}.
+
+      The contract is stale. Re-run the observability role to rewrite it; every
+      agent repo is currently resolving to an address that does not answer.
+    success_msg: "{{ item.item }} = {{ item.content | b64decode | trim }}"
+  loop: "{{ obs_contract.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  # Only the host that WRITES the contract may assert it. These two files name
+  # the shared services cluster, not this one, so a lab node checking them would
+  # be failing — or passing — on another machine's data.
+  when: observability_write_discovery_contract | bool
+
+# Co-tenant guard. This role shares the namespace; a step that removed something
+# it does not own would show up here first.
+- name: List co-tenant workloads left untouched
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    namespace: "{{ observability_namespace }}"
+  register: obs_all_deploys
+  check_mode: false
+
+- name: Report co-tenants
+  ansible.builtin.debug:
+    msg: >-
+      co-tenants left untouched:
+      {{ obs_all_deploys.resources
+         | map(attribute='metadata.name')
+         | reject('search', 'jaeger')
+         | reject('search', observability_release)
+         | reject('search', victoriametrics_name)
+         | list | join(', ') | default('none', true) }}

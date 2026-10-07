@@ -1,0 +1,126 @@
+# The workstation CA, cert-manager, and the ClusterIssuer that joins them.
+---
+# ---- the root CA, on the workstation ---------------------------------------------
+
+- name: Ensure the CA directory exists
+  ansible.builtin.file:
+    path: "{{ cluster_ca_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+# regenerate: never — an existing key is kept whatever its parameters, because
+# replacing it is replacing the root.
+- name: Generate the CA key, once
+  community.crypto.openssl_privatekey:
+    path: "{{ cert_manager_ca_key }}"
+    type: RSA
+    size: 4096
+    mode: "0600"
+    regenerate: never
+  delegate_to: localhost
+  become: false
+
+- name: Check for the CA certificate
+  ansible.builtin.stat:
+    path: "{{ cert_manager_ca_crt }}"
+  register: cert_manager_ca_crt_stat
+  delegate_to: localhost
+  become: false
+
+# Only when absent. The certificate module's own idempotency would reissue a
+# root whose parameters drifted from these defaults; a root is not something to
+# reissue by accident.
+- name: Issue the CA certificate, once
+  when: not cert_manager_ca_crt_stat.stat.exists
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Build the CA signing request
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ cert_manager_ca_key }}"
+        common_name: "{{ cert_manager_ca_common_name }}"
+        use_common_name_for_san: false
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+        key_usage_critical: true
+      register: cert_manager_ca_csr
+
+    - name: Self-sign the CA certificate
+      community.crypto.x509_certificate:
+        path: "{{ cert_manager_ca_crt }}"
+        csr_content: "{{ cert_manager_ca_csr.csr }}"
+        privatekey_path: "{{ cert_manager_ca_key }}"
+        provider: selfsigned
+        selfsigned_not_after: "{{ cert_manager_ca_lifetime }}"
+        mode: "0644"
+
+    - name: Report how to trust the new CA
+      ansible.builtin.debug:
+        msg: >-
+          A new root CA was created at {{ cert_manager_ca_crt }}. Browsers will
+          not trust the cluster's HTTPS endpoints until it is added to the
+          macOS System keychain, once, with:
+          sudo security add-trusted-cert -d -r trustRoot
+          -k /Library/Keychains/System.keychain {{ cert_manager_ca_crt }}
+          — and Firefox, which keeps its own store, needs it imported under
+          Settings > Privacy & Security > Certificates.
+
+# ---- cert-manager ------------------------------------------------------------------
+
+- name: Install cert-manager
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ cert_manager_release }}"
+    chart_ref: cert-manager
+    chart_repo_url: "{{ cert_manager_chart_repo_url }}"
+    chart_version: "{{ cert_manager_version }}"
+    release_namespace: "{{ cert_manager_namespace }}"
+    create_namespace: true
+    values:
+      # The chart manages its CRDs, and keeps them on uninstall: deleting the
+      # CRDs would delete every Certificate in the cluster with them.
+      crds:
+        enabled: true
+        keep: true
+    wait: true
+    wait_timeout: "10m"
+
+# The key leaves the workstation here — cert-manager has to sign with it. The
+# workstation copy stays authoritative and is what survives a rebuild.
+- name: Import the root CA for cert-manager
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/tls
+      metadata:
+        name: "{{ cert_manager_ca_secret }}"
+        namespace: "{{ cert_manager_namespace }}"
+      data:
+        tls.crt: "{{ lookup('ansible.builtin.file', cert_manager_ca_crt) | b64encode }}"
+        tls.key: "{{ lookup('ansible.builtin.file', cert_manager_ca_key) | b64encode }}"
+  no_log: true
+  when: not ansible_check_mode or cert_manager_ca_crt_stat.stat.exists
+
+# No SelfSigned bootstrap issuer, on purpose: the root is external to the
+# cluster, which is what makes it durable.
+- name: Declare the CA ClusterIssuer
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: "{{ cert_manager_issuer }}"
+      spec:
+        ca:
+          secretName: "{{ cert_manager_ca_secret }}"

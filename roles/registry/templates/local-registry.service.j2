@@ -1,0 +1,33 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/registry. Edits here are overwritten on the next run.
+#
+# podman rather than Docker: nothing else on these hosts needs a daemon, and
+# k3s brings its own containerd. Running the registry under --rm with systemd
+# supervising restarts keeps the container disposable and the data in a bind
+# mount that outlives it.
+#
+# The bind mount carries no :Z. That flag asks podman to relabel the volume for
+# SELinux, and roles/preflight asserts every host is Debian-family — these run
+# AppArmor, where podman ignores it. It was inherited from a hand-written unit
+# for a machine that also did not use SELinux, so it has never had an effect on
+# anything in this estate.
+
+[Unit]
+Description=Local Container Registry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/podman stop {{ registry_container_name }}
+ExecStartPre=-/usr/bin/podman rm {{ registry_container_name }}
+ExecStart=/usr/bin/podman run --rm --name {{ registry_container_name }} \
+    -p {{ registry_bind_address }}:{{ registry_port }}:5000 \
+    -v {{ registry_root }}:/var/lib/registry \
+    {{ registry_image }}
+ExecStop=/usr/bin/podman stop -t 10 {{ registry_container_name }}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

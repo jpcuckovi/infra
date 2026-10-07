@@ -1,0 +1,174 @@
+{{ ansible_managed | comment }}
+# kube-prometheus-stack — the per-host overlay, rendered for {{ inventory_hostname }}.
+#
+# Facts about THIS cluster, applied after the base file so every key here wins.
+# Rendered rather than committed as a static file so that ports, retention and
+# cluster identity have exactly one source of truth — inventory — instead of
+# being restated here and drifting.
+
+# k3s bundles the control-plane components into one process and does not expose
+# the standard scheduler/controller/proxy/etcd metrics ports. Scraping them just
+# produces permanently-down targets and noise, and those metrics go unused.
+{% if 'k3s_servers' in group_names %}
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+{% elif 'kubeadm_clusters' in group_names %}
+# kubeadm runs the control plane as separate processes, and this estate's
+# kubeadm-config binds them so they can be scraped: bind-address on the
+# scheduler and controller manager, listen-metrics-urls on etcd. Ported from
+# k8s-aio's values file, which is where those flags are set.
+kubeControllerManager:
+  enabled: true
+  # null lets the chart discover node addresses rather than carry a hardcoded
+  # endpoint list that would need editing per cluster.
+  endpoints: null
+  service:
+    enabled: true
+    port: 10257
+    targetPort: 10257
+  serviceMonitor:
+    https: true
+    # The serving certificate is signed for the node name while the target is
+    # reached by address, so verification fails on a SAN mismatch rather than on
+    # anything meaningful about trust.
+    insecureSkipVerify: true
+kubeScheduler:
+  enabled: true
+  endpoints: null
+  service:
+    enabled: true
+    port: 10259
+    targetPort: 10259
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+kubeEtcd:
+  enabled: true
+  endpoints: null
+  service:
+    enabled: true
+    # 2381 is etcd's metrics-only listener. The client API on 2379 stays behind
+    # mutual TLS, so no client certificate is needed and this stays plain http.
+    port: 2381
+    targetPort: 2381
+  serviceMonitor:
+    scheme: http
+# Cilium replaced kube-proxy and `kubeadm init` skipped its addon, so leaving
+# this enabled produces permanently failing targets that make every other target
+# look suspect.
+kubeProxy:
+  enabled: false
+{% endif %}
+
+prometheus:
+  # NodePort rather than an ingress: the consumers are workstations on the LAN,
+  # and no ingress controller runs here — traefik is disabled at k3s install.
+  service:
+    type: NodePort
+    nodePort: {{ prometheus_node_port }}
+  prometheusSpec:
+    # Identifies this cluster's series in the shared long-term store. Every
+    # Prometheus writing to one VictoriaMetrics must carry a unique value, or
+    # identically-named series from different clusters merge into one — not
+    # visible by eye, and not cleanly separable afterwards.
+    externalLabels: {{ prometheus_external_labels | to_json }}
+
+    # Short by design. This Prometheus is a scrape buffer; history lives in
+    # VictoriaMetrics. Persisting it is about surviving a pod restart
+    # mid-diagnosis, not about hoarding.
+    retention: {{ prometheus_retention }}
+
+    # The real bound on disk usage. local-path enforces no quota, so the PVC
+    # size below is advisory and Prometheus would otherwise write until the
+    # filesystem filled.
+    retentionSize: {{ prometheus_retention_size }}
+
+    remoteWrite:
+      - url: "{{ prometheus_remote_write_url }}"
+        # Bounded so a store that is unreachable cannot grow the WAL without
+        # limit and take the node's disk with it. Samples older than the window
+        # are dropped, deliberately: losing the tail of an outage is better than
+        # losing the node.
+        queueConfig:
+          capacity: 10000
+          maxShards: 4
+          maxSamplesPerSend: 2000
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # A variable, not a constant, and the reason is that it cannot be
+          # changed later: a StatefulSet's volume claim is immutable, so a class
+          # that disagrees with an existing release is not drift to reconcile
+          # but an upgrade that fails. A cluster adopted from elsewhere declares
+          # the class it was built with.
+          storageClassName: {{ prometheus_storage_class }}
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: {{ prometheus_storage_size }}
+    resources: {{ prometheus_resources | to_json }}
+
+prometheusOperator:
+  resources: {{ prometheus_operator_resources | to_json }}
+
+{% if not (observability_grafana_enabled | bool) %}
+# Grafana is off on this host. Its metrics are read from the shared Grafana on
+# the metrics store, filtered by the `cluster` external label that every series
+# from here already carries — so nothing is lost by not running a second one,
+# and a dashboard on a routinely-rebuilt node would die with it.
+#
+# Everything below Grafana in this file still applies: the operator, Prometheus,
+# node-exporter and kube-state-metrics all run, and Prometheus keeps its own
+# NodePort for live debugging when remote-write lag matters.
+grafana:
+  enabled: false
+{% else %}
+grafana:
+  service:
+    type: NodePort
+    nodePort: {{ grafana_node_port }}
+  resources: {{ grafana_resources | to_json }}
+
+  # VictoriaMetrics is the default datasource: almost every question reaches
+  # further back than the local buffer holds. The cluster's own Prometheus stays
+  # available for the live view, where freshness matters more than depth.
+  #
+  # Making one datasource default REQUIRES unmaking the other, and the chart
+  # marks its Prometheus datasource default out of the box. Grafana treats two
+  # defaults as a fatal provisioning error rather than picking one:
+  #
+  #   Datasource provisioning error: datasource.yaml config is invalid.
+  #   Only one datasource per organization can be marked as default
+  #
+  # The pod then CrashLoopBackOffs, helm reports only "Progress deadline
+  # exceeded", and nothing between the two names a datasource. These two
+  # settings are one decision and must stay adjacent — split across files they
+  # drift apart and this comes back.
+  #
+  # isDefaultDatasource, not defaultDatasourceEnabled: the latter removes the
+  # Prometheus datasource entirely, and the live view is the reason it exists.
+  sidecar:
+    datasources:
+      isDefaultDatasource: false
+
+  # The in-cluster Service address, which is correct because a host that runs
+  # Grafana in this estate is the host that runs VictoriaMetrics — both are
+  # gated on metrics_stores membership. A cluster that had one without the other
+  # would need the metrics_alias CNAME here instead, the way
+  # prometheus_remote_write_url already discriminates.
+  additionalDataSources:
+    - name: VictoriaMetrics
+      type: prometheus
+      access: proxy
+      isDefault: true
+      url: "http://{{ victoriametrics_name }}.{{ victoriametrics_namespace }}.svc:{{ victoriametrics_port }}"
+      jsonData:
+        timeInterval: 15s
+{% endif %}

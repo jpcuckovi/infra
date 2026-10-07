@@ -1,0 +1,35 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nut.
+#
+# roles/nut reads the password back from the MONITOR line below on every run.
+# Its shape is the pattern that read depends on; reformatting it generates a new
+# password on the next run.
+{% if nut_mode == 'netclient' %}
+#
+# Not on this host, though: a netclient logs in as a secondary, with the
+# password held on the workstation, and has no primary line to read back.
+MONITOR {{ nut_ups_name }}@{{ nut_server_address }}:{{ nut_listen_port }} 1 {{ nut_secondary_user }} {{ nut_secondary_password }} secondary
+{% else %}
+MONITOR {{ nut_ups_name }}@{{ nut_listen_address }}:{{ nut_listen_port }} 1 upsmon {{ nut_upsmon_password }} primary
+{% endif %}
+MINSUPPLIES 1
+
+# Runs when the UPS is on battery AND reports its battery low. The threshold is
+# the UPS's own.
+SHUTDOWNCMD "{{ nut_shutdown_command }}"
+
+POLLFREQ 5
+POLLFREQALERT 5
+HOSTSYNC 15
+DEADTIME 15
+
+{% if nut_killpower | bool and nut_local_ups | bool %}
+# Killpower ON. After this host shuts down, the system-shutdown hook finds this
+# flag and commands the UPS to cut EVERY outlet, so the host boots when mains
+# returns if its firmware powers on after AC loss.
+POWERDOWNFLAG {{ nut_powerdown_flag }}
+{% else %}
+# Killpower OFF: POWERDOWNFLAG is deliberately absent. Without it the
+# system-shutdown hook never commands the UPS to cut its outlets, so only this
+# host shuts down, and it stays off until someone powers it on.
+{% endif %}

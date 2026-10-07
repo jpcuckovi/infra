@@ -1,0 +1,178 @@
+# Gates for the NVIDIA host stack.
+#
+# The last one is the point of the whole role: it checks that k3s picked the
+# runtime up. Everything before it can pass on a host where the GPU is
+# nonetheless unusable from a container.
+---
+- name: Read the driver version
+  ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_smi_gate
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the driver is loaded and new enough for this hardware
+  ansible.builtin.assert:
+    that:
+      - nvidia_smi_gate.rc == 0
+      - nvidia_driver_major | int >= nvidia_driver_min_major | int
+    fail_msg: >-
+      nvidia-smi reports '{{ nvidia_smi_gate.stdout | default("nothing") | trim }}'
+      (exit {{ nvidia_smi_gate.rc | default("?") }}); this hardware needs
+      R{{ nvidia_driver_min_major }} or newer.
+    success_msg: "driver {{ nvidia_smi_gate.stdout | default('') | trim }}"
+  vars:
+    nvidia_driver_major: >-
+      {{ nvidia_smi_gate.stdout | default('0') | trim
+         | split('.') | first | default('0', true) }}
+
+- name: Check the container toolkit
+  ansible.builtin.command: nvidia-ctk --version
+  register: nvidia_ctk_gate
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the container toolkit is installed
+  ansible.builtin.assert:
+    that:
+      - nvidia_ctk_gate.rc == 0
+    fail_msg: >-
+      nvidia-ctk is not on PATH. Without it k3s has no nvidia-container-runtime
+      to detect, so containerd gets no nvidia runtime and every pod requesting
+      the GPU fails at start with an unknown runtime class.
+    success_msg: "{{ nvidia_ctk_gate.stdout_lines | first | default('nvidia-ctk present') | trim }}"
+
+# --- the versions are what they say they are ---------------------------------
+# Everything above asks whether the stack WORKS. These ask whether it is the
+# stack this repository declared, which is a different question and was
+# previously asked by nothing.
+#
+# The driver assert above compares a MINIMUM major (570) — deliberately, because
+# that floor is a property of Blackwell rather than of the chosen package. It
+# therefore passes on any driver newer than the floor, which is most of them.
+# It cannot detect drift and was never meant to.
+- name: Read which packages are held
+  ansible.builtin.command: apt-mark showhold
+  register: nvidia_holds
+  changed_when: false
+  check_mode: false
+
+- name: Read the installed versions of the pinned NVIDIA packages
+  ansible.builtin.command: >-
+    dpkg-query -W -f='${Package}=${Version}\n'
+    {{ nvidia_driver_package }} {{ nvidia_toolkit_package }}
+  register: nvidia_pkg_versions
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# `apt-mark showhold` prints one package name per line and nothing else, so the
+# membership test is a list operation rather than a pattern match against a
+# status string. Asking a question that has a structural answer structurally is
+# the difference between a gate and a guess — dpkg's `db:Status-Abbrev` encodes
+# the same fact as three positional characters, and reading it would have meant
+# matching 'h' at an offset.
+- name: Assert the driver and toolkit are held at their installed versions
+  ansible.builtin.assert:
+    that:
+      - nvidia_unheld | length == 0
+    fail_msg: >-
+      Not held: {{ nvidia_unheld | join(', ') }}.
+
+      Without a hold these packages move on the next `apt upgrade`, and nothing
+      here would notice: the install task skips when the version already matches,
+      and the driver gate above only checks a minimum major. The file would go on
+      declaring one version while the machine ran another — and gpu-bench's
+      artifacts record the driver as a fact about the substrate a campaign
+      measured.
+
+      roles/nvidia_runtime applies the hold, so this failing means that task was
+      skipped or something released it:  sudo apt-mark showhold
+    success_msg: "held: {{ nvidia_pinned_packages | join(', ') }}"
+  vars:
+    nvidia_unheld: >-
+      {{ nvidia_pinned_packages | reject('in', nvidia_holds.stdout_lines) | list }}
+
+# Only meaningful when a version was named. Under `latest` there is nothing to
+# compare against — the declaration is "whatever the reload installed", and the
+# hold above is what makes that a real constraint rather than a shrug.
+- name: Assert the installed versions match the declared ones
+  ansible.builtin.assert:
+    that:
+      - nvidia_driver_declared_ok
+      - nvidia_toolkit_declared_ok
+    fail_msg: >-
+      Declared versions do not match what is installed.
+
+      driver:   declared {{ nvidia_driver_version }},
+                installed {{ nvidia_installed_driver | default('absent', true) }}
+      toolkit:  declared {{ nvidia_toolkit_version }},
+                installed {{ nvidia_installed_toolkit | default('absent', true) }}
+
+      A pin that cannot be contradicted is not a pin. This is the assert that
+      contradicts it.
+    success_msg: >-
+      versions match declaration
+      (driver {{ nvidia_driver_version }}, toolkit {{ nvidia_toolkit_version }})
+  vars:
+    # `dpkg-query -f='${Package}=${Version}'` yields name=version per line, so
+    # this becomes a dict lookup rather than positional field-splitting.
+    nvidia_installed: >-
+      {{ dict(nvidia_pkg_versions.stdout_lines | default([])
+              | map('split', '=', 1) | list) }}
+    nvidia_installed_driver: "{{ nvidia_installed[nvidia_driver_package] | default('') }}"
+    nvidia_installed_toolkit: "{{ nvidia_installed[nvidia_toolkit_package] | default('') }}"
+    nvidia_driver_declared_ok: >-
+      {{ true if nvidia_driver_version == 'latest'
+         else nvidia_installed_driver == nvidia_driver_version }}
+    nvidia_toolkit_declared_ok: >-
+      {{ true if nvidia_toolkit_version == 'latest'
+         else nvidia_installed_toolkit == nvidia_toolkit_version }}
+
+# THE gate. Everything above can pass on a host where the GPU is still unusable
+# from a container, because the question is not whether the toolkit exists but
+# whether k3s noticed it.
+#
+# k3s regenerates this file from its own template on every start, so its
+# contents are evidence of what k3s decided rather than of anything this
+# repository wrote. If the toolkit was installed AFTER k3s first started, the
+# runtime is absent here and stays absent until k3s is restarted — which is
+# exactly the ordering playbooks/_layers.yml asserts, checked from the far side.
+- name: Read the containerd configuration k3s generated
+  ansible.builtin.find:
+    paths: "{{ nvidia_containerd_dir }}"
+    patterns: "config*.toml"
+    file_type: file
+  register: nvidia_containerd_files
+  check_mode: false
+
+- name: Look for the nvidia runtime in it
+  ansible.builtin.command: "grep -ril nvidia {{ item.path }}"
+  register: nvidia_containerd_grep
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: "{{ nvidia_containerd_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Assert k3s registered the nvidia runtime with containerd
+  ansible.builtin.assert:
+    that:
+      - nvidia_containerd_files.files | length > 0
+      - nvidia_containerd_grep.results | selectattr('rc', 'equalto', 0) | list | length > 0
+    fail_msg: >-
+      No nvidia runtime in k3s's generated containerd config under
+      {{ nvidia_containerd_dir }}.
+
+      k3s scans PATH for nvidia-container-runtime ONCE, when it starts, and
+      writes the runtime into the config it generates. A toolkit installed after
+      k3s first started is invisible to it until a restart — the node stays
+      Ready, the device plugin may even advertise a GPU, and pods requesting the
+      nvidia runtime class fail at start.
+
+      Fix by restarting k3s deliberately: sudo systemctl restart k3s
+      Prevent it by composing nvidia_runtime before k3s_server, which
+      playbooks/_layers.yml asserts.
+    success_msg: "k3s registered the nvidia runtime"

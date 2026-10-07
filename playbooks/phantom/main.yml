@@ -1,0 +1,39 @@
+# phantom — the shared services host.
+#
+# Holds what every other machine consumes: the image registry, the long-term
+# metrics store, and the observability stack. Built first because it is the
+# dependency root — revenant's k3s cannot start correctly without registries.yaml
+# naming a registry that answers, and every box remote-writes its history here.
+#
+# This file declares WHAT phantom composes. HOW the two layers run — connection,
+# privilege, fact gathering, the workstation interpreter, controller
+# preconditions — lives in ../_layers.yml, stated once for the whole estate.
+#
+# The ordering constraints in these lists are not preferences and are not
+# re-litigable per host. They are asserted in ../_layers.yml rather than
+# described here, because a constraint restated in every host playbook is a
+# constraint that drifts in every host playbook.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: phantom
+
+    # preflight first: nothing should be changed before the preconditions are
+    # known. kubeconfig last: it reads the cluster's own kubeconfig, which does
+    # not exist until k3s_server has run.
+    #
+    # Phantom composes registry_mirror AND registry — it serves the registry and,
+    # like every other k3s host, needs to be told where to pull from. Hosts that
+    # only consume compose registry_mirror alone.
+    host_roles:
+      - preflight
+      - base
+      - wired_link
+      - registry_mirror
+      - registry
+      - k3s_server
+      - kubeconfig
+
+    cluster_roles:
+      - victoriametrics
+      - observability

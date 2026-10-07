@@ -1,0 +1,128 @@
+# containerd, installed from the verified upstream tarball and configured for
+# kubelet.
+#
+# Composed by kubeadm nodes only. k3s carries its own containerd, and a host
+# running both would have two runtimes answering for the same images.
+---
+- name: Install runc
+  ansible.builtin.apt:
+    name: "{{ containerd_packages }}"
+    state: present
+
+# The installed binary's own report, not the presence of a file. A `creates:`
+# guard is how a pin went unenforced once already in this repository — see the
+# k3s_version comment in group_vars/all.yml — because a binary that exists at
+# the wrong version satisfies it forever.
+- name: Read the installed containerd version
+  ansible.builtin.command: "{{ containerd_bin }} --version"
+  register: containerd_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Settle whether the pinned release is installed
+  ansible.builtin.set_fact:
+    # `containerd github.com/containerd/containerd/v2 v2.3.6 <commit>`. Matched
+    # with the surrounding spaces so 2.3.6 does not accept 2.3.60.
+    containerd_current: >-
+      {{ containerd_installed.rc == 0
+         and (' v' ~ containerd_version ~ ' ') in (containerd_installed.stdout ~ ' ') }}
+
+- name: Ensure the artifact cache exists
+  ansible.builtin.file:
+    path: "{{ containerd_cache_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  register: containerd_cache
+
+# checksum names the published .sha256sum file by URL. get_url fetches it,
+# finds the line for this file's name, and refuses a download that does not
+# match — so verification cannot silently stop happening the way a hand-quoted
+# `sha256sum -c` inside a YAML scalar can.
+- name: Download the pinned containerd release
+  ansible.builtin.get_url:
+    url: "{{ containerd_release_url }}/{{ containerd_tarball }}"
+    dest: "{{ containerd_cache_dir }}/{{ containerd_tarball }}"
+    checksum: "sha256:{{ containerd_release_url }}/{{ containerd_tarball }}.sha256sum"
+    owner: root
+    group: root
+    mode: "0644"
+  # Skipped under --check on a node with no cache directory yet. The task above
+  # only simulated creating it, and get_url, unlike copy and template, fails on
+  # a missing destination directory even in check mode. The dry run shows the
+  # directory as the pending change in its place.
+  when: not (ansible_check_mode and containerd_cache is changed)
+
+# Only when the running binary is not the pin. Extracting over a matching
+# install would report `changed` on every run and restart nothing useful.
+#
+# Skipped under --check on a node that needs it, because there is no tarball to
+# open in a dry run.
+- name: Install containerd into /usr/local
+  ansible.builtin.unarchive:
+    src: "{{ containerd_cache_dir }}/{{ containerd_tarball }}"
+    dest: /usr/local
+    remote_src: true
+    owner: root
+    group: root
+  when:
+    - not containerd_current
+    - not ansible_check_mode
+  notify: Restart containerd
+
+- name: Install the containerd unit
+  ansible.builtin.template:
+    src: containerd.service.j2
+    dest: "{{ containerd_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart containerd
+
+- name: Ensure the configuration directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ containerd_config_dir }}"
+    - "{{ containerd_registry_config_path }}/{{ registry_alias }}:{{ registry_port }}"
+
+- name: Configure containerd for kubelet
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: "{{ containerd_config_dir }}/config.toml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart containerd
+
+# Read on every pull, so a change here needs no restart — unlike k3s's
+# registries.yaml, which is read once at start and is why roles/registry_mirror
+# carries an ordering assert that this file does not need.
+- name: Declare the estate registry
+  ansible.builtin.template:
+    src: hosts.toml.j2
+    dest: "{{ containerd_registry_config_path }}/{{ registry_alias }}:{{ registry_port }}/hosts.toml"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Restart now, not at the end of the play. kubeadm_node follows this role, and
+# the verify gates read the EFFECTIVE configuration from the running daemon.
+- name: Apply containerd changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start containerd
+  ansible.builtin.systemd_service:
+    name: containerd.service
+    state: started
+    enabled: true
+    daemon_reload: true
+  # Under --check the unit file above was only simulated, so systemd has no
+  # containerd.service to start on a fresh node. Same idiom as wired_link's.
+  when: not ansible_check_mode

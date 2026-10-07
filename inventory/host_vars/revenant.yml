@@ -1,0 +1,114 @@
+# revenant — the lab box.
+#
+# GPU work, cEOS topologies, k8s failure injection, and the installation half of
+# ztlab. Reloaded routinely, and that
+# single fact shapes everything below: nothing durable lives here, and anything
+# produced here that matters has to leave the machine before it does.
+#
+# Consumes what phantom serves — pulls images through registry.lan and
+# remote-writes its history to metrics.lan — and serves nothing back. It is
+# deliberately in neither registry_hosts nor metrics_stores.
+
+# ---- cluster identity ------------------------------------------------------
+# Named for the machine, which is a departure from the rule in
+# docs/ARCHITECTURE.md that a context names a CLUSTER and machine names are
+# arbitrary identity. The departure is deliberate and narrow.
+#
+# This is a single-node cluster whose lifetime is exactly the machine's: it is
+# created by an OS reload and destroyed by the next one. There is no sense in
+# which it could be "rehomed" while remaining the same cluster, which is the
+# property `services` on phantom was protecting. A function-derived name would
+# also be wrong half the time — the same box is either a standalone k3s server
+# or a kubeadm worker, and in the second mode this context does
+# not exist at all.
+#
+# The previous name was `nightlabs`, carried in gpu-bench's config/cluster.yaml.
+# It described nothing and matched no other name in the estate.
+kubeconfig_context: revenant
+
+# ---- observability ---------------------------------------------------------
+# REQUIRED and unique across the estate. Every Prometheus writing to the one
+# VictoriaMetrics must carry a distinct value, or identically-named series from
+# phantom and revenant interleave into a single series — invisible in a graph
+# and not separable afterwards.
+#
+# This is also the label the shared Grafana filters on to show this cluster.
+prometheus_external_labels:
+  cluster: revenant
+
+# Three things this host does NOT run, because each should exist once in the
+# estate and phantom already has it.
+#
+# Jaeger: templates/jaeger.yaml.j2 argues tracing must not compete for resources
+# with the thing being traced, and this is the box whose GPU is the thing being
+# traced. Traces go to phantom over OTLP.
+#
+# Grafana: this cluster's metrics arrive in phantom's VictoriaMetrics carrying
+# cluster=revenant, and phantom's Grafana already has that store as its default
+# datasource — so they are visible there the moment remote-write starts. A
+# dashboard here would die with the next reload. The local Prometheus UI stays
+# on its NodePort for live debugging when remote-write lag matters.
+#
+# The discovery contract: those two files carry no host in their names because
+# they answer "where should an agent send telemetry" — one answer for the
+# estate, which is phantom. A second writer would overwrite phantom's on every
+# run and each host's verify would then fail the other's.
+observability_jaeger_enabled: false
+observability_grafana_enabled: false
+observability_write_discovery_contract: false
+
+# ---- k3s -------------------------------------------------------------------
+# The full list, restated rather than appended to, because group_vars owns the
+# estate-wide pair and this host owns its own reason for the third.
+#
+# max-pods 250 rather than the kubelet default of 110. This box runs the
+# observability stack alongside cEOS topologies, where a single lab is a dozen
+# containers and several labs coexist. Phantom does not carry this: its binding
+# constraint is 8GB of RAM, and a pod ceiling it can never reach is a number
+# with no meaning.
+#
+# The last three hand the pod network to Cilium, and they only work together.
+# ztlab uses revenant as its installation and needs network policy it can SHOW
+# being enforced: Hubble records every dropped flow and the policy that dropped
+# it. See docs/ARCHITECTURE.md, "revenant's CNI".
+#
+#   --flannel-backend=none     no bundled pod network; roles/cilium provides one
+#   --disable-network-policy   no bundled policy controller competing with Cilium
+#   --disable-kube-proxy       Cilium replaces kube-proxy, as it does on necropolis
+#
+# Without flannel the node registers and stays NotReady until roles/cilium runs,
+# which is why cilium leads cluster_roles in playbooks/revenant/main.yml.
+#
+# INSTALL-TIME. INSTALL_K3S_EXEC is read once, when k3s is installed — changing
+# this list later configures the NEXT install and has no effect on a running
+# server. It must be right before the first run. See docs/ARCHITECTURE.md,
+# "What is reconciled, and what is only declared".
+k3s_server_args:
+  - "--secrets-encryption"
+  - "--disable=traefik"
+  - "--kubelet-arg=max-pods=250"
+  - "--flannel-backend=none"
+  - "--disable-network-policy"
+  - "--disable-kube-proxy"
+
+# ---- inotify ---------------------------------------------------------------
+# Restated in full, not appended to: roles/base owns the estate-wide pair, and
+# this host owns its own reason for the values being larger. The same idiom the
+# k3s argument list above follows.
+#
+# 32768 rather than the estate's 8192. containerlab's cEOS scale note gives 1250
+# inotify instances per cEOS node; seven nodes is 8750, already past the default
+# before k3s and the observability stack take their share. The ceiling is chosen
+# for two labs coexisting, which is the same justification max-pods=250 carries
+# a few lines above.
+#
+# The failure this prevents is the bad kind. cEOS does not refuse to start when
+# the ceiling is too low — it starts, its agents fail with "Too many open files"
+# in a log nobody reads, and the lab converges partially, which is
+# indistinguishable from a topology that is merely still coming up.
+#
+# Unlike k3s_server_args this IS reconciled: a sysctl takes effect on write, so
+# raising it later costs nothing and no reinstall.
+base_sysctl:
+  fs.inotify.max_user_instances: "32768"
+  fs.inotify.max_user_watches: "1048576"

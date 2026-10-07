@@ -1,0 +1,18 @@
+# The container registry this host serves to the estate.
+#
+# Where consumers are told to find it is roles/registry_mirror. Nothing here
+# names an address: registry_alias and registry_port live in group_vars/all.yml,
+# because both roles need the same answer.
+---
+registry_root: /srv/registry
+registry_container_name: local-registry
+registry_unit_path: /etc/systemd/system/local-registry.service
+
+# Binds every interface, NOT loopback.
+#
+# gpu-bench's unit has `-p 127.0.0.1:5000:5000`, correctly, because that
+# registry only ever served the box it ran on. Copied verbatim onto a host that
+# serves the estate, the registry comes up healthy, passes a local curl, and
+# answers nothing for anyone else — a failure that only surfaces later as an
+# ImagePullBackOff on a different machine.
+registry_bind_address: "0.0.0.0"

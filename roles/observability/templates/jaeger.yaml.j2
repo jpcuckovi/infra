@@ -1,0 +1,108 @@
+{{ ansible_managed | comment }}
+# Jaeger v2 — the shared trace backend for the diagnostic agents.
+#
+# Ported from k8s-obs-stack/deploy/jaeger/jaeger.yaml. The agents are
+# distinguished by service.name rather than by deployment, and use matching span
+# names and attribute keys so their traces read identically side by side. That
+# contract is why one instance serves all of them.
+#
+# Runs on the shared services cluster, separate from any lab host: tracing must
+# not compete for resources with the thing being traced, and a lab node is
+# redeployed often.
+#
+# Storage is Badger — embedded, no external database. Traces are durable across
+# restarts, which matters because the interesting comparison is between runs:
+# whether a change to a tool description made the agent behave better is only
+# answerable if last week's traces still exist.
+#
+# NO Namespace resource here, deliberately. The namespace is shared with
+# unrelated workloads, so nothing in this file may be capable of removing it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jaeger-badger
+  namespace: {{ observability_namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Spans are small; this holds a long history. Provisioned from local disk
+      # via the default local-path StorageClass.
+      storage: {{ jaeger_storage_size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: {{ observability_namespace }}
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: a ReadWriteOnce volume cannot be mounted by the
+  # old and new pods at once, so a rolling update would deadlock.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+      annotations:
+        # Roll the pod when the pipeline config changes. Without this the
+        # ConfigMap updates and the running collector keeps its old pipeline —
+        # the change is applied and inert, which looks like success.
+        infra/config-checksum: "{{ lookup('file', 'jaeger-config.yaml') | hash('sha1') }}"
+    spec:
+      # The image runs as uid 10001. Without this the PVC is root-owned and
+      # Badger cannot create its store, which presents as a crash loop.
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: jaeger
+          image: {{ jaeger_image }}
+          args: ["--config", "file:/conf/jaeger-config.yaml"]
+          ports:
+            - { name: ui, containerPort: 16686 }
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: health, containerPort: 13133 }
+          volumeMounts:
+            - { name: config, mountPath: /conf }
+            - { name: badger, mountPath: /badger }
+          resources: {{ jaeger_resources | to_json }}
+          readinessProbe:
+            httpGet: { path: /status, port: 13133 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /status, port: 13133 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: jaeger-config
+        - name: badger
+          persistentVolumeClaim:
+            claimName: jaeger-badger
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: {{ observability_namespace }}
+spec:
+  # NodePort rather than an ingress: the trace producers are workstations and
+  # lab hosts on the LAN, not something inside the cluster, and a fixed port
+  # needs no DNS beyond the node's own name.
+  type: NodePort
+  selector:
+    app: jaeger
+  ports:
+    - { name: ui, port: 16686, targetPort: 16686, nodePort: {{ jaeger_ui_node_port }} }
+    - { name: otlp-http, port: 4318, targetPort: 4318, nodePort: {{ jaeger_otlp_http_node_port }} }
+    - { name: otlp-grpc, port: 4317, targetPort: 4317, nodePort: {{ jaeger_otlp_grpc_node_port }} }

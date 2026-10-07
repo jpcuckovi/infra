@@ -1,0 +1,78 @@
+# Disable power save on every wireless interface this host carries.
+#
+# Composed only by hosts in wifi_hosts. A wired machine needs none of these
+# tasks — not a subset of them with different values — which is the test for a
+# separate role rather than a `when:` inside base.
+#
+# The failure this exists to prevent: phantom's link dropped at 02:47 with
+# `brcmf_cyw_external_auth: External authentication failed`, and the box stayed
+# up and healthy, serving its registry to nobody, for three and a half hours.
+# Power save is the most common cause of a wireless drop that never recovers,
+# because a sleeping radio misses the reassociation it needed to answer.
+---
+- name: Install the wireless tools
+  ansible.builtin.apt:
+    name: "{{ wifi_link_packages }}"
+    state: present
+
+# /sys/class/net/<iface>/wireless exists if and only if the interface is
+# wireless, on every driver and every kernel. That is why it is used here rather
+# than matching on names: `wlan0` is a brcmfmac convention, systemd's predictable
+# naming gives `wlp2s0`, and this estate has both.
+#
+# follow: true because the entries under /sys/class/net are symlinks into
+# /sys/devices — without it the search never descends and finds nothing, on a
+# host where every interface is wireless.
+- name: Discover the wireless interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: wireless
+    file_type: directory
+    recurse: true
+    depth: 2
+    follow: true
+  register: wifi_link_found
+  check_mode: false
+
+- name: Settle the interface list
+  ansible.builtin.set_fact:
+    wifi_link_managed: >-
+      {{ wifi_link_interfaces
+         if (wifi_link_interfaces | length > 0)
+         else (wifi_link_found.files | map(attribute='path')
+               | map('dirname') | map('basename') | list) }}
+
+- name: Assert a wireless interface was found
+  ansible.builtin.assert:
+    that:
+      - wifi_link_managed | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} is in wifi_hosts but carries no wireless
+      interface — nothing under /sys/class/net has a `wireless` directory.
+
+      Either the host is wired and should leave that group, or its driver failed
+      to load and the radio is absent rather than merely down. `ip link` will
+      show the interface in the second case and not in the first.
+    success_msg: "wireless interfaces: {{ wifi_link_managed | join(', ') }}"
+
+- name: Install the power-save unit
+  ansible.builtin.template:
+    src: wifi-powersave@.service.j2
+    dest: "{{ wifi_link_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start power-save suppression per interface
+  ansible.builtin.systemd_service:
+    name: "wifi-powersave@{{ item }}.service"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop: "{{ wifi_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  # Under --check the unit above was only simulated, so systemd has no
+  # wifi-powersave@ template to instantiate and this fails on a host where
+  # nothing is wrong. Same idiom, and same reason, as the registry's start task.
+  when: not ansible_check_mode

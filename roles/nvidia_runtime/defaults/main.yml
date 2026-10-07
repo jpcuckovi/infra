@@ -1,0 +1,37 @@
+# Paths and probes for the NVIDIA host stack.
+#
+# The VERSIONS are not here — they live in inventory/group_vars/gpu_hosts.yml,
+# because they are a property of the hardware class rather than of this role,
+# and because a pin repeated in two files is a pin that drifts between them.
+---
+# lspci, which this role's first probe depends on. Not in base_packages: base
+# carries what every machine needs, and a host with no GPU has no use for it.
+nvidia_runtime_packages:
+  - pciutils
+
+# The packages this role freezes, named once so main.yml's hold and
+# verify.yml's gate cannot disagree about what is supposed to be pinned. A gate
+# checking a different list from the one the converge acts on is a gate that
+# passes while the thing it names goes unheld.
+#
+# Only the two metapackages. NVIDIA's dependent packages carry exact-version
+# dependencies on these, so apt keeps the whole set back rather than splitting
+# the tree; enumerating libnvidia-compute, nvidia-dkms-open and the rest would
+# be a list that goes stale the first time upstream repackages.
+nvidia_pinned_packages:
+  - "{{ nvidia_driver_package }}"
+  - "{{ nvidia_toolkit_package }}"
+
+nvidia_toolkit_gpgkey_url: https://nvidia.github.io/libnvidia-container/gpgkey
+nvidia_toolkit_keyring: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+nvidia_toolkit_sources_list: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+nvidia_toolkit_repo_base: https://nvidia.github.io/libnvidia-container/stable/deb
+
+# Long enough for a workstation to POST, which is slower than it sounds on a
+# board with a lot of memory to train. The reboot only happens when a freshly
+# installed driver fails to load into the running kernel.
+nvidia_reboot_timeout: 600
+
+# Where k3s writes the containerd config it generates. Read only — nothing in
+# this repository writes it, and gpu-bench deleted the call that used to.
+nvidia_containerd_dir: /var/lib/rancher/k3s/agent/etc/containerd

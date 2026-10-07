@@ -1,0 +1,119 @@
+# Gates for the baseline.
+#
+# Included by playbooks/<host>/verify.yml. Assertions live here, beside the
+# tasks that create what they check, so adding a host composes gates rather than
+# copying them.
+---
+- name: Read the running kernel tunables
+  ansible.builtin.command: "sysctl -n {{ item.key }}"
+  register: base_sysctl_live
+  changed_when: false
+  check_mode: false
+  loop: "{{ base_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Asserted once over the whole set rather than once per tunable.
+#
+# `loop_control.label` shortens a looped task's HEADER but not its result body,
+# and an assert in a loop carries the entire registered result — for a command
+# that is the full invocation, for kubernetes.core it is the whole resource
+# including managedFields. The gate then buries its own one-line verdict.
+#
+# Reducing to the mismatches first gives one line on success and, on failure,
+# names exactly which tunables are wrong instead of leaving the reader to find
+# the one failing item among several screens of correct ones.
+- name: Assert kernel tunables are live, not merely written
+  ansible.builtin.assert:
+    that:
+      - base_sysctl_actual == base_sysctl_expected
+    fail_msg: >-
+      Expected {{ base_sysctl_want | join(', ') }};
+      the machine reports {{ base_sysctl_found | join(', ') }}.
+
+      The drop-in at {{ base_sysctl_file }} may exist without having been
+      applied — a written-but-inactive tunable is the shape of failure that
+      looks green everywhere else.
+    success_msg: "{{ base_sysctl_found | join(', ') }}"
+  vars:
+    # Compared as whole lists rather than per item. rejectattr and selectattr
+    # test an attribute against a CONSTANT, so neither can express "this result's
+    # stdout differs from this result's own expected value" — the two sides of
+    # the comparison both live on the item.
+    base_sysctl_keys: >-
+      {{ base_sysctl_live.results | map(attribute='item.key') | list }}
+    base_sysctl_actual: >-
+      {{ base_sysctl_live.results | map(attribute='stdout') | map('trim') | list }}
+    base_sysctl_expected: >-
+      {{ base_sysctl_live.results | map(attribute='item.value') | list }}
+    base_sysctl_found: >-
+      {{ base_sysctl_keys | zip(base_sysctl_actual) | map('join', '=') | list }}
+    base_sysctl_want: >-
+      {{ base_sysctl_keys | zip(base_sysctl_expected) | map('join', '=') | list }}
+
+# Asserted on the PROFILE, not the package or the service.
+#
+# A removed package with its AppArmor profile still resident in the kernel is the
+# half-fix that looks complete: no daemon, no unit, and a profile quietly
+# confining container processes and generating denials. The profile is the thing
+# that caused the outage after rsyslog itself was already stopped, so the profile
+# is what this gate reads.
+- name: Read the loaded AppArmor profiles
+  ansible.builtin.slurp:
+    src: /sys/kernel/security/apparmor/profiles
+  register: base_apparmor_loaded
+  check_mode: false
+  failed_when: false
+
+- name: Assert no rsyslog profile is loaded
+  ansible.builtin.assert:
+    that:
+      - "'rsyslog' not in base_apparmor_profiles"
+    fail_msg: >-
+      An rsyslog AppArmor profile is still loaded in the kernel on
+      {{ inventory_hostname }}.
+
+      Removing the package does not unload a profile already resident, and a
+      resident profile keeps confining whatever its attachment path matches —
+      which on revenant was container processes, emitting denials at a rate that
+      filled the kernel audit backlog and took the host off the network while it
+      was still powered on.
+
+      Unload it, or reboot:
+        sudo apparmor_parser -R /etc/apparmor.d/*rsyslog*
+    success_msg: "no rsyslog AppArmor profile loaded"
+  vars:
+    # The file is one profile per line with a mode in parentheses. Decoded and
+    # searched as a whole rather than parsed, because the question is only
+    # whether the name appears at all.
+    base_apparmor_profiles: >-
+      {{ base_apparmor_loaded.content | default('') | b64decode }}
+
+- name: Check the hostname the machine reports
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['hostname'] == inventory_hostname
+    fail_msg: >-
+      This machine calls itself '{{ ansible_facts['hostname'] }}' but is
+      addressed as '{{ inventory_hostname }}'. k3s derives its node name from
+      the hostname, so a mismatch means the Node object is named something no
+      inventory entry refers to, and a later rename is a node replacement rather
+      than an edit.
+      Fix with: hostnamectl set-hostname {{ inventory_hostname }}
+    success_msg: "hostname {{ ansible_facts['hostname'] }}"
+
+- name: Confirm the clock service is running
+  ansible.builtin.systemd_service:
+    name: chrony
+  register: base_chrony
+  check_mode: true
+
+- name: Assert the clock is disciplined
+  ansible.builtin.assert:
+    that:
+      - base_chrony.status.ActiveState == "active"
+    fail_msg: >-
+      chrony is {{ base_chrony.status.ActiveState }}. Clock skew across the
+      estate makes correlated traces and metrics lie about ordering, which is
+      the one thing an observability stack exists to get right.
+    success_msg: "chrony active"

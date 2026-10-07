@@ -1,0 +1,80 @@
+# Gates for the wired link.
+#
+# Asserts the PHY's state, not the unit's. A unit that is enabled and active
+# proves systemd ran `ethtool`; it does not prove the setting survived the last
+# link renegotiation, and since EEE is negotiated fresh every time the link comes
+# up, that difference is the whole question. `ethtool --show-eee` asks the
+# interface.
+---
+- name: Discover the hardware-backed interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: device
+    file_type: any
+    recurse: true
+    depth: 2
+    follow: true
+  register: wired_link_hardware
+  check_mode: false
+
+- name: Discover the wireless interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: wireless
+    file_type: directory
+    recurse: true
+    depth: 2
+    follow: true
+  register: wired_link_radios
+  check_mode: false
+
+- name: Settle the interface list
+  ansible.builtin.set_fact:
+    wired_link_managed: >-
+      {{ wired_link_interfaces
+         if (wired_link_interfaces | length > 0)
+         else ((wired_link_hardware.files | map(attribute='path')
+                | map('dirname') | map('basename') | list)
+               | difference(wired_link_radios.files | map(attribute='path')
+                            | map('dirname') | map('basename') | list)) }}
+
+- name: Read the EEE state of each interface
+  ansible.builtin.command: "ethtool --show-eee {{ item }}"
+  register: wired_link_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assert EEE is off on every wired interface
+  ansible.builtin.assert:
+    that:
+      - wired_link_on | length == 0
+    fail_msg: >-
+      EEE is still enabled on {{ wired_link_on | join(', ') }}.
+
+      Low Power Idle wake transitions drop packets, a dropped packet in an idle
+      stream has no duplicate ACKs to trigger fast retransmit, and the resulting
+      timeout backs off exponentially — so a sub-millisecond hardware event is
+      felt as a terminal that freezes for several seconds and then catches up all
+      at once. Throughput tests will not show it, because a saturated link never
+      goes idle.
+
+      Check: systemctl status eee-off@<iface>, and whether the link renegotiated
+      after the unit last ran — a reseated cable or a switch reboot is enough.
+    success_msg: "EEE off: {{ wired_link_managed | join(', ') }}"
+  vars:
+    # `ethtool --show-eee` prints "EEE status: disabled", "enabled - active",
+    # "enabled - inactive", or "not supported". Only the two `enabled` forms are
+    # failures: "not supported" means the hardware cannot park the link and
+    # there is nothing to suppress.
+    #
+    # Anchored on the status line rather than searching the whole output,
+    # because the block below it lists the EEE link modes both ends advertise
+    # and those strings contain the word regardless of the negotiated state.
+    wired_link_on: >-
+      {{ wired_link_state.results
+         | selectattr('stdout', 'search', '(?i)EEE status:\s*enabled')
+         | map(attribute='item') | list }}

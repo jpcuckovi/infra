@@ -1,0 +1,71 @@
+# A node that carries network topologies as Kubernetes workloads.
+#
+# Distinct from roles/containerlab, which converges a host to run containerlab
+# DIRECTLY over veth pairs with no Kubernetes at all. The kernel modules overlap;
+# the runtime, the lifecycle and the failure modes do not, and a host running
+# both would need both roles rather than a wider version of either.
+#
+# What this role does NOT do:
+#
+#   - install podman or the containerlab .deb. Under clabernetes the launcher
+#     image carries its own containerlab, and the node's container runtime is
+#     the one k3s already provides. Installing either here would be furniture
+#     nothing sits on.
+#   - install the clabernetes controller. That is a cluster capability and lives
+#     in roles/clabernetes, the same seam that separates k3s_server from
+#     observability.
+#   - run a topology. Topologies are the experiment, and an experiment belongs to
+#     the repository that varies it — the same rule roles/containerlab states.
+---
+
+# ---- kernel modules ---------------------------------------------------------
+# A property of a topology-carrying node, not of the estate. The test for
+# belonging here is the one that put `iw` in wifi_link: a machine that runs no
+# topologies needs none of them.
+#
+#   sch_netem   tc impairment — loss, delay, jitter, rate limiting. The whole
+#               L1/L2 fault catalogue is built on it, and its absence is silent:
+#               tc accepts a netem qdisc against a kernel without it by impairing
+#               nothing, so the scenario runs, the agent correctly reports a
+#               healthy network, and the miss is scored against the agent.
+#   veth        the link primitive. Without it no topology comes up at all.
+#   vrf         VRF separation.
+#   bonding     what lets a container build an 802.3ad bond, which is how the
+#               cEOS lab's host terminates LACP into an MLAG pair. Without it the
+#               bundle falls back to static and the LACP fault family disappears.
+#   8021q       tagged subinterfaces on a host.
+#
+# mpls_router is deliberately absent, unlike roles/containerlab. No topology here
+# uses MPLS, and on Ubuntu's generic amd64 kernel it lives in linux-modules-extra
+# — so naming it would demand a package for a capability nothing exercises.
+clabernetes_kernel_modules:
+  - sch_netem
+  - veth
+  - vrf
+  - bonding
+  - 8021q
+
+# Named for this role, not for roles/containerlab. A host that ever carried both
+# would otherwise have one file overwriting the other's list.
+clabernetes_modules_conf: /etc/modules-load.d/clabernetes.conf
+
+# Empty, and the test is `modinfo -n <module>`: a path means the module is
+# present and this stays empty, "not found" means something has to supply it.
+#
+# roles/containerlab carries the same contract and reached the same answer for a
+# different reason — its host runs Ubuntu's raspi kernel, this one runs generic.
+# The value agreeing is a coincidence worth not relying on.
+clabernetes_modules_extra_package: ""
+
+# ---- inotify ----------------------------------------------------------------
+# cEOS is unusually hungry here: containerlab's own scale note gives 1250 inotify
+# instances per cEOS node. This is the per-node figure the gate multiplies by the
+# expected topology size, NOT a value this role sets — the sysctl itself belongs
+# to roles/base, and is overridden for a host in that host's host_vars, which is
+# where a value with a per-machine justification goes.
+clabernetes_inotify_per_node: 1250
+
+# The size the gate assumes when checking headroom. Seven cEOS nodes is the
+# current lab; the ceiling is chosen so a second lab can coexist, which is the
+# same justification revenant's max-pods=250 already carries.
+clabernetes_expected_nodes: 14

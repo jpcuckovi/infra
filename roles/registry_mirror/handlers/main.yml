@@ -1,0 +1,34 @@
+# Both handlers exist for one situation: the mirror config changed on a host where
+# k3s was ALREADY running. They are mutually exclusive by construction, and which
+# one fires is registry_restart_k3s_on_change.
+#
+# This is the repository's worked example of "reconciled, but the operator chooses
+# the timing" — see docs/ARCHITECTURE.md, "What is reconciled, and what is only
+# declared". The file on disk is always correct; only its application is deferred.
+---
+# k3s reads registries.yaml only at start. If it is already running when the
+# mirror config changes, the config is correct on disk and inert in the process
+# — the failure appears later as an ImagePullBackOff naming an image, not a
+# config.
+- name: Restart k3s to read the mirror config
+  ansible.builtin.systemd_service:
+    name: k3s
+    state: restarted
+  when:
+    - registry_k3s_running | bool
+    - registry_restart_k3s_on_change | bool
+
+- name: Report that k3s has not read the new mirror config
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ k3s_registries_yaml }} changed while k3s was already running.
+      k3s read the old configuration at start, so pulls from
+      {{ registry_alias }}:{{ registry_port }} will fail until it is restarted.
+
+      This run did NOT restart it, because that bounces every pod on the node
+      and is not something to do as a side effect. Restart deliberately with:
+        sudo systemctl restart k3s
+      or re-run with -e registry_restart_k3s_on_change=true
+  when:
+    - registry_k3s_running | bool
+    - not (registry_restart_k3s_on_change | bool)

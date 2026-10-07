@@ -1,0 +1,108 @@
+{{ ansible_managed | comment }}
+#
+# kubeadm configuration for the node that initialises {{ kubeconfig_context }}.
+# Ported from k8s-aio's ops/manifests/kubeadm/kubeadm-config.yaml.tmpl.
+#
+# A config file rather than a pile of flags: controlPlaneEndpoint, podSubnet
+# and the kubelet cgroup driver all matter enough to be reviewable in one
+# place, and the same file documents the cluster after the fact.
+#
+# API v1beta4 requires Kubernetes 1.31+. kubeletExtraArgs and extraArgs are
+# LISTS of name/value pairs in v1beta4, where v1beta3 took maps — silently the
+# wrong shape if copied from an older guide.
+
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  # The node's own address, not the VIP. This is where its API server binds;
+  # the VIP floats on top and is set in ClusterConfiguration below.
+  advertiseAddress: "{{ kubeadm_control_plane_node_ip }}"
+  bindPort: {{ kubeadm_control_plane_port }}
+nodeRegistration:
+  name: "{{ inventory_hostname }}"
+  criSocket: "{{ kubeadm_control_plane_cri_socket }}"
+  kubeletExtraArgs:
+    # Pinned so kubelet does not pick a different address once the Cilium
+    # interfaces appear.
+    - name: node-ip
+      value: "{{ kubeadm_control_plane_node_ip }}"
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: "{{ kubeconfig_context }}"
+kubernetesVersion: "v{{ kubernetes_version }}"
+
+# The VIP's ADDRESS, resolved from {{ kubeadm_control_plane_endpoint }} at run time,
+# and it must be right the first time: changing controlPlaneEndpoint on a
+# running cluster means regenerating API server certificates on every node.
+#
+# An address rather than the name, so kubelets and kube-vip reach the API
+# without depending on the router's DNS. The name is in certSANs below, which
+# is what lets the workstation's kubeconfig use it.
+controlPlaneEndpoint: "{{ kubeadm_control_plane_vip }}:{{ kubeadm_control_plane_port }}"
+
+networking:
+  podSubnet: "{{ kubeadm_control_plane_pod_subnet }}"
+  serviceSubnet: "{{ kubeadm_control_plane_service_subnet }}"
+
+# CLUSTER-WIDE: joining control-plane nodes read this from the kubeadm-config
+# ConfigMap, so nothing here may name one node. k8s-aio listed node 1's address
+# here, which put node 1's IP into every other node's certificate; kubeadm adds
+# each node's own advertise address by itself.
+apiServer:
+  certSANs:
+    - "{{ kubeadm_control_plane_vip }}"
+    - "{{ kubeadm_control_plane_endpoint }}"
+    # kube-vip reaches the API through a loopback kubeconfig. Without this SAN
+    # the TLS handshake fails and the VIP never comes up.
+    - "127.0.0.1"
+    - "localhost"
+
+# Scheduler and controller-manager bind 127.0.0.1 by default under kubeadm,
+# which makes their metrics unreachable from a Prometheus pod on another node.
+# Set at init so it propagates to every joining node through the ConfigMap.
+#
+# These endpoints are authenticated and authorised (10257/10259 over TLS);
+# binding 0.0.0.0 exposes them on the LAN but not anonymously.
+controllerManager:
+  extraArgs:
+    - name: bind-address
+      value: "0.0.0.0"
+
+scheduler:
+  extraArgs:
+    - name: bind-address
+      value: "0.0.0.0"
+
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+    # Stacked etcd: one member per control-plane node. Quorum is 2 of 3.
+    #
+    # No serverCertSANs/peerCertSANs, unlike k8s-aio: the same cluster-wide
+    # problem as certSANs above, and kubeadm already includes each node's own
+    # address and hostname in its etcd certificates.
+    extraArgs:
+      # kubeadm defaults this to 127.0.0.1:2381, so etcd metrics cannot be
+      # scraped off-node. 2381 is the metrics listener ONLY — the client API
+      # stays on 2379 behind mutual TLS — so plain HTTP exposes metrics, not
+      # data or control.
+      - name: listen-metrics-urls
+        value: "http://0.0.0.0:2381"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# Must match containerd's SystemdCgroup = true (roles/containerd). A mismatch
+# has kubelet and containerd disagreeing about cgroup ownership, and pods fail
+# to start with an error that names neither.
+cgroupDriver: systemd
+
+# kubelet requests its SERVING certificate from the cluster CA through the CSR
+# API instead of self-signing it, so metrics-server and Prometheus can verify
+# kubelet without --kubelet-insecure-tls.
+#
+# The resulting kubernetes.io/kubelet-serving CSRs are not auto-approved by the
+# cluster — nothing in it can verify a node owns the addresses it requests.
+# tasks/main.yml approves them, narrowly; k8s-aio left them for a human after
+# every rebuild.
+serverTLSBootstrap: true

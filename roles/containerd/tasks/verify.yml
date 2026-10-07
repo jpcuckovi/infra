@@ -1,0 +1,72 @@
+# Gates for containerd.
+#
+# Asserts what the running daemon reports, not what is on disk. A config.toml
+# with the right lines proves the template rendered; `containerd config dump`
+# proves containerd parsed it and merged it the way kubelet will experience it.
+# A misplaced table header renders perfectly and is silently ignored.
+---
+- name: Read the running containerd version
+  ansible.builtin.command: "{{ containerd_bin }} --version"
+  register: containerd_version_out
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert containerd is the pinned release
+  ansible.builtin.assert:
+    that:
+      - containerd_version_out.rc == 0
+      - (' v' ~ containerd_version ~ ' ') in (containerd_version_out.stdout ~ ' ')
+    fail_msg: >-
+      Expected containerd v{{ containerd_version }} at {{ containerd_bin }}; got
+      rc={{ containerd_version_out.rc }}:
+      {{ containerd_version_out.stdout | default('') }}{{ containerd_version_out.stderr | default('') }}
+
+      A missing binary means the install task was skipped or failed. A
+      different version means the pin moved without a converge — run
+      playbooks/necropolis/main.yml.
+    success_msg: "{{ containerd_version_out.stdout }}"
+
+- name: Read the containerd service state
+  ansible.builtin.systemd_service:
+    name: containerd.service
+  register: containerd_unit
+  check_mode: false
+
+- name: Assert containerd is running and enabled
+  ansible.builtin.assert:
+    that:
+      - containerd_unit.status.ActiveState == 'active'
+      - containerd_unit.status.UnitFileState == 'enabled'
+    fail_msg: >-
+      containerd.service is {{ containerd_unit.status.ActiveState }} /
+      {{ containerd_unit.status.UnitFileState }}. kubelet has no runtime without
+      it. `journalctl -u containerd -b` shows why; a restart loop with no log
+      output at all is the signature of Ubuntu's SIGSEGVing package, installed
+      over or alongside this one.
+    success_msg: "containerd active and enabled"
+
+- name: Read the effective containerd configuration
+  ansible.builtin.command: "{{ containerd_bin }} config dump"
+  register: containerd_dump
+  changed_when: false
+  check_mode: false
+
+- name: Assert kubelet's cgroup driver and the registry path are in effect
+  ansible.builtin.assert:
+    that:
+      - containerd_dump.stdout is search('(?m)^\s*SystemdCgroup\s*=\s*true\s*$')
+      - containerd_dump.stdout is search("(?m)^\s*config_path\s*=\s*['\"]" ~ containerd_registry_config_path ~ "['\"]")
+    fail_msg: >-
+      containerd's merged configuration is missing SystemdCgroup = true or
+      config_path = '{{ containerd_registry_config_path }}'.
+
+      The first makes kubelet and containerd disagree about cgroup ownership,
+      and pods fail to start with an error naming neither. The second makes
+      containerd ignore every hosts.toml, so {{ registry_alias }} images are
+      pulled as if from an HTTPS registry and fail.
+
+      Compare {{ containerd_config_dir }}/config.toml with `containerd config
+      dump`: a line present in the file and absent from the dump is under the
+      wrong table header.
+    success_msg: "SystemdCgroup and config_path in effect"

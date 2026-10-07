@@ -1,0 +1,38 @@
+# Gates for the containerd mirror config.
+#
+# Runs on every k3s host, including the one serving the registry. The gates that
+# prove the registry ANSWERS live in roles/registry and run only where it is
+# served.
+---
+- name: Read the mirror configuration
+  ansible.builtin.slurp:
+    src: "{{ k3s_registries_yaml }}"
+  register: registry_mirror_conf
+  check_mode: false
+
+- name: Assert the mirror names the DNS alias, not a machine
+  ansible.builtin.assert:
+    that:
+      - registry_alias in registry_mirror_parsed
+      - "'localhost' not in registry_mirror_parsed"
+    fail_msg: >-
+      {{ k3s_registries_yaml }} does not name {{ registry_alias }}, or still
+      names localhost. Every host must carry byte-identical mirror config: a
+      localhost special case on the serving host means images tagged there do
+      not pull anywhere else, and the registry can no longer move hosts without
+      editing every consumer.
+
+      Mirrors declared: {{ registry_mirror_parsed }}
+    success_msg: "mirror config names {{ registry_alias }}"
+  vars:
+    # Parsed as YAML and re-serialised, so this examines the CONFIGURATION
+    # rather than the file. Comments are not configuration, and the template
+    # renders a header explaining why localhost is the wrong thing to name here
+    # — a substring search over the raw bytes reads that explanation as the
+    # violation it warns about, and the gate fails on a correct file.
+    #
+    # The same mistake in the other direction is what the first assertion
+    # guards: a file that merely mentions registry.lan in a comment while
+    # mirroring something else would pass a text search.
+    registry_mirror_parsed: >-
+      {{ registry_mirror_conf.content | b64decode | from_yaml | to_json }}

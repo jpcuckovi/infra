@@ -1,0 +1,21 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/registry_mirror. Read by k3s ONCE, at start.
+#
+# Identical on every host in the estate, including the one that serves the
+# registry. Naming registry.lan rather than localhost here is what makes that
+# true: a config with a localhost special case for the serving host is a config
+# that has to be reasoned about per machine, and images tagged on one box would
+# not pull on another.
+#
+# registry.lan is a CNAME, so the registry can move hosts without a single image
+# being re-tagged and without this file changing.
+#
+# Declared as a distinct registry, NOT as a mirror for docker.io. The difference
+# matters when the registry is down: only locally-built images fail to pull, and
+# everything from upstream is unaffected. Mirroring docker.io would make this
+# host a single point of failure for every pull in the estate.
+
+mirrors:
+  "{{ registry_alias }}:{{ registry_port }}":
+    endpoint:
+      - "http://{{ registry_alias }}:{{ registry_port }}"

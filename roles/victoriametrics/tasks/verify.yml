@@ -1,0 +1,117 @@
+# Gates for the long-term metrics store.
+---
+- name: Read the VictoriaMetrics deployment
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ victoriametrics_name }}"
+    namespace: "{{ victoriametrics_namespace }}"
+  register: vm_deploy
+  check_mode: false
+
+- name: Assert VictoriaMetrics is available
+  ansible.builtin.assert:
+    that:
+      - vm_deploy.resources | length == 1
+      - vm_deploy.resources[0].status.availableReplicas | default(0) == 1
+    fail_msg: >-
+      The {{ victoriametrics_name }} deployment is not available in
+      {{ victoriametrics_namespace }}. Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ victoriametrics_namespace }} describe deploy/{{ victoriametrics_name }}
+    success_msg: "{{ victoriametrics_name }} available"
+
+- name: Assert the storage volume is bound
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: PersistentVolumeClaim
+    name: "{{ victoriametrics_name }}-storage"
+    namespace: "{{ victoriametrics_namespace }}"
+  register: vm_pvc
+  check_mode: false
+  failed_when: >-
+    vm_pvc.resources | length != 1 or
+    vm_pvc.resources[0].status.phase != 'Bound'
+
+# Probed through the CNAME from the workstation, not through the ClusterIP.
+# That is the path every other box's Prometheus takes, so it is the path worth
+# proving — a store reachable only from inside the cluster it runs in collects
+# nothing from the estate.
+- name: Probe VictoriaMetrics health over the LAN
+  ansible.builtin.uri:
+    url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/health"
+  register: vm_health
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+
+- name: Assert VictoriaMetrics answers on the metrics alias
+  ansible.builtin.assert:
+    that:
+      - vm_health.status == 200
+    fail_msg: >-
+      {{ metrics_alias }}:{{ victoriametrics_node_port }} did not answer from
+      this workstation. Either the {{ metrics_alias }} CNAME does not resolve to
+      the host running the store, or the NodePort is not published.
+
+      Every other box in the estate writes its history through this address. If
+      it is unreachable, their Prometheus instances will buffer and then drop
+      samples while continuing to look healthy.
+    success_msg: "VictoriaMetrics answers on {{ metrics_alias }}:{{ victoriametrics_node_port }}"
+
+# Proves data is actually landing, not merely that both ends are running. A
+# Prometheus remote-writing into a black hole reports no error a dashboard would
+# show, and the loss is only discovered when someone queries a window that no
+# longer exists.
+- name: Ask VictoriaMetrics how many series it holds
+  ansible.builtin.uri:
+    url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/query"
+    # POST, not GET. The uri module sends `body` as a request body, and the
+    # Prometheus query API reads `query` from the URL string on GET — so a GET
+    # with a form body arrives carrying no query at all and is rejected. POST
+    # with a form-urlencoded body is the form Prometheus documents for queries,
+    # and VictoriaMetrics is compatible with it.
+    #
+    # The old GET failed at the transport layer while the store was healthy and
+    # holding series, which the combined assert below then reported as "nothing
+    # is arriving".
+    method: POST
+    body_format: form-urlencoded
+    body:
+      query: "count(count by (__name__)({__name__!=''}))"
+    return_content: true
+  register: vm_series
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+
+- name: Assert the series query itself succeeded
+  ansible.builtin.assert:
+    that:
+      - vm_series.status == 200
+    fail_msg: >-
+      Querying VictoriaMetrics at
+      {{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/query returned
+      HTTP {{ vm_series.status | default('no response') }}.
+
+      This says nothing about whether data is arriving — the question was never
+      answered. Separated from the gate below deliberately: a failed query and
+      an empty store are different faults, and reporting one as the other sends
+      the reader to inspect a healthy Prometheus.
+    success_msg: "series query answered"
+
+- name: Assert the store is receiving data
+  ansible.builtin.assert:
+    that:
+      - vm_series.json.data.result | length > 0
+      - (vm_series.json.data.result[0].value[1] | int) > 0
+    fail_msg: >-
+      VictoriaMetrics is healthy but holds no series, so nothing is arriving.
+
+      Check, in order:
+        1. Prometheus has a remote_write target configured:
+           kubectl --context {{ kubeconfig_context }} -n {{ victoriametrics_namespace }} get prometheus -o yaml | grep -A5 remoteWrite
+        2. Samples are leaving it — prometheus_remote_storage_samples_total
+           should be climbing, not flat at zero.
+    success_msg: >-
+      VictoriaMetrics holds
+      {{ vm_series.json.data.result[0].value[1] | default('?') }} distinct metric names

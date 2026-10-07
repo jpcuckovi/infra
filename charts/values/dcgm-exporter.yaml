@@ -1,0 +1,29 @@
+# dcgm-exporter — GPU hardware metrics.
+#
+# Ported from gpu-bench/ops/observability/dcgm-exporter.values.yaml. Emits SM
+# utilisation, VRAM, power, temperature and the profiling counters — the data
+# that makes a GPU host's telemetry worth remote-writing anywhere.
+
+# The exporter needs GPU access, and on these clusters the GPU runtime class is
+# `nvidia` — created by k3s once nvidia-container-runtime is on PATH before it
+# starts, not by this repository.
+runtimeClassName: nvidia
+
+serviceMonitor:
+  enabled: true
+  interval: 5s
+
+  # scrapeTimeout MUST be <= interval, or Prometheus silently drops the WHOLE
+  # DCGM scrape job — not the late samples, the job. The chart's default timeout
+  # is 10s, so leaving interval at 5s and saying nothing about the timeout
+  # breaks it, and breaks it invisibly: the exporter is healthy, the target
+  # simply never appears.
+  #
+  # Confirmed against this chart. If a chart upgrade re-breaks
+  # DCGM scraping, that version ignored this override and the answer is to raise
+  # interval to >= 10s rather than to fight it.
+  scrapeTimeout: 5s
+
+# Not exported by this chart's default counter set: throttle-reason fields
+# (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS) and XID error counters. Anything that
+# needs them needs a custom counters ConfigMap first.

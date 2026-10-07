@@ -1,0 +1,202 @@
+# Estate-wide defaults.
+#
+# What belongs here: values true of every machine regardless of role — version
+# pins, the DNS role aliases, published port numbers. Anything that is a fact
+# about one box belongs in host_vars/; anything a machine can report about
+# itself belongs in neither, and is gathered as a fact instead.
+
+# ---- role aliases ----------------------------------------------------------
+# CNAMEs, not machine names, so a service can move hosts without every consumer
+# being edited. Images are tagged registry.lan/... and Prometheus remote-writes
+# to metrics.lan — neither names the box that happens to serve them today.
+#
+# `.lan` and not `.local`: RFC 6762 reserves .local for mDNS, so a .local
+# unicast name resolves through mDNSResponder on macOS and misbehaves.
+registry_alias: registry.lan
+metrics_alias: metrics.lan
+
+# Where traces go. Added later than the other two, and for the same reason they
+# exist: workloads on other machines were naming a trace backend by the address
+# of the box that happened to run it, so moving Jaeger would have meant editing
+# every consumer.
+#
+# The consumer that prompted it is gpu-bench's vLLM, which sends OTLP from
+# revenant to the Jaeger on whichever host serves this name.
+# Requires a CNAME: traces.lan -> whichever host serves Jaeger.
+#
+# There is deliberately no prometheus_alias to match. The test for whether a
+# service needs an alias is not "is it a service" — it is WHO REWRITES THE
+# REFERENCE.
+#
+# roles/observability regenerates the discovery contract on every run, asking the
+# cluster for its address as it goes, so an IP in those files self-heals: the
+# host moves, the playbook runs, the files are right again. A name there would be
+# ceremony.
+#
+# Nothing regenerates gpu-bench's vLLM deployment or frr-diag-agent's committed
+# fallback file. An address in those is wrong from the moment the estate changes
+# until a human notices telemetry stopped — which is the quietest failure in the
+# estate, because everything keeps working except the part that would have told
+# you.
+traces_alias: traces.lan
+
+# ---- published ports -------------------------------------------------------
+# Fixed rather than allocated, so workstation bookmarks and the endpoint
+# contract survive a reinstall.
+registry_port: 5000
+prometheus_node_port: 30900
+grafana_node_port: 30300
+victoriametrics_node_port: 30428
+jaeger_ui_node_port: 31686
+jaeger_otlp_http_node_port: 31318
+jaeger_otlp_grpc_node_port: 31317
+# The Cilium chart's own default for the Hubble UI, adopted rather than invented.
+hubble_ui_node_port: 31235
+
+# ---- version pins ----------------------------------------------------------
+# Every pin is deliberate. Bumping one is a change with a reason, not a side
+# effect of running the playbook on a different day.
+#
+# k3s names the version phantom already runs on Ubuntu 26.04 with the
+# 7.0.0-raspi kernel, rather than a newer one unproven on that hardware.
+#
+# The previous value, v1.34.1+k3s1, was carried in from a scratch note
+# describing revenant — a different machine and a different architecture — and
+# was never installed by this repository on any host. roles/k3s_server guards
+# the install with `creates:`, so on a box that already had a binary the task
+# skipped, the pin was never applied, and the mismatch could not surface: the
+# play still reported success and no gate compares the running version to this
+# one. A pin that cannot be contradicted is not a pin.
+k3s_version: "v1.36.2+k3s1"
+registry_image: "docker.io/library/registry:2"
+victoriametrics_image: "victoriametrics/victoria-metrics:v1.111.0"
+jaeger_image: "jaegertracing/jaeger:2.20.0"
+kube_prometheus_stack_version: "88.0.0"
+
+# Cilium names a release whose compatibility table lists revenant's Kubernetes
+# minor — 1.36, from k3s_version above — as e2e tested.
+# necropolis runs the same release on kubernetes_version below, which is the
+# same minor for the same reason. Bumping either Kubernetes to a minor Cilium
+# does not list is a change to this pin first.
+cilium_version: "1.20.1"
+
+# necropolis — upstream kubeadm.
+#
+# Kubernetes 1.36, not the newest minor: 1.37.1 was out, but Cilium 1.20's
+# compatibility table stops at 1.36, and a cluster whose CNI is untested
+# against its API is a cluster whose first failure has no known cause. Moving
+# to 1.37 waits on a Cilium that lists it — the same rule cilium_version above
+# states from the other direction. Matches revenant's minor, so the estate's
+# two Cilium clusters share an API version too.
+#
+# The package revision is pkgs.k8s.io's, which suffixes every build: the deb for
+# 1.36.5 is `1.36.5-1.1`. roles/kubeadm_node installs exactly this string, so a
+# rebuilt package with a new revision is a deliberate bump rather than a surprise.
+kubernetes_version: "1.36.5"
+kubernetes_package_revision: "1.1"
+
+# containerd from the 2.3 line, which is LTS to 2028-04-30 and listed for both
+# Kubernetes 1.36 and 1.37 — so the eventual minor bump needs no runtime change.
+# 2.4 is newer and lists 1.37 only. Installed from the upstream tarball, never
+# Ubuntu's package; roles/containerd says why.
+containerd_version: "2.3.6"
+
+# The control-plane VIP on necropolis, as a static pod on every control-plane
+# node. The newest release when pinned.
+kube_vip_version: "v1.2.4"
+
+# necropolis's cluster layer.
+#
+# Gateway API at the version Cilium 1.20's documentation names, not the newest
+# patch (v1.6.2): its CRDs are what Cilium's controller is built against, and
+# they are installed BEFORE Cilium, which only programs Gateways whose CRDs it
+# found at start.
+gateway_api_version: "v1.6.1"
+# Longhorn: newest, and requires Kubernetes >= 1.25.
+longhorn_version: "1.12.1"
+# cert-manager: newest release line.
+cert_manager_version: "v1.21.2"
+
+# clabernetes is pinned harder than the rest, and for a reason that is not
+# tidiness.
+#
+# The nested launcher runtime that this estate's topologies are configured
+# against has ALREADY BEEN DELETED upstream — PR #307, "replace the nested
+# launcher runtime with the native k8s runtime", merged to main,
+# and its own notes say it is breaking and that upgrading means uninstall and
+# reinstall. It was unreleased when this pin was set.
+#
+# So an unpinned `helm upgrade --install` after the next release would not update
+# a controller; it would swap the entire runtime model underneath a converged
+# lab, and the topologies would need rewriting to come back.
+#
+# Note also that 0.7.0 renamed the API group from clabernetes.containerlab.dev to
+# c9s.run with no upgrade path. roles/clabernetes refuses to install alongside
+# the old group rather than attempting to cross it.
+clabernetes_version: "0.8.0"
+
+# No helm pin. This repository does not install helm — it is a workstation
+# prerequisite, checked by roles/preflight/tasks/controller.yml. A version
+# recorded here would be a claim nothing can keep: no task would install it, no
+# gate compared against it, and the number would drift from whatever brew last
+# produced. The preflight assert is the contract.
+#
+# Same reasoning does NOT apply to k3s_version above: that one names a version
+# this repository actually installs.
+
+# ---- cross-role contracts --------------------------------------------------
+# Values one role owns and another reads. They live here rather than in either
+# role's defaults because a contract between two capabilities belongs to
+# neither of them.
+#
+# This is not decoration. A static `roles:` block loads every role's defaults
+# into play scope before any of them run, which let these reads work by
+# accident; playbooks/_layers.yml includes roles dynamically, where defaults are
+# scoped to the including role. Defined here, they resolve regardless of role
+# order, of which roles a host composes, and of whether a name also happens to
+# appear in host_vars.
+#
+# Roles keep their own defaults for the same names, so each stays readable on
+# its own. group_vars wins over role defaults, and host_vars wins over this —
+# the usual layering, with the estate-wide value stated once.
+
+# The hosts whose nodes form this cluster. The cluster layer runs on ONE host,
+# but roles/cilium and roles/longhorn act for every node — every node's facts,
+# every node's Ready condition, every node's disk. A single-node cluster is
+# itself; a multi-node cluster names its group in its group_vars.
+cluster_hosts: ["{{ inventory_hostname }}"]
+
+# LoadBalancer pools, as host offsets within the cluster's /24 (the network is a
+# gathered fact, so no routable address is committed). Declared by
+# roles/cilium; read by roles/gateway to find its own address. Empty unless a
+# cluster announces LoadBalancer addresses — see group_vars/necropolis.yml.
+lb_pools: []
+# The Service label that binds a Service to a labelled pool. A pool with a
+# `label` serves only Services carrying it; one without serves only Services
+# without it.
+lb_pool_label: infra/lb-pool
+
+# Where a cluster's root CA lives on the WORKSTATION, outside every repository
+# and every cluster, so it survives any rebuild and is trusted once. Written by
+# roles/cert_manager; read by roles/gateway to verify HTTPS end to end.
+cluster_ca_dir: "{{ lookup('env', 'HOME') }}/.local/share/infra/pki/{{ kubeconfig_context }}"
+
+# Read by roles/kubeconfig, which has no other way to know where k3s wrote it.
+k3s_kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+
+# Read by roles/observability to build Prometheus' remote_write URL and
+# Grafana's default datasource. Those are addresses of a service this cluster
+# may not even host — the discriminator is metrics_stores group membership, not
+# these values.
+victoriametrics_name: victoriametrics
+victoriametrics_namespace: observability
+victoriametrics_port: 8428
+
+# Read by roles/victoriametrics, which ensures the namespace exists so it can
+# run standalone.
+observability_namespace: observability
+
+# Read by roles/preflight, which asserts a registry host declares where images
+# live. Note this one runs BACKWARDS through role order — preflight executes
+# before registry — so no amount of forward default-exposure would resolve it.
+registry_root: /srv/registry

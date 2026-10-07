@@ -1,0 +1,26 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/wifi_link. Edits here are overwritten on the next run.
+#
+# A systemd TEMPLATE unit, instantiated once per wireless interface —
+# wifi-powersave@wlan0, wifi-powersave@wlp2s0. One file serves every host and
+# every radio, which is the point: this estate has three wireless machines with
+# three different chipsets and three different interface names.
+#
+# BindsTo and WantedBy on the .device unit rather than a plain boot-time
+# ordering. `iw ... power_save off` is a property of a live interface, not a
+# persistent setting — it is lost whenever the device disappears and returns,
+# which for a USB or reloaded wireless driver is not a rare event. Tying the
+# unit to the device means it reapplies on re-enumeration, not just at boot.
+
+[Unit]
+Description=Disable wireless power save on %i
+After=sys-subsystem-net-devices-%i.device
+BindsTo=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iw dev %i set power_save off
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device

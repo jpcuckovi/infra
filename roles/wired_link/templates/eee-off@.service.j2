@@ -1,0 +1,32 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/wired_link. Edits here are overwritten on the next run.
+#
+# A systemd TEMPLATE unit, instantiated once per wired interface — eee-off@eth0,
+# eee-off@enp13s0. One file serves every host and every NIC, which is the point:
+# interface names in this estate are not consistent, and the Pi that needs this
+# most is the one whose driver predates predictable naming.
+#
+# BindsTo and WantedBy on the .device unit rather than a plain boot-time
+# ordering. EEE is NEGOTIATED between the two ends when the link comes up, so
+# `ethtool --set-eee off` is undone by every renegotiation — a cable reseated, a
+# switch rebooted, an autoneg flap — not merely by a reboot. A boot-only unit
+# leaves the setting correct on paper and absent in the PHY, with no event in
+# any log to explain why the symptom came back.
+#
+# ExecStart is deliberately strict. A NIC that does not support EEE fails this
+# unit loudly, which is the wanted behaviour for a role a host composes on
+# purpose: the answer is to leave wired_hosts or to pin wired_link_interfaces,
+# not to silence the error and let the role appear to work everywhere.
+
+[Unit]
+Description=Disable Energy-Efficient Ethernet on %i
+After=sys-subsystem-net-devices-%i.device
+BindsTo=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ethtool --set-eee %i eee off
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device

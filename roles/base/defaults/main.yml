@@ -1,0 +1,45 @@
+# Packages and kernel tunables every machine in the estate gets.
+#
+# Kept deliberately short. Anything a single WORKLOAD needs belongs to that
+# workload's role — the previous generation of these scripts accreted database
+# clients, Argo CLIs and shell aliases into the "system" step, and none of it
+# was system.
+#
+# Most of this list is not used by any task in this repository, and that is
+# deliberate rather than an oversight. These are general-purpose tools for a
+# machine an operator SSHes into and debugs by hand, which is a real requirement
+# even though no playbook consumes them. Stating it here so the next reader who
+# greps for a user and finds none does not trim them back out.
+#
+# The distinction that matters is workload versus operator: a database client
+# belongs to whatever needs a database, but `jq` belongs to whoever is reading
+# JSON on the box at two in the morning.
+---
+base_packages:
+  - bind9-dnsutils     # dig; every service here is found through a .lan name
+  - ca-certificates
+  - chrony             # clock skew breaks TLS and makes correlated logs lie
+  - curl
+  - git
+  - gnupg
+  - jq
+  - make
+  - net-tools
+  - nvme-cli           # drive health and wear; harmless on the Pis, which have no NVMe
+  - podman             # the registry runs under this, not under Docker
+  - python3
+  - traceroute
+  - unzip
+
+# A drop-in rather than appending to /etc/sysctl.conf. Appending is what the
+# hand-written runbook did, and it is not idempotent: re-running appends the
+# same line again, and the file ends up with a history of every run.
+base_sysctl_file: /etc/sysctl.d/60-infra.conf
+
+# Kubernetes watches a lot of files. The defaults are low enough that a control
+# plane plus an observability stack exhausts them, and the resulting failure —
+# pods stuck, controllers wedged, "too many open files" buried in a log — reads
+# as anything but a sysctl.
+base_sysctl:
+  fs.inotify.max_user_instances: "8192"
+  fs.inotify.max_user_watches: "524288"

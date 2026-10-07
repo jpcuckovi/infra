@@ -1,0 +1,160 @@
+# The Gateway, its certificate, and its routes.
+---
+- name: Settle the Gateway's address
+  ansible.builtin.set_fact:
+    gateway_address: >-
+      {{ (hostvars[cluster_hosts | first]['ansible_facts']['default_ipv4']['network']).rsplit('.', 1)[0]
+         ~ '.' ~ (lb_pools | selectattr('name', 'equalto', gateway_pool) | first).first }}
+    gateway_pool_label: "{{ (lb_pools | selectattr('name', 'equalto', gateway_pool) | first).label }}"
+
+- name: Ensure the Gateway namespace exists
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ gateway_namespace }}"
+
+# A Certificate written out, rather than cert-manager's gateway-shim reading
+# annotations off the Gateway: the shim is an opt-in controller feature, and
+# an explicit resource says what is issued without knowing that.
+#
+# In the Gateway's namespace, because a listener's certificateRefs resolve
+# there.
+- name: Request the Gateway's certificate
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: "{{ gateway_tls_secret }}"
+        namespace: "{{ gateway_namespace }}"
+      spec:
+        secretName: "{{ gateway_tls_secret }}"
+        dnsNames: "{{ gateway_routes | map(attribute='hostname') | list }}"
+        duration: "{{ gateway_cert_duration }}"
+        renewBefore: "{{ gateway_cert_renew_before }}"
+        issuerRef:
+          group: cert-manager.io
+          kind: ClusterIssuer
+          name: "{{ gateway_issuer }}"
+
+# spec.addresses asks Cilium for exactly this address — the method Cilium's
+# 1.20 documentation prefers over the older lb-ipam annotation. The
+# infrastructure label is copied onto the Service Cilium generates, which is
+# what matches the `gateway` pool and nothing else.
+#
+# Two listeners: HTTPS for the UIs, HTTP only to redirect. Routes from any
+# namespace may attach to HTTPS, since each UI's route lives beside its Service;
+# only this namespace's redirect may attach to HTTP.
+- name: Declare the Gateway
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: "{{ gateway_name }}"
+        namespace: "{{ gateway_namespace }}"
+      spec:
+        gatewayClassName: cilium
+        addresses:
+          - type: IPAddress
+            value: "{{ gateway_address }}"
+        infrastructure:
+          labels: "{{ {lb_pool_label: gateway_pool_label} }}"
+        listeners:
+          - name: https
+            protocol: HTTPS
+            port: 443
+            tls:
+              mode: Terminate
+              certificateRefs:
+                - kind: Secret
+                  name: "{{ gateway_tls_secret }}"
+            allowedRoutes:
+              namespaces:
+                from: All
+          - name: http
+            protocol: HTTP
+            port: 80
+            allowedRoutes:
+              namespaces:
+                from: Same
+
+- name: Redirect HTTP to HTTPS
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        name: https-redirect
+        namespace: "{{ gateway_namespace }}"
+      spec:
+        parentRefs:
+          - name: "{{ gateway_name }}"
+            sectionName: http
+        rules:
+          - filters:
+              - type: RequestRedirect
+                requestRedirect:
+                  scheme: https
+                  statusCode: 301
+
+- name: Route each UI through the Gateway
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      spec:
+        parentRefs:
+          - name: "{{ gateway_name }}"
+            namespace: "{{ gateway_namespace }}"
+            sectionName: https
+        hostnames:
+          - "{{ item.hostname }}"
+        rules:
+          - backendRefs:
+              - name: "{{ item.service }}"
+                port: "{{ item.port | int }}"
+  loop: "{{ gateway_routes }}"
+  loop_control:
+    label: "{{ item.hostname }} -> {{ item.namespace }}/{{ item.service }}:{{ item.port }}"
+
+- name: Wait for the Gateway to be programmed on its address
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: gateway.networking.k8s.io/v1
+    kind: Gateway
+    namespace: "{{ gateway_namespace }}"
+    name: "{{ gateway_name }}"
+  register: gateway_info
+  until: >-
+    gateway_info.resources | length == 1
+    and (gateway_info.resources[0].status.conditions | default([])
+         | selectattr('type', 'equalto', 'Programmed')
+         | map(attribute='status') | list) == ['True']
+    and gateway_address in (gateway_info.resources[0].status.addresses | default([])
+                            | map(attribute='value') | list)
+  retries: "{{ gateway_programmed_retries }}"
+  delay: "{{ gateway_programmed_delay }}"
+  when: not ansible_check_mode
+
+- name: Report the Gateway
+  ansible.builtin.debug:
+    msg: >-
+      Gateway {{ gateway_namespace }}/{{ gateway_name }} on {{ gateway_address }}.
+      Each hostname needs a DNS record for that address:
+      {{ gateway_routes | map(attribute='hostname') | join(', ') }}.

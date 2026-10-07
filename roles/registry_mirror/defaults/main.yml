@@ -1,0 +1,16 @@
+# Where the mirror config is written, and whether writing it may bounce k3s.
+#
+# The registry's ADDRESS is not here. registry_alias and registry_port are
+# estate-wide values in inventory/group_vars/all.yml, because every host needs
+# the same answer and a per-role default would be a second place for it to drift.
+---
+k3s_registries_yaml: /etc/rancher/k3s/registries.yaml
+
+# Whether a change to the mirror config may restart k3s.
+#
+# False by default and deliberately so: restarting k3s bounces every pod on the
+# node, and doing that as a side effect of an unrelated run is how a diagnosis
+# in progress gets destroyed. In the normal ordering this role runs before k3s
+# ever starts, so this never arises. When it does, the run says so loudly and
+# the operator chooses the moment.
+registry_restart_k3s_on_change: false

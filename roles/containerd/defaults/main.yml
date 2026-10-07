@@ -1,0 +1,44 @@
+# containerd for kubeadm nodes, from the upstream release tarball.
+#
+# k3s bundles its own containerd, so no k3s host composes this role. A kubeadm
+# node has none until something installs one, and Ubuntu 26.04's package is not
+# an option: it SIGSEGVs on any invocation — `containerd --version` dies before
+# reading a config file — so the service restart-loops and kubelet never gets a
+# runtime. Found on k8s-aio's guests; other Go binaries on the same machine
+# (kubeadm, runc) ran fine, so it is that package, not the CPU or the kernel.
+---
+# The pin lives in group_vars/all.yml with the estate's other versions. Restated
+# here so the role reads on its own; group_vars wins.
+containerd_version: "2.3.6"
+
+# Architecture from facts, in Go's naming. Every necropolis node is amd64, but
+# nothing about this role is, and a declared value would be a second source of
+# truth for something the machine reports.
+containerd_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+
+# Release artifacts, under their PUBLISHED names. get_url reads the .sha256sum
+# file directly and matches the line naming this file, which only works while
+# the downloaded name is the one the checksum file names.
+containerd_tarball: "containerd-{{ containerd_version }}-linux-{{ containerd_arch }}.tar.gz"
+containerd_release_url: "https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}"
+
+# Kept after extraction rather than written to /tmp, so a reboot does not turn
+# the next run into a re-download, and the verified artifact the binaries came
+# from stays inspectable.
+containerd_cache_dir: /var/cache/infra/containerd
+
+# The tarball installs to /usr/local/bin. Ubuntu's unit would point at
+# /usr/bin/containerd and find nothing, which is why this role carries its own.
+containerd_bin: /usr/local/bin/containerd
+containerd_unit_path: /etc/systemd/system/containerd.service
+containerd_config_dir: /etc/containerd
+
+# Where the CRI plugin looks for per-registry hosts.toml files. containerd 2.x
+# defaults this to '' — no directory at all — so without setting it every
+# hosts.toml below is ignored, silently.
+containerd_registry_config_path: /etc/containerd/certs.d
+
+# runc is the one piece that comes from the archive, where it works. The tarball
+# carries containerd and its shims only.
+containerd_packages:
+  - runc

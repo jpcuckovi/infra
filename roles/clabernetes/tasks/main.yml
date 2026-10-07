@@ -1,0 +1,86 @@
+# Install the clabernetes controller.
+#
+# One task, in the same shape as the kube-prometheus-stack install in
+# roles/observability: context named explicitly, chart version pinned from
+# group_vars, values from charts/values/, and wait.
+---
+- name: Assert a superseded clabernetes is not installed
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: CustomResourceDefinition
+    name: "{{ clabernetes_superseded_crd }}"
+  register: clabernetes_old_crd
+  check_mode: false
+
+# Checked before installing rather than after, because the two CRDs can coexist
+# on a cluster while the controller reconciles only one of them — so the failure
+# is a topology that applies cleanly and is never acted upon.
+- name: Refuse to install alongside the pre-0.7 API group
+  ansible.builtin.assert:
+    that:
+      - clabernetes_old_crd.resources | length == 0
+    fail_msg: >-
+      {{ clabernetes_superseded_crd }} exists on this cluster, so a clabernetes
+      release older than 0.7 is installed.
+
+      The API group was renamed in v0.7.0 and there is NO upgrade path across it.
+      Remove the old release and its CRDs first; upgrading in place leaves a
+      controller reconciling an API nothing writes to any more.
+    success_msg: "no superseded clabernetes CRD present"
+
+# wait: false, deliberately, and this is the one place in the estate where a
+# chart is installed without it.
+#
+# The bootstrap config is delivered as a ConfigMap that init containers on the
+# manager read, merge into the Config CR singleton, and then DELETE — the chart's
+# own values.yaml says so: "once complete, the configmap will be deleted (hence
+# why you don't want this if you are using argocd/flux)".
+#
+# helm --wait therefore waits for a resource the release is designed to destroy,
+# and cannot win the race. Measured: the install completed, the
+# manager came up 1/1, the CRDs registered and the Config singleton was written
+# correctly — and helm then sat for its full ten minutes and marked the release
+# `failed` on ConfigMap/c9s/clabernetes-config "status: NotFound".
+#
+# The state that matters is asserted below and in tasks/verify.yml instead.
+# Waiting on an artifact is a proxy for readiness; waiting on the controller and
+# then checking the singleton is the thing itself.
+- name: Install clabernetes
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ clabernetes_release }}"
+    chart_ref: "{{ clabernetes_chart_ref }}"
+    chart_version: "{{ clabernetes_version }}"
+    release_namespace: "{{ clabernetes_namespace }}"
+    create_namespace: true
+    values_files:
+      - "{{ role_path }}/../../charts/values/clabernetes.yaml"
+    wait: false
+
+- name: Wait for the controller to become available
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    namespace: "{{ clabernetes_namespace }}"
+    name: "{{ clabernetes_release }}-manager"
+  register: clabernetes_manager
+  until: >-
+    clabernetes_manager.resources | length > 0
+    and (clabernetes_manager.resources[0].status.availableReplicas | default(0)) > 0
+  retries: 30
+  delay: 10
+
+# The singleton, not the ConfigMap. The ConfigMap is gone by design once the init
+# containers have consumed it, so its absence proves the bootstrap RAN — and the
+# CR is where the settings actually have to have landed.
+- name: Wait for the bootstrap config to reach the singleton
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: c9s.run/v1alpha1
+    kind: Config
+    namespace: "{{ clabernetes_namespace }}"
+    name: "{{ clabernetes_release }}"
+  register: clabernetes_singleton
+  until: clabernetes_singleton.resources | length > 0
+  retries: 30
+  delay: 10

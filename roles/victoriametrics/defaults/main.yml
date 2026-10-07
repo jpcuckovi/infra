@@ -1,0 +1,48 @@
+# The estate's long-term metrics store.
+#
+# Every box keeps 24h of local Prometheus as a scrape buffer and remote-writes
+# here. The decisive property is that data leaves the machine that produced it:
+# revenant is reloaded routinely, and history kept on revenant dies with it.
+#
+# Single-node VictoriaMetrics rather than Thanos or Mimir. Both of those are
+# built for object storage and horizontal scale, so both mean running MinIO plus
+# three or four components — all cost and no benefit on one Pi. This is one
+# binary writing to local disk that ingests Prometheus remote_write and serves
+# the Prometheus query API, so Grafana treats it as an ordinary Prometheus
+# datasource.
+#
+# Federation was rejected separately: it carries only the series explicitly
+# enumerated in the scrape config, so it silently loses whatever nobody thought
+# to list — the opposite of what a long-term archive is for.
+---
+victoriametrics_name: victoriametrics
+victoriametrics_namespace: "{{ observability_namespace | default('observability') }}"
+victoriametrics_port: 8428
+
+# victoriametrics_retention_period and victoriametrics_storage_size are REQUIRED
+# and deliberately have no default here. roles/preflight asserts both before
+# anything is installed.
+#
+# They had defaults of "12" months and 500Gi, which the only host that uses them
+# overrode to 24 and 1000Gi. A default that is always overridden is not a
+# default — it is a number nobody chose, sitting where a reader expects a
+# decision, and it answers no version of "what would have to be true for this to
+# be right".
+#
+# Both are answers to a question only the host can settle: how far back a
+# question might reach, and how much of that machine's disk is set aside for it.
+# Retention is the real bound in any case — local-path enforces no quota, so the
+# volume size is advisory and exists so declared intent and actual behaviour can
+# be compared.
+#
+# Retention is read as MONTHS when bare; suffixes (30d, 1y) also work.
+#
+# Same reasoning as prometheus_external_labels: a value with no safe default is
+# better absent than guessed, because the guess is what gets shipped.
+
+victoriametrics_resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    memory: 2Gi

@@ -1,0 +1,107 @@
+{{ ansible_managed | comment }}
+#
+# kube-vip static pod — the {{ kubeconfig_context }} API server VIP.
+# Ported from k8s-aio's ops/manifests/kube-vip/kube-vip.yaml.tmpl.
+#
+# Written to {{ kubeadm_control_plane_manifests }} rather than applied with
+# kubectl: this pod has to exist before there is an API server to apply it to.
+#
+# The kubeconfig it mounts is {{ kubeadm_control_plane_vip_conf }}, a LOOPBACK
+# rewrite of super-admin.conf during init and of admin.conf afterwards. Both
+# kubeconfigs name the VIP as their server, and kube-vip needs the API to take
+# the lease that creates the VIP — mounted directly, it logs "no route to host"
+# forever and never claims the address. Do not "simplify" it back to admin.conf.
+#
+# The annotation below carries a checksum of that kubeconfig, and it is what
+# makes the super-admin -> admin swap reach the running pod. Ansible replaces
+# files by rename, so a container that bind-mounted the old file keeps reading
+# the old inode — super-admin credentials included — until the pod is
+# recreated. A changed checksum changes this manifest, and kubelet recreates
+# the pod. On a converged node the checksum is stable and nothing restarts.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-vip
+  namespace: kube-system
+  annotations:
+    infra/kubeconfig-sha256: "{{ kubeadm_control_plane_vip_conf_content | hash('sha256') }}"
+spec:
+  # The VIP is bound to a host interface; there is no pod network at this point
+  # in the bootstrap anyway.
+  hostNetwork: true
+  # kube-vip {{ kube_vip_version }} does not dial the `server:` in the kubeconfig it
+  # mounts. In control-plane mode it dials https://kubernetes:<port> and takes
+  # only the credentials from the file. Without this alias the name does not
+  # resolve, and kube-vip logs "lookup kubernetes ... no such host" on every
+  # lease attempt and never claims the VIP. Measured on the first
+  # hardware run: the mounted kubeconfig named 127.0.0.1 and the log showed the
+  # request going to `kubernetes`. The API certificate carries `kubernetes` in
+  # its SANs by kubeadm's default, so loopback under that name verifies.
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames:
+        - kubernetes
+  containers:
+    - name: kube-vip
+      image: ghcr.io/kube-vip/kube-vip:{{ kube_vip_version }}
+      imagePullPolicy: IfNotPresent
+      args:
+        - manager
+      env:
+        - name: address
+          value: "{{ kubeadm_control_plane_vip }}"
+        - name: vip_interface
+          value: "{{ kubeadm_control_plane_interface }}"
+        - name: vip_cidr
+          value: "32"
+        - name: vip_arp
+          value: "true"
+        - name: port
+          value: "{{ kubeadm_control_plane_port }}"
+
+        # Control plane VIP only. Service LoadBalancer addresses are Cilium's,
+        # through its IP pool and L2 announcements — two components answering
+        # ARP for overlapping ranges is a bad afternoon.
+        - name: cp_enable
+          value: "true"
+        - name: cp_namespace
+          value: "kube-system"
+        - name: svc_enable
+          value: "false"
+
+        # Lease-based leader election: exactly one node answers ARP for the VIP
+        # and sends a gratuitous ARP on takeover. The lease is plndr-cp-lock.
+        - name: vip_leaderelection
+          value: "true"
+        - name: vip_leaseduration
+          value: "5"
+        - name: vip_renewdeadline
+          value: "3"
+        - name: vip_retryperiod
+          value: "1"
+
+        - name: vip_ddns
+          value: "false"
+        - name: prometheus_server
+          value: ":2112"
+      securityContext:
+        capabilities:
+          add:
+            # NET_ADMIN to bind the VIP, NET_RAW to emit gratuitous ARP.
+            - NET_ADMIN
+            - NET_RAW
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      volumeMounts:
+        - name: kubeconfig
+          mountPath: /etc/kubernetes/admin.conf
+          readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: {{ kubeadm_control_plane_vip_conf }}
+        type: File
+  priorityClassName: system-node-critical

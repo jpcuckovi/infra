@@ -1,0 +1,36 @@
+# Device plugin values that make one GPU schedulable as two, by time slicing.
+#
+# Selected when nvidia_gpu_sharing is `timeslicing`. Ported from
+# gpu-bench/ops/nvidia/time-slicing.values.yaml.
+#
+# What this does and does not do:
+#
+#   Time slicing shares TIME. Two pods each get `nvidia.com/gpu: 1` and the
+#   driver interleaves their kernels. It does NOT partition memory — both see
+#   the whole card and allocate against all of it, so two workloads whose memory
+#   requests sum past capacity fail with an out-of-memory error rather than a
+#   scheduling one. A consumer that enables this has to size its own memory
+#   fraction accordingly; nothing here can do that for it.
+#
+#   It also does not isolate. Anything on the node can take a slice.
+#
+# NODE-WIDE AND STICKY. This changes advertised capacity for every workload on
+# the machine until it is deliberately reverted, and nothing in a workload's own
+# spec records that it is in effect. A pod that assumed exclusive access simply
+# gets less of the card, correctly and silently.
+#
+# That is why this is never a default and never rides along with a routine
+# converge: playbooks/<host>/gpu-sharing.yml exists so enabling it is an act
+# someone chose on the day they chose it. Revert with the same playbook and
+# nvidia_gpu_sharing=none.
+runtimeClassName: nvidia
+
+config:
+  map:
+    default: |-
+      version: v1
+      sharing:
+        timeSlicing:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 2

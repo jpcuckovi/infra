@@ -1,0 +1,134 @@
+# Converge a host to the state a containerlab topology needs.
+#
+# Ordering is load-bearing in one place only: the extra-modules package must be
+# installed before modprobe is attempted, because on a Pi kernel the modules do
+# not exist until it is. Everything else here is independent.
+---
+- name: Install the container runtime
+  ansible.builtin.apt:
+    name: "{{ containerlab_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  # Ubuntu runs unattended-upgrades on a freshly installed machine, and it holds
+  # the dpkg frontend lock for as long as the initial security set takes to
+  # download. Without a timeout this task fails on a host where nothing is
+  # wrong except that the machine is new — which is exactly when this role runs
+  # for the first time. Waiting is correct; the lock is doing its job.
+  register: containerlab_apt
+  retries: 3
+  delay: 30
+  until: containerlab_apt is succeeded
+
+- name: Install the extra kernel modules package
+  ansible.builtin.apt:
+    name: "{{ containerlab_modules_extra_package }}"
+    state: present
+  when: containerlab_modules_extra_package | length > 0
+  register: containerlab_modules_pkg
+  retries: 3
+  delay: 30
+  until: containerlab_modules_pkg is succeeded
+
+# Rebuild the dependency index so modprobe can find what was just unpacked.
+# Without it a freshly installed module is on disk and unloadable, which reads
+# as "the package did not help" rather than "the index is stale".
+- name: Refresh the module dependency index
+  ansible.builtin.command: depmod -a
+  changed_when: false
+  when: containerlab_modules_pkg is defined and containerlab_modules_pkg.changed
+
+- name: Load the topology kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ containerlab_kernel_modules }}"
+  loop_control:
+    label: "{{ item }}"
+  register: containerlab_modprobe
+  failed_when: false
+
+# The bootstrap script exited 1 here unconditionally and told the operator to
+# reboot. That is right about the cause and wrong about when: a reboot is needed
+# only if the extra-modules package installed for a kernel other than the
+# running one, which happens when apt pulled a newer kernel along with it. When
+# the versions match — the common case on a converged host — the modules load
+# immediately and demanding a reboot wastes a boot cycle on a lab machine.
+#
+# So: attempt the load, and fail only on what actually failed, naming the
+# version mismatch when there is one.
+- name: Assert every topology module loaded
+  ansible.builtin.assert:
+    that:
+      - containerlab_modprobe_failed | length == 0
+    fail_msg: >-
+      These kernel modules did not load: {{ containerlab_modprobe_failed | join(', ') }}.
+
+      Running kernel is {{ ansible_facts['kernel'] }}.
+
+      Ask the host whether the module exists at all:  modinfo -n <module>
+
+      A path means it is present and failed to load for another reason. "not
+      found" means this kernel does not carry it, and containerlab_modules_extra_package
+      needs to name whatever supplies it on this release — it is empty by
+      default because Ubuntu 26.04's raspi kernel ships all four in the base
+      module set.
+
+      If a package DID install modules for a different kernel version, they are
+      on disk and unloadable until that kernel runs. Compare `uname -r` against
+      `ls /lib/modules/` and reboot.
+
+      Without sch_netem there is no impairment and the L1/L2 fault catalogue
+      silently does nothing; without veth no topology comes up at all.
+    success_msg: "modules loaded: {{ containerlab_kernel_modules | join(', ') }}"
+  vars:
+    containerlab_modprobe_failed: >-
+      {{ containerlab_modprobe.results | default([])
+         | selectattr('failed', 'defined') | selectattr('failed')
+         | map(attribute='item') | list }}
+
+# modprobe does not survive a reboot. Without this the fault-injection tooling
+# stops working after a power cycle, and it stops SILENTLY — tc accepts a netem
+# qdisc request against a kernel with no sch_netem by simply not impairing
+# anything, so the scenario runs, the agent diagnoses a healthy network, and the
+# run is scored as a miss.
+#
+# A template rather than `copy: content:`, and not merely for tidiness:
+# ansible_managed is injected by the template module and is undefined in a copy
+# task's inline content, so the copy form fails at argument resolution. Every
+# other rendered file in this repository is a template for the same reason.
+- name: Persist the modules across reboot
+  ansible.builtin.template:
+    src: modules-load.conf.j2
+    dest: "{{ containerlab_modules_conf }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read the package architecture
+  ansible.builtin.command: dpkg --print-architecture
+  register: containerlab_arch
+  changed_when: false
+  check_mode: false
+
+- name: Settle the architecture
+  ansible.builtin.set_fact:
+    containerlab_deb_arch: "{{ containerlab_arch.stdout | trim }}"
+
+- name: Check the installed containerlab version
+  ansible.builtin.command: dpkg-query -W -f='${Version}' containerlab
+  register: containerlab_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Guarded on the version rather than on the binary's existence. A `creates:`-style
+# check passes as soon as anything called containerlab is present, which is how
+# a pin gets declared and never applied — the failure this repository already
+# hit with k3s, where the playbook reported success against a host running two
+# minors ahead of the pin for months.
+- name: Install containerlab
+  ansible.builtin.apt:
+    deb: "{{ containerlab_deb_url }}"
+    state: present
+  when: containerlab_installed.stdout | trim != containerlab_version

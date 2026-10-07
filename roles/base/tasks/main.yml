@@ -1,0 +1,93 @@
+# Baseline every machine gets: packages, clock, kernel tunables.
+#
+# Every task here uses a real module rather than a shell command. That is not
+# style — modules are what make `--check --diff` trustworthy. A `command:` task
+# skips under --check and reports nothing, so a playbook built from shell-outs
+# gives a dry run that is confidently wrong. This is the single strongest reason
+# the migration is worth doing at all, and it is only true if the discipline
+# holds.
+---
+- name: Refresh the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    # Avoids a network round trip on every run while still picking up changes
+    # within a session.
+    cache_valid_time: 3600
+  # Refreshing package metadata changes nothing this repository declares — no
+  # package is installed, removed or upgraded by it. Reporting it as a change
+  # makes the changed=0 acceptance gate depend on how long since the last run:
+  # inside the hour it reports ok, outside it reports changed, on an estate that
+  # is byte-for-byte identical either way.
+  #
+  # A gate whose answer depends on the clock is not a gate.
+  changed_when: false
+
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+# rsyslog is removed, not merely disabled, and the distinction is the whole
+# point of these three tasks.
+#
+# Ubuntu Server ships it by default. Nothing in this estate reads
+# /var/log/syslog — journald is the log store, and the diagnostic agents read the
+# observability stack. So it is a daemon with no consumer, which would be merely
+# untidy if it were also harmless.
+#
+# It is not. On revenant its AppArmor profile denied it `mknod` on its own PID
+# file, so it failed to start, so systemd restarted it, forever. Each attempt
+# emitted a burst of denials: sixty thousand audit events per five seconds. The
+# kernel audit backlog filled, and because a full backlog blocks the process
+# generating the event, PAM's pam_loginuid call never returned — the machine
+# stayed up, stopped answering the network, and refused logins at the console.
+# Nothing in its own logs said why, because the logging daemon was the fault.
+#
+# Stopping the service is NOT sufficient. AppArmor profiles are loaded into the
+# kernel at boot and stay resident regardless of whether their daemon runs, so a
+# disabled rsyslog leaves a profile still confining anything whose path matches
+# it — on revenant that was container processes, which kept generating denials
+# after the daemon was stopped. The profile has to be unloaded, and it must be
+# unloaded BEFORE the package is purged, because apparmor_parser needs the file
+# it is being asked to remove.
+- name: Find any rsyslog AppArmor profile
+  ansible.builtin.find:
+    paths: /etc/apparmor.d
+    patterns: "*rsyslog*"
+    file_type: file
+  register: base_rsyslog_profiles
+
+- name: Unload the rsyslog AppArmor profile
+  ansible.builtin.command: "apparmor_parser -R {{ item.path }}"
+  loop: "{{ base_rsyslog_profiles.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  changed_when: true
+  # Unloading a profile that is not currently loaded is an error and not a
+  # problem. The task is reached only when the file exists, and the file is gone
+  # after the purge below, so this runs once per host and never again.
+  failed_when: false
+
+- name: Remove rsyslog
+  ansible.builtin.apt:
+    name: rsyslog
+    state: absent
+    purge: true
+
+- name: Apply kernel tunables
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "{{ base_sysctl_file }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop: "{{ base_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Ensure the clock is disciplined
+  ansible.builtin.systemd_service:
+    name: chrony
+    state: started
+    enabled: true

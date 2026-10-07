@@ -1,0 +1,24 @@
+# wraith — the acceptance gate.
+#
+#   ~/.venv/bin/ansible-playbook playbooks/wraith/verify.yml
+#
+# A composition, not an implementation: each role owns its assertions in
+# tasks/verify.yml, so a gate lives beside the code that creates the thing it
+# checks.
+#
+# Same list as main.yml minus preflight, which is assertions already, and minus
+# containerlab, which this host no longer composes.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: wraith
+    layer_mode: verify
+
+    host_roles:
+      - base
+      - wifi_link
+      - registry_mirror
+      - k3s_server
+
+    cluster_roles:
+      - observability

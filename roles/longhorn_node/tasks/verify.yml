@@ -1,0 +1,70 @@
+# Gates for Longhorn node readiness.
+#
+# The mount gate is the one that matters most. A data path that is a plain
+# directory on the root filesystem looks exactly like a working one until
+# Longhorn fills the boot drive, so the gate asserts the path is its own mount,
+# of the labelled filesystem.
+---
+- name: Read the Longhorn data path mount
+  ansible.builtin.command: >-
+    findmnt --noheadings --output SOURCE,FSTYPE,LABEL --mountpoint {{ longhorn_node_data_path }}
+  register: longhorn_node_findmnt
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the data disk is mounted at the data path
+  ansible.builtin.assert:
+    that:
+      - longhorn_node_findmnt.rc == 0
+      - longhorn_node_findmnt.stdout.split() | length == 3
+      - longhorn_node_findmnt.stdout.split()[1] == longhorn_node_fstype
+      - longhorn_node_findmnt.stdout.split()[2] == longhorn_node_fs_label
+    fail_msg: >-
+      {{ longhorn_node_data_path }} is not a mount of the {{ longhorn_node_fstype }}
+      filesystem labelled {{ longhorn_node_fs_label }}. findmnt reported:
+      '{{ longhorn_node_findmnt.stdout }}'.
+
+      Empty means nothing is mounted there, and Longhorn would write replicas
+      to the boot drive. The fstab entry carries nofail, so a disk that failed
+      to appear at boot shows up here rather than as an unbootable node:
+      `blkid -L {{ longhorn_node_fs_label }}` and `journalctl -b | grep -i nvme`.
+    success_msg: "{{ longhorn_node_data_path }}: {{ longhorn_node_findmnt.stdout }}"
+
+- name: Read the loaded kernel modules
+  ansible.builtin.slurp:
+    src: /proc/modules
+  register: longhorn_node_proc_modules
+
+- name: Assert the Longhorn kernel modules are loaded
+  ansible.builtin.assert:
+    that:
+      - longhorn_node_missing_modules | length == 0
+    fail_msg: >-
+      Not loaded: {{ longhorn_node_missing_modules | join(', ') }}. Without
+      iscsi_tcp a V1 volume cannot attach; load it, then restart iscsid, which
+      does not see a module loaded after it started.
+    success_msg: "loaded: {{ longhorn_node_modules | join(', ') }}"
+  vars:
+    longhorn_node_loaded: >-
+      {{ (longhorn_node_proc_modules.content | b64decode).splitlines()
+         | map('split', ' ') | map('first') | list }}
+    longhorn_node_missing_modules: "{{ longhorn_node_modules | difference(longhorn_node_loaded) }}"
+
+- name: Read the iscsid service state
+  ansible.builtin.systemd_service:
+    name: iscsid.service
+  register: longhorn_node_iscsid
+  check_mode: false
+
+- name: Assert iscsid is running and enabled
+  ansible.builtin.assert:
+    that:
+      - longhorn_node_iscsid.status.ActiveState == 'active'
+      - longhorn_node_iscsid.status.UnitFileState == 'enabled'
+    fail_msg: >-
+      iscsid is {{ longhorn_node_iscsid.status.ActiveState }} /
+      {{ longhorn_node_iscsid.status.UnitFileState }}. Longhorn's V1 volumes
+      attach over iSCSI, and without iscsid the CSI plugin reports a device
+      error rather than a missing service.
+    success_msg: "iscsid active and enabled"

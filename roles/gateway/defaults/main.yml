@@ -1,0 +1,34 @@
+# One HTTPS front door for a cluster's UIs: a Gateway API Gateway, programmed by
+# Cilium, on a fixed LoadBalancer address, with a certificate from the cluster's
+# CA and one HTTPRoute per UI.
+#
+# Replaces k8s-aio's ingress-nginx, which was retired upstream in March 2026 —
+# no releases and no security fixes since. Cilium is already the CNI, so this
+# adds no controller.
+---
+gateway_name: "{{ kubeconfig_context }}"
+gateway_namespace: gateway
+
+# The lb_pools entry (group_vars) this Gateway takes its address from: that
+# pool's first host offset, within the nodes' /24. Its label is also what
+# confines that pool to this Gateway's Service.
+gateway_pool: gateway
+
+# UIs to publish. Each: name, hostname (needs a DNS record for the Gateway's
+# address), namespace and service/port of the backend.
+gateway_routes: []
+
+# Leaves are short and rotate themselves; only the root is long-lived. A
+# 10-year leaf would trade a real security property for a convenience
+# cert-manager already provides.
+gateway_issuer: "{{ kubeconfig_context }}-ca"
+gateway_cert_duration: 2160h
+gateway_cert_renew_before: 720h
+gateway_tls_secret: "{{ gateway_name }}-gateway-tls"
+
+# The workstation CA, for the end-to-end gate. cluster_ca_dir is the contract
+# roles/cert_manager writes to.
+gateway_ca_crt: "{{ cluster_ca_dir }}/ca.crt"
+
+gateway_programmed_retries: 30
+gateway_programmed_delay: 10

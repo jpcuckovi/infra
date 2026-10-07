@@ -1,0 +1,216 @@
+# Gates for Cilium.
+#
+# Each asks the cluster rather than helm. A deployed release says the chart
+# rendered; it does not say the agent runs on every node, that kube-proxy
+# replacement took, or that flannel is absent.
+---
+- name: Read the Cilium agent DaemonSet
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: DaemonSet
+    namespace: "{{ cilium_namespace }}"
+    name: cilium
+  register: cilium_ds
+  check_mode: false
+
+# numberReady against desiredNumberScheduled rather than a literal node count,
+# and desired must be non-zero: a DaemonSet ready 0 of 0 is "ready" to every
+# check that compares only the two numbers.
+- name: Assert the agent is ready on every node
+  ansible.builtin.assert:
+    that:
+      - cilium_ds.resources | length == 1
+      - (cilium_ds_status.desiredNumberScheduled | default(0)) > 0
+      - (cilium_ds_status.numberReady | default(0)) == cilium_ds_status.desiredNumberScheduled
+    fail_msg: >-
+      The Cilium agent is ready on {{ cilium_ds_status.numberReady | default(0) }}
+      of {{ cilium_ds_status.desiredNumberScheduled | default(0) }} nodes.
+
+      A node without a ready agent has no pod network. Check:
+      kubectl --context {{ kubeconfig_context }} -n {{ cilium_namespace }} logs ds/cilium
+    success_msg: >-
+      agent ready on {{ cilium_ds_status.numberReady | default(0) }} node(s)
+  vars:
+    cilium_ds_status: "{{ (cilium_ds.resources | first | default({})).status | default({}) }}"
+
+- name: Read the deployments in the Cilium namespace
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    namespace: "{{ cilium_namespace }}"
+  register: cilium_deployments
+  check_mode: false
+
+- name: Assert the operator and Hubble are available
+  ansible.builtin.assert:
+    that:
+      - cilium_missing | length == 0
+    fail_msg: >-
+      Not available in {{ cilium_namespace }}: {{ cilium_missing | join(', ') }}.
+
+      Without the operator no new pod receives an address; without hubble-relay
+      and hubble-ui, dropped flows are enforced but cannot be inspected.
+    success_msg: "{{ cilium_expected | join(', ') }} available"
+  vars:
+    cilium_expected:
+      - cilium-operator
+      - hubble-relay
+      - hubble-ui
+    cilium_available: >-
+      {{ cilium_deployments.resources | default([])
+         | selectattr('status.availableReplicas', 'defined')
+         | selectattr('status.availableReplicas', 'gt', 0)
+         | map(attribute='metadata.name') | list }}
+    cilium_missing: "{{ cilium_expected | difference(cilium_available) }}"
+
+- name: Read the Hubble UI service
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Service
+    namespace: "{{ cilium_namespace }}"
+    name: hubble-ui
+  register: cilium_hubble_ui_svc
+  check_mode: false
+
+# The published port is a contract with workstation bookmarks, so it is checked
+# against the pin rather than trusted to the chart: a port the chart allocated
+# would still work today and move on the next reinstall.
+- name: Assert the Hubble UI is published on its fixed NodePort
+  ansible.builtin.assert:
+    that:
+      - cilium_hubble_ui_spec.type | default('') == 'NodePort'
+      - cilium_hubble_ui_ports == [hubble_ui_node_port | int]
+    fail_msg: >-
+      hubble-ui is {{ cilium_hubble_ui_spec.type | default('absent') }} on
+      node port(s) {{ cilium_hubble_ui_ports }}; expected NodePort
+      {{ hubble_ui_node_port }} from inventory/group_vars/all.yml.
+    success_msg: "hubble ui on NodePort {{ hubble_ui_node_port }}"
+  vars:
+    cilium_hubble_ui_spec: "{{ (cilium_hubble_ui_svc.resources | first | default({})).spec | default({}) }}"
+    cilium_hubble_ui_ports: >-
+      {{ cilium_hubble_ui_spec.ports | default([])
+         | map(attribute='nodePort') | select('defined') | list }}
+
+- name: Read the Cilium configuration
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: ConfigMap
+    namespace: "{{ cilium_namespace }}"
+    name: cilium-config
+  register: cilium_config
+  check_mode: false
+
+- name: Assert kube-proxy replacement is enabled
+  ansible.builtin.assert:
+    that:
+      - cilium_config.resources | length == 1
+      - (cilium_config.resources[0].data | default({})).get('kube-proxy-replacement', '') == 'true'
+    fail_msg: >-
+      cilium-config does not enable kube-proxy replacement.
+
+      k3s is installed with --disable-kube-proxy, so without it nothing
+      programs Service addresses and every ClusterIP and NodePort is dead.
+    success_msg: "kube-proxy replacement enabled"
+
+- name: Read the nodes
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+  register: cilium_verify_nodes
+  check_mode: false
+
+- name: Assert no node is networked by flannel
+  ansible.builtin.assert:
+    that:
+      - cilium_flannel_nodes | length == 0
+    fail_msg: >-
+      {{ cilium_flannel_nodes | join(', ') }} carries {{ cilium_flannel_annotation }},
+      so flannel is running alongside Cilium. k3s was installed with its bundled
+      CNI; reinstall it with the arguments in
+      inventory/host_vars/{{ inventory_hostname }}.yml.
+    success_msg: "no flannel-managed node"
+  vars:
+    cilium_flannel_nodes: >-
+      {{ cilium_verify_nodes.resources
+         | selectattr('metadata.annotations', 'defined')
+         | selectattr('metadata.annotations', 'contains', cilium_flannel_annotation)
+         | map(attribute='metadata.name') | list }}
+
+- name: Assert every node of the cluster is Ready
+  ansible.builtin.assert:
+    that:
+      - cilium_not_ready | length == 0
+    fail_msg: >-
+      Not Ready: {{ cilium_not_ready | join(', ') }}. On a kubeadm cluster a node
+      stays NotReady until the CNI runs on it, so a node listed here usually has
+      no ready Cilium agent — see the DaemonSet gate above.
+    success_msg: "Ready: {{ cluster_hosts | join(', ') }}"
+  vars:
+    # By query, not with `contains` and a two-key dict. A condition carries
+    # timestamps, a reason and a message as well, so a dict of only type and
+    # status equals none of them and every node reads as not Ready.
+    cilium_ready: >-
+      {{ cilium_verify_nodes.resources
+         | community.general.json_query("[?status.conditions[?type=='Ready' && status=='True']].metadata.name") }}
+    cilium_not_ready: "{{ cluster_hosts | difference(cilium_ready) }}"
+
+# Cilium records a pool whose range overlaps another pool as conflicted, and
+# allocates nothing from it. The Service simply never gets an address.
+- name: Read the LoadBalancer pools
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: cilium.io/v2
+    kind: CiliumLoadBalancerIPPool
+  register: cilium_pools
+  check_mode: false
+  when: lb_pools | length > 0
+
+- name: Assert every pool exists and none is in conflict
+  ansible.builtin.assert:
+    that:
+      - lb_pools | map(attribute='name') | difference(cilium_pool_names) | length == 0
+      - cilium_conflicted | length == 0
+    fail_msg: >-
+      Declared pools: {{ lb_pools | map(attribute='name') | join(', ') }}.
+      Present: {{ cilium_pool_names | join(', ') or 'none' }}.
+      In conflict: {{ cilium_conflicted | join(', ') or 'none' }}.
+
+      A conflicted pool hands out nothing: `kubectl --context {{ kubeconfig_context }}
+      get ciliumloadbalancerippool` shows which overlaps which.
+    success_msg: "pools: {{ cilium_pool_names | join(', ') }}, no conflicts"
+  vars:
+    cilium_pool_names: "{{ cilium_pools.resources | map(attribute='metadata.name') | list }}"
+    cilium_conflicted: >-
+      {{ cilium_pools.resources
+         | selectattr('status.conditions', 'defined')
+         | selectattr('status.conditions', 'contains',
+                      {'type': 'cilium.io/PoolConflict', 'status': 'True'}) | list
+         | map(attribute='metadata.name') | list }}
+  when: lb_pools | length > 0
+
+- name: Read the Cilium GatewayClass
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: gateway.networking.k8s.io/v1
+    kind: GatewayClass
+    name: cilium
+  register: cilium_gatewayclass
+  check_mode: false
+  when: cilium_gateway_api
+
+# Cilium creates the class only when its Gateway controller started, which it
+# does only if the Gateway API CRDs existed when the operator came up.
+- name: Assert Cilium's GatewayClass is accepted
+  ansible.builtin.assert:
+    that:
+      - cilium_gatewayclass.resources | length == 1
+      - cilium_gatewayclass.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Accepted')
+        | map(attribute='status') | list == ['True']
+    fail_msg: >-
+      GatewayClass `cilium` is missing or not Accepted. The usual cause is the
+      Gateway API CRDs arriving after the Cilium operator started: restart it
+      with `kubectl --context {{ kubeconfig_context }} -n {{ cilium_namespace }}
+      rollout restart deploy/cilium-operator`.
+    success_msg: "GatewayClass cilium accepted"
+  when: cilium_gateway_api

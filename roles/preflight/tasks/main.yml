@@ -1,0 +1,158 @@
+# Host-layer preconditions. Runs before anything is changed.
+#
+# This role exists to preserve one property of the shell scripts it replaces:
+# their error messages. `die "API_VIP is unset — copy cluster.env.example to
+# cluster.env and fill it in"` tells the reader what to do; an Ansible
+# undefined-variable traceback tells them a template failed. Every assert here
+# carries a fail_msg written for whoever hits it at 1am.
+#
+# Nothing in this file changes state, so it is safe under --check and runs in
+# full there — unlike the command-shaped tasks it guards.
+---
+# Facts are read as ansible_facts['name'] throughout, never as the bare
+# ansible_<name> form. INJECT_FACTS_AS_VARS, which creates those top-level
+# aliases, is deprecated and goes away in ansible-core 2.24.
+#
+# Worth migrating ahead of the removal rather than after it: bare facts do not
+# fail loudly when the alias disappears, they become undefined INSIDE assert
+# conditions. Every gate in this repository then fails with a variable error, on
+# hosts that are perfectly healthy, and the message names neither the fact nor
+# the deprecation.
+- name: Assert the target is Debian-family
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == "Debian"
+    fail_msg: >-
+      This estate's roles use apt, netplan-free systemd-networkd assumptions and
+      Debian package names. Detected os_family={{ ansible_facts['os_family'] }}
+      on {{ inventory_hostname }}. Porting to another family is a real change,
+      not a variable.
+    success_msg: >-
+      {{ ansible_facts['distribution'] }}
+      {{ ansible_facts['distribution_version'] }}
+
+- name: Assert a kubeconfig context is named, and is not 'default'
+  ansible.builtin.assert:
+    that:
+      - kubeconfig_context is defined
+      - kubeconfig_context | length > 0
+      - kubeconfig_context != "default"
+    fail_msg: >-
+      {{ inventory_hostname }} runs Kubernetes but names no kubeconfig context,
+      or names 'default'. Set kubeconfig_context in
+      inventory/host_vars/{{ inventory_hostname }}.yml, or in the cluster's
+      group_vars when several nodes form one cluster.
+
+      A context called 'default' is what gets applied to when nobody thought
+      about it, which is how an observability stack once landed on a production
+      cluster. The name must be a deliberate choice, and it names the CLUSTER
+      rather than this machine.
+  when: "'k3s_servers' in group_names or 'kubeadm_clusters' in group_names"
+
+# Kubelet refuses to start without a memory cgroup, and on a board where the
+# controller is absent the failure arrives as a k3s that never becomes Ready,
+# with the cause several layers below anything the playbook touches.
+#
+# Read from /sys/fs/cgroup/cgroup.controllers rather than by grepping
+# /proc/cmdline. On a Raspberry Pi the running command line is assembled from a
+# firmware-injected prefix plus a file selected through `os_prefix` in
+# config.txt — so /boot/firmware/cmdline.txt is frequently NOT the file in use,
+# and a cmdline grep tests a boot parameter rather than the capability it was
+# supposed to produce. The controllers file is the capability itself, and it is
+# the same check on every distribution and board.
+#
+# For the record, because the advice is everywhere and is wrong here:
+# `cgroup_enable=memory cgroup_memory=1` is Raspberry Pi OS guidance. Ubuntu's
+# Pi kernels enable the memory controller by default and need no cmdline edit.
+- name: Read the available cgroup controllers
+  ansible.builtin.slurp:
+    src: /sys/fs/cgroup/cgroup.controllers
+  register: preflight_cgroup_controllers
+  when: "'k3s_servers' in group_names or 'kubeadm_clusters' in group_names"
+
+- name: Assert the cgroup controllers kubelet requires are present
+  ansible.builtin.assert:
+    that:
+      - "'memory' in preflight_cgroup_available"
+      - "'cpuset' in preflight_cgroup_available"
+    fail_msg: >-
+      {{ inventory_hostname }} exposes cgroup controllers
+      [{{ preflight_cgroup_available | join(', ') }}], missing
+      [{{ ['memory', 'cpuset'] | difference(preflight_cgroup_available) | join(', ') }}].
+
+      kubelet will not start without them, so k3s would install successfully and
+      then never report Ready. On a Raspberry Pi the fix is a kernel boot
+      parameter — but edit the file the bootloader actually reads, which
+      `os_prefix` in /boot/firmware/config.txt selects and which is usually NOT
+      /boot/firmware/cmdline.txt.
+    success_msg: "cgroup controllers: {{ preflight_cgroup_available | join(', ') }}"
+  vars:
+    preflight_cgroup_available: >-
+      {{ (preflight_cgroup_controllers.content | b64decode).split() }}
+  when: "'k3s_servers' in group_names or 'kubeadm_clusters' in group_names"
+
+- name: Assert this cluster identifies its metrics
+  ansible.builtin.assert:
+    that:
+      - prometheus_external_labels is defined
+      - prometheus_external_labels | length > 0
+      - prometheus_external_labels.cluster is defined
+      - prometheus_external_labels.cluster | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} would remote-write to the shared metrics store
+      without a unique external label. Set prometheus_external_labels.cluster in
+      inventory/host_vars/{{ inventory_hostname }}.yml.
+
+      Without it, identically-named series from different clusters merge into a
+      single series in VictoriaMetrics. It is not visible by eye, it is not
+      cleanly separable afterwards, and it corrupts every query that spans the
+      period. This is the most expensive mistake available here, which is why it
+      is checked before anything is installed rather than after.
+  when: "'observability_hosts' in group_names"
+
+- name: Assert the metrics store declares its retention and allocation
+  ansible.builtin.assert:
+    that:
+      - victoriametrics_retention_period is defined
+      - victoriametrics_retention_period | string | length > 0
+      - victoriametrics_storage_size is defined
+      - victoriametrics_storage_size | string | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} runs the estate's long-term metrics store but does
+      not declare victoriametrics_retention_period or
+      victoriametrics_storage_size. Set both in
+      inventory/host_vars/{{ inventory_hostname }}.yml.
+
+      Neither has a default, deliberately. How far back a question might reach,
+      and how much of this machine's disk is set aside to answer it, are facts
+      about this machine — a default would be a number nobody chose, and because
+      retention is what actually bounds the data, a guessed one is silently wrong
+      rather than loudly missing.
+
+      Retention is read as months when bare; suffixes (30d, 1y) also work.
+    success_msg: >-
+      retention {{ victoriametrics_retention_period }} months,
+      {{ victoriametrics_storage_size }} allocated
+  when: "'metrics_stores' in group_names"
+
+- name: Assert k3s and kubeadm modes are not both selected
+  ansible.builtin.assert:
+    that:
+      - not ("k3s_servers" in group_names and "kubeadm_workers" in group_names)
+      - not ("k3s_servers" in group_names and "kubeadm_clusters" in group_names)
+    fail_msg: >-
+      {{ inventory_hostname }} is in k3s_servers and also in kubeadm_workers or
+      kubeadm_clusters. These are mutually exclusive: a k3s server and a kubelet
+      formed by kubeadm contend for port 10250 and run two containerds and two CNIs.
+      Switching between them is an OS reload, by design — not a playbook run.
+      Remove one group membership in inventory/hosts.yml.
+
+- name: Assert the registry host declares where images live
+  ansible.builtin.assert:
+    that:
+      - registry_root is defined
+      - registry_root | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} serves the registry but sets no registry_root.
+      Set it in inventory/host_vars/{{ inventory_hostname }}.yml.
+  when: "'registry_hosts' in group_names"

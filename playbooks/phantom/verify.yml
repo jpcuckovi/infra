@@ -1,0 +1,34 @@
+# phantom — the acceptance gate.
+#
+# A composition, not an implementation. Each role owns its own assertions in
+# tasks/verify.yml, so a gate lives beside the code that creates the thing it
+# checks, and adding a host means listing gates rather than rewriting them. An
+# assertion copied per host is an assertion that drifts per host.
+#
+# Runs standalone, and also as the last step of a full apply:
+#
+#   ~/.venv/bin/ansible-playbook playbooks/phantom/verify.yml
+#
+# Every gate is an assert with a fail_msg that says what was expected and what
+# to do about it. An Ansible traceback is a worse error message than the shell
+# scripts these replace, and that is a regression worth spending effort to avoid.
+#
+# Same lists as main.yml minus the roles that have nothing to verify: preflight
+# is assertions already, and kubeconfig's product is checked by every cluster
+# gate that reaches the API at all.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: phantom
+    layer_mode: verify
+
+    host_roles:
+      - base
+      - wired_link
+      - registry_mirror
+      - registry
+      - k3s_server
+
+    cluster_roles:
+      - victoriametrics
+      - observability

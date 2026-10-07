@@ -1,0 +1,14 @@
+{{ ansible_managed | comment }}
+#
+# The estate registry, for images tagged {{ registry_alias }}:{{ registry_port }}/...
+# The containerd counterpart of roles/registry_mirror's registries.yaml, with
+# the same meaning: a DISTINCT registry, not a mirror for docker.io. When it is
+# down only locally built images fail to pull; everything from upstream is
+# unaffected.
+#
+# Plain HTTP, as it is for every k3s host. {{ registry_alias }} is a CNAME, so
+# the registry can move without this file changing.
+server = "http://{{ registry_alias }}:{{ registry_port }}"
+
+[host."http://{{ registry_alias }}:{{ registry_port }}"]
+  capabilities = ["pull", "resolve"]

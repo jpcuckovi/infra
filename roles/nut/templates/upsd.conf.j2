@@ -1,0 +1,14 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nut.
+#
+{% if nut_mode == 'netserver' %}
+# One listener for this host's own upsmon and for the other hosts this UPS
+# feeds. NOT a loopback line beside it: a wildcard address already covers
+# loopback, so the second bind collides with the first and upsd exits with
+# "some listening interfaces were not available".
+LISTEN {{ nut_server_listen_address }} {{ nut_listen_port }}
+{% else %}
+# Loopback only. Nothing off this host reads the UPS; a consumer that needs to is
+# a change to this line with its own reason.
+LISTEN {{ nut_listen_address }} {{ nut_listen_port }}
+{% endif %}

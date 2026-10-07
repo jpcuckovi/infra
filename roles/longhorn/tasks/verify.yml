@@ -1,0 +1,75 @@
+# Gates for Longhorn.
+#
+# The disk gate asks Longhorn where each node's disk is, not only whether it is
+# schedulable: a disk registered at the default path on the ROOT filesystem is
+# schedulable too, and fills the boot drive. roles/longhorn_node's own gate
+# checks the mount; this one checks Longhorn is using it.
+---
+- name: Read Longhorn's nodes
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: longhorn.io/v1beta2
+    kind: Node
+    namespace: "{{ longhorn_namespace }}"
+  register: longhorn_nodes
+  check_mode: false
+
+- name: Assert every node offers one schedulable disk at the data path
+  ansible.builtin.assert:
+    that:
+      - longhorn_node_names | sort == longhorn_expected | sort
+      - longhorn_unschedulable | length == 0
+      - longhorn_wrong_path | length == 0
+    fail_msg: >-
+      Longhorn nodes: {{ longhorn_node_names | join(', ') or 'none' }}
+      (expected {{ longhorn_expected | join(', ') }}).
+      Not schedulable: {{ longhorn_unschedulable | join(', ') or 'none' }}.
+      Disks not at {{ longhorn_data_path }}: {{ longhorn_wrong_path | join(', ') or 'none' }}.
+
+      An unschedulable node usually lacks a prerequisite from
+      roles/longhorn_node (iscsid, or the data disk not mounted), and Longhorn
+      names which in `kubectl --context {{ kubeconfig_context }} -n
+      {{ longhorn_namespace }} describe nodes.longhorn.io <node>`.
+    success_msg: "{{ longhorn_node_names | join(', ') }}: disk at {{ longhorn_data_path }}, schedulable"
+  vars:
+    longhorn_expected: "{{ cluster_hosts }}"
+    longhorn_node_names: "{{ longhorn_nodes.resources | map(attribute='metadata.name') | list }}"
+    longhorn_unschedulable: >-
+      {{ longhorn_node_names | difference(longhorn_nodes.resources
+         | community.general.json_query("[?status.conditions[?type=='Schedulable' && status=='True']].metadata.name")) }}
+    longhorn_wrong_path: >-
+      {{ longhorn_nodes.resources
+         | selectattr('spec.disks', 'defined')
+         | map(attribute='spec.disks') | map('dict2items') | flatten
+         | map(attribute='value.path') | map('regex_replace', '/$', '')
+         | reject('equalto', longhorn_data_path | regex_replace('/$', '')) | list }}
+
+- name: Read the StorageClasses
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+  register: longhorn_storageclasses
+  check_mode: false
+
+# Exactly one default. Two defaults make every unqualified PVC ambiguous, and
+# Kubernetes resolves it by picking the newest, which is not a decision anyone
+# made.
+- name: Assert longhorn is the only default StorageClass
+  ansible.builtin.assert:
+    that:
+      - longhorn_defaults == ['longhorn']
+    fail_msg: >-
+      Default StorageClasses: {{ longhorn_defaults | join(', ') or 'none' }};
+      expected exactly longhorn.
+    success_msg: "default StorageClass: longhorn"
+  vars:
+    # The query needs both quote styles, so it is held as a plain YAML value
+    # and passed by name. Escaped inside a Jinja string, the backslashes reach
+    # JMESPath literally and it rejects the expression.
+    longhorn_default_query: >-
+      [?metadata.annotations."storageclass.kubernetes.io/is-default-class"=='true'].metadata.name
+    longhorn_defaults: >-
+      {{ longhorn_storageclasses.resources
+         | community.general.json_query(longhorn_default_query) }}
+  when: longhorn_default_class | bool

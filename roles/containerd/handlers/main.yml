@@ -1,0 +1,12 @@
+# One handler for the binary, the unit and the config: each is read only when
+# the daemon starts, and a restart re-reads all three.
+#
+# Skips under --check, where the unit may exist only as a simulated write — the
+# idiom roles/nut documents for its handlers.
+---
+- name: Restart containerd
+  ansible.builtin.systemd_service:
+    name: containerd.service
+    state: restarted
+    daemon_reload: true
+  when: not ansible_check_mode

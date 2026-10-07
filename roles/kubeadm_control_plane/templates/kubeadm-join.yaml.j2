@@ -1,0 +1,31 @@
+{{ ansible_managed | comment }}
+#
+# kubeadm configuration for a control-plane node joining {{ kubeconfig_context }}.
+#
+# A config file rather than k8s-aio's `kubeadm token create --print-join-command`
+# replayed with flags, because the printed command cannot carry the two things
+# that must be per-node: the kubelet's node-ip, and the address this node's API
+# server advertises. k8s-aio pinned node-ip on node 1 only.
+#
+# SECRETS: a bootstrap token and the certificate key that decrypts the cluster's
+# uploaded CA material. Written 0600 and deleted as soon as the join completes.
+
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: "{{ kubeadm_control_plane_vip }}:{{ kubeadm_control_plane_port }}"
+    token: "{{ kubeadm_control_plane_join_token }}"
+    caCertHashes:
+      - "{{ kubeadm_control_plane_join_ca_hash }}"
+nodeRegistration:
+  name: "{{ inventory_hostname }}"
+  criSocket: "{{ kubeadm_control_plane_cri_socket }}"
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "{{ kubeadm_control_plane_node_ip }}"
+controlPlane:
+  localAPIEndpoint:
+    advertiseAddress: "{{ kubeadm_control_plane_node_ip }}"
+    bindPort: {{ kubeadm_control_plane_port }}
+  certificateKey: "{{ kubeadm_control_plane_join_cert_key }}"

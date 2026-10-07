@@ -1,0 +1,20 @@
+# Keeping a wireless host reachable.
+#
+# Three machines in this estate are on wifi with three different chipsets —
+# phantom's onboard Broadcom, revenant's card, and the second Pi. Nothing here
+# names a driver or an interface: both are discovered, because `wlan0` is a
+# brcmfmac convention and a host with a different NIC gets `wlp2s0` or similar
+# from systemd's predictable naming.
+---
+# Discovered from /sys/class/net rather than declared, so a host that gains or
+# renames a NIC needs no inventory edit. Override in host_vars only to pin a
+# subset — a machine with two radios where only one carries the LAN.
+wifi_link_interfaces: []
+
+# iw belongs to this role, not to base_packages. base carries what every machine
+# needs; this is what a WIRELESS machine needs, and a wired host should not
+# install a wireless tool to satisfy a role it does not compose.
+wifi_link_packages:
+  - iw
+
+wifi_link_unit_path: /etc/systemd/system/wifi-powersave@.service

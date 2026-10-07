@@ -1,0 +1,191 @@
+# Workstation preconditions for the cluster layer.
+#
+# The cluster-layer play runs with connection: local, so these tools must exist
+# on the machine driving Ansible, not on the target. Checked separately from the
+# host layer because the failure mode is different and so is the fix.
+---
+- name: Locate helm on the controller
+  ansible.builtin.command: helm version --short
+  register: infra_helm_version
+  changed_when: false
+  failed_when: false
+  # A pure read. Marked so it still runs under --check, where a skipped command
+  # would leave the assert below reading an undefined result.
+  check_mode: false
+
+- name: Assert helm runs on the controller
+  ansible.builtin.assert:
+    that:
+      - infra_helm_version.rc == 0
+    fail_msg: >-
+      `helm version --short` exited {{ infra_helm_version.rc | default('?') }}
+      on this workstation.
+
+      stderr: {{ infra_helm_version.stderr | default('') | trim | default('(none)', true) }}
+
+      kubernetes.core.helm shells out to the real binary rather than
+      reimplementing it, so the chart installs cannot run until this command
+      succeeds.
+
+      If helm is genuinely absent:  brew install helm
+
+      If helm is installed and on PATH, the failure is not helm. rc 127 with a
+      "No such file or directory" naming a python binary means this play is
+      running modules under the TARGET's interpreter: facts gathered over SSH in
+      an earlier play persist for the host, and a `connection: local` play
+      reuses that path on the workstation. Set ansible_python_interpreter to
+      ansible_playbook_python on the local play.
+    success_msg: "helm {{ infra_helm_version.stdout | default('') | trim }}"
+
+- name: Assert the kubernetes Python library is importable
+  ansible.builtin.command: "{{ ansible_playbook_python }} -c 'import kubernetes'"
+  register: infra_k8s_lib
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert kubernetes.core can reach its Python dependency
+  ansible.builtin.assert:
+    that:
+      - infra_k8s_lib.rc == 0
+    fail_msg: >-
+      The `kubernetes` Python library is not importable from
+      {{ ansible_playbook_python }}.
+
+      kubernetes.core imports it from whichever interpreter Ansible itself runs
+      under — not from whatever is first on PATH. A brew-installed ansible with
+      a pip-installed kubernetes puts them in different interpreters and
+      produces exactly this, on a machine where the library is plainly present.
+
+      Fix by installing both into the same environment:
+        ~/.venv/bin/python3 -m pip install kubernetes
+
+- name: Check the jmespath library
+  ansible.builtin.command: "{{ ansible_playbook_python }} -c 'import jmespath'"
+  register: infra_jmespath
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert jmespath is importable
+  ansible.builtin.assert:
+    that:
+      - infra_jmespath.rc == 0
+    fail_msg: >-
+      The `jmespath` library is not importable from
+      {{ ansible_playbook_python }}.
+
+      The verify gates use the json_query filter to read structured kubectl and
+      API output, and json_query is a thin wrapper over jmespath. Without it the
+      failure surfaces as a filter error inside an assert, which reads as a
+      broken gate rather than a missing dependency.
+
+      Fix with:
+        ~/.venv/bin/python3 -m pip install jmespath
+
+- name: Assert helm is a version kubernetes.core can drive
+  ansible.builtin.assert:
+    that:
+      - infra_helm_major | int >= 3
+    fail_msg: >-
+      helm reports '{{ infra_helm_version.stdout | default('') | trim }}', which
+      parses as major version {{ infra_helm_major }}.
+
+      kubernetes.core.helm shells out to the real binary rather than
+      reimplementing it, so it needs helm 3 or later. Helm 2 is a different
+      product — a client talking to an in-cluster tiller — and this collection
+      cannot drive it at all.
+
+      Helm 4 is permitted here and not merely tolerated: the CLI changed in
+      places, so if a chart install later fails in an unfamiliar way, check it
+      against the collection's supported versions before treating it as a values
+      problem. That is a real failure with a real error, not something this gate
+      can predict.
+    success_msg: >-
+      helm {{ infra_helm_version.stdout | default('') | trim }}
+      (major {{ infra_helm_major }})
+  vars:
+    # Parsed with regex_replace and split rather than regex_search.
+    # regex_search returns None when the pattern does not match, and the
+    # surrounding expression then dereferences it — so a version string in an
+    # unexpected shape crashes the gate instead of failing it, and the traceback
+    # names a filter plugin rather than helm. The previous form did exactly that
+    # when handed `v4.2.4+g3900f43`.
+    #
+    # Every step below is total: regex_replace always returns a string, split
+    # always returns a list, and default(..., true) covers the empty case. A
+    # version this cannot parse reports major 0 and fails the assert with the
+    # raw string quoted, which is the diagnosis.
+    infra_helm_major: >-
+      {{ infra_helm_version.stdout | default('') | trim
+         | regex_replace('^[^0-9]*', '')
+         | split('.') | first | default('0', true) }}
+
+# The cluster layer addresses the cluster by kubeconfig context, and every module
+# in it fails without one — but it fails from inside kubernetes.core, as
+# "Invalid kube-config file. Expected object with name <ctx> in .../contexts
+# list", which names neither the role that creates the context nor the reason it
+# is missing.
+#
+# It is missing for exactly one reason worth distinguishing: on a FIRST build
+# under --check, roles/kubeconfig's merge tasks are skipped, so the context this
+# play then asks for was never written. That is expected and not a fault.
+- name: Read the workstation kubeconfig contexts
+  ansible.builtin.command: kubectl config get-contexts -o name
+  register: infra_kube_contexts
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert this cluster's context exists on the workstation
+  ansible.builtin.assert:
+    that:
+      - kubeconfig_context in (infra_kube_contexts.stdout_lines | default([]))
+    fail_msg: >-
+      No kubeconfig context named '{{ kubeconfig_context }}' on this workstation.
+
+      {% if ansible_check_mode %}
+      This run is --check on a host whose cluster does not exist yet. The
+      kubeconfig role would have created the context, but its merge tasks cannot
+      run under check mode, so the cluster layer has nothing to address. Expected
+      on a first build: run without --check.
+      {% else %}
+      roles/kubeconfig should have created it during the host layer. Check
+      whether that role is composed in this host's playbook, and whether
+      k3s_server ran before it — the context is built from the kubeconfig k3s
+      writes, which does not exist until k3s is installed.
+      {% endif %}
+
+      Contexts present: {{ infra_kube_contexts.stdout_lines | default([]) | join(', ') | default('none', true) }}
+    success_msg: "context '{{ kubeconfig_context }}' present"
+
+- name: List the helm plugins on the controller
+  ansible.builtin.command: helm plugin list
+  register: infra_helm_plugins
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the helm diff plugin is installed
+  ansible.builtin.assert:
+    that:
+      - infra_helm_plugins.stdout is search('(?m)^diff\s')
+    fail_msg: >-
+      The helm-diff plugin is not installed on this workstation.
+
+      Without it kubernetes.core.helm cannot tell an upgrade that changes
+      nothing from one that does — `helm upgrade` cuts a new revision either
+      way — so the chart task reports `changed` on every run, forever. That
+      makes the changed=0 second run in README.md unreachable, and an
+      acceptance gate nobody can satisfy is one nobody reads.
+
+      Install with:
+        helm plugin install https://github.com/databus23/helm-diff --verify=false
+
+      The flag is needed because helm 4 verifies plugin provenance by default
+      and this plugin publishes none. It skips a signature check on a binary
+      that will run here, which is worth deciding rather than pasting past.
+    success_msg: "helm-diff present"
+  # Asserted rather than assumed, because its absence degrades a claim instead
+  # of breaking a run: everything still works, the idempotency gate just stops
+  # meaning anything, and nothing in a green run says so.

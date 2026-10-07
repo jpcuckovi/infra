@@ -1,0 +1,46 @@
+# Listed in dependency order, which is the order handlers run in: driver units
+# first, then the data server that reads the driver, then the monitor that logs
+# in to the data server.
+#
+# Every handler skips under --check. On a host where NUT is not yet installed
+# the packages were only simulated, so systemd has no units to restart and the
+# dry run would die at the flush — the idiom roles/registry documents for its
+# start task, for the same reason.
+#
+# The driver and server handlers also skip on a netclient, which has neither.
+---
+# nut-driver-enumerator regenerates the nut-driver@ instances from ups.conf. A
+# renamed or added UPS has no unit until it runs.
+- name: Resync NUT driver units
+  ansible.builtin.systemd_service:
+    name: nut-driver-enumerator.service
+    state: restarted
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+- name: Restart UPS driver
+  ansible.builtin.systemd_service:
+    name: "nut-driver@{{ nut_ups_name }}.service"
+    state: restarted
+  # The device may not be attached yet. The start task after the flush reports
+  # that with a message naming the cable, which a failed handler cannot.
+  failed_when: false
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+- name: Restart NUT server
+  ansible.builtin.systemd_service:
+    name: nut-server.service
+    state: restarted
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+- name: Restart NUT monitor
+  ansible.builtin.systemd_service:
+    name: nut-monitor.service
+    state: restarted
+  when: not ansible_check_mode

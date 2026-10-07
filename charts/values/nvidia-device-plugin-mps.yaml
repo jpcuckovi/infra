@@ -1,0 +1,31 @@
+# Device plugin values for MPS sharing — the alternative to time slicing.
+#
+# Selected when nvidia_gpu_sharing is `mps`. Ported from
+# gpu-bench/ops/nvidia/mps.values.yaml.
+#
+# Time slicing interleaves whole time quanta between processes. MPS instead runs
+# kernels from several processes concurrently through a single scheduler context.
+# Where slicing's cost is context-switch overhead, MPS recovers most of it; where
+# the workload is bound by something else — memory bandwidth, most often — it
+# does not, because each process still holds its own working set.
+#
+# REQUIRES the node to carry nvidia.com/mps.capable=true. The chart's
+# mps-control-daemon is gated on that label and sits at 0 desired without it, at
+# which point the plugin advertises two GPUs while no MPS daemon exists — and the
+# failure lands at pod start rather than at install, on a cluster where every
+# install-time check passed. roles/nvidia_device_plugin applies the label as part
+# of selecting this mode, which is the only reason that ordering is safe.
+#
+# Everything the time-slicing values file says about being node-wide and sticky
+# applies here identically.
+runtimeClassName: nvidia
+
+config:
+  map:
+    default: |-
+      version: v1
+      sharing:
+        mps:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 2

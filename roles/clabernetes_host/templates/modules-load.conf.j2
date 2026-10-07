@@ -1,0 +1,11 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/clabernetes_host. Edits here are overwritten on the next run.
+#
+# Read at boot by systemd-modules-load.service. modprobe alone does not survive a
+# power cycle, and what follows is silent: tc accepts a netem qdisc against a
+# kernel with no sch_netem by impairing nothing, so a fault scenario runs to
+# completion, the agent correctly diagnoses a healthy network, and the miss is
+# scored against the agent rather than against the host.
+{% for module in clabernetes_kernel_modules %}
+{{ module }}
+{% endfor %}

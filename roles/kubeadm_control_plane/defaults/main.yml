@@ -1,0 +1,43 @@
+# Forming a kubeadm HA control plane: kube-vip, `kubeadm init` on one node,
+# control-plane joins on the rest.
+#
+# Ported from k8s-aio's ops/scripts/lib/kubeadm.sh and its two manifest
+# templates. The ordering those encode survives intact; what changed is
+# recorded where it changed.
+---
+# The API endpoint's DNS name. Declared in the cluster's group_vars; there is no
+# sensible default, and preflight-style asserts in tasks/main.yml say so.
+kubeadm_control_plane_endpoint: ""
+kubeadm_control_plane_port: 6443
+
+# Pinned in group_vars/all.yml; restated so the role reads on its own.
+kube_vip_version: "v1.2.4"
+kubernetes_version: "1.36.5"
+
+# Cluster-internal ranges. Neither may overlap the LAN (192.168.x here) or each
+# other; an overlap between pod and LAN addresses produces pods that reach some
+# hosts and not others. k8s-aio's defaults, kept.
+kubeadm_control_plane_pod_subnet: 10.244.0.0/16
+kubeadm_control_plane_service_subnet: 10.96.0.0/12
+
+kubeadm_control_plane_cri_socket: unix:///var/run/containerd/containerd.sock
+
+# Paths kubeadm itself decides. Named once here so the tasks read as intent.
+kubeadm_control_plane_dir: /etc/kubernetes
+kubeadm_control_plane_admin_conf: /etc/kubernetes/admin.conf
+kubeadm_control_plane_super_admin_conf: /etc/kubernetes/super-admin.conf
+kubeadm_control_plane_kubelet_conf: /etc/kubernetes/kubelet.conf
+kubeadm_control_plane_manifests: /etc/kubernetes/manifests
+
+# kube-vip's own kubeconfig: a loopback rewrite of admin.conf (super-admin.conf
+# during init). See tasks/main.yml for the deadlock it breaks.
+kubeadm_control_plane_vip_conf: /etc/kubernetes/kube-vip.conf
+
+# Rendered kubeadm configs. Root-only: the join config carries a bootstrap
+# token and the certificate key that decrypts the cluster's CA material, and
+# is deleted as soon as the join completes.
+kubeadm_control_plane_init_config: /root/kubeadm-init.yaml
+kubeadm_control_plane_join_config: /root/kubeadm-join.yaml
+
+# kubectl on the node, with the admin credentials kubeadm wrote.
+kubeadm_control_plane_kubectl: "kubectl --kubeconfig {{ kubeadm_control_plane_admin_conf }}"

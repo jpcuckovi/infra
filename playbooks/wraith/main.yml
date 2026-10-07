@@ -1,0 +1,56 @@
+# wraith — ztlab's headquarters.
+#
+# The identity authority and the policy decision point: SPIRE server, OPA, and
+# the pdp/pa/posture services, deployed by ztlab onto a single-node k3s that
+# this repository builds. None of the application runs here, and that separation
+# is the whole point — someone who owns a workload on revenant must not be able
+# to mint an identity or change a policy, and neither lives on this cluster.
+#
+# It holds the role because the board was free and the role is small:
+# headquarters only needs a cluster to run SPIRE, OPA and the PDP in.
+#
+# Having no UPS is a property rather than an oversight. A real power cut takes
+# headquarters down while revenant rides its battery, which is exactly the
+# degraded-mode enforcement ztlab exists to demonstrate — an event caused by
+# pulling one plug rather than simulated with a firewall rule.
+#
+# containerlab is NO LONGER composed, and the absence is a decision: the FRR
+# fault catalogue is paused, and its successor targets cEOS images that are
+# amd64 and cannot run on this board. wraith stays in containerlab_hosts because
+# it remains eligible and roles/containerlab still serves the next topology
+# host, but nothing here converges it. What is already installed on the box is
+# left alone; it simply stops being managed.
+#
+#   nvidia_runtime   still not composed: no GPU, and the images that would want
+#                    one are amd64 while this box is a Pi.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: wraith
+
+    # preflight first: nothing is changed before the preconditions are known.
+    #
+    # wifi_link early, and the ordering is real rather than tidy: everything
+    # after it pulls packages and images across a wireless link whose power save
+    # this estate has already watched drop a host mid-operation for three and a
+    # half hours. Stabilise the link, then use it.
+    #
+    # registry_mirror before k3s_server, which _layers.yml asserts: k3s reads
+    # registries.yaml once, at first start.
+    #
+    # kubeconfig last, because it reads a kubeconfig that does not exist until
+    # k3s_server has run.
+    host_roles:
+      - preflight
+      - base
+      - wifi_link
+      - registry_mirror
+      - k3s_server
+      - kubeconfig
+
+    # No cilium here, unlike revenant. The enforcement points live where the
+    # application does, and headquarters only needs a cluster to run SPIRE, OPA
+    # and the PDP in — so k3s keeps its bundled flannel, which also keeps an
+    # eBPF dataplane off a Pi's raspi kernel.
+    cluster_roles:
+      - observability

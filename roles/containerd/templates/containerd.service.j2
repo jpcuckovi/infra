@@ -1,0 +1,32 @@
+{{ ansible_managed | comment }}
+# Ported from containerd v{{ containerd_version }}'s own containerd.service. Two changes:
+# ExecStart names the binary by variable, and the note about systemd older than
+# 226 is dropped because no target is that old. Templated rather
+# than downloaded because the upstream file carries no checksum, and a unit is
+# as much a part of what runs as the binary is.
+
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target dbus.service
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart={{ containerd_bin }}
+
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNPROC=infinity
+LimitCORE=infinity
+
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target

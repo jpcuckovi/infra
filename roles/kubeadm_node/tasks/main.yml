@@ -1,0 +1,127 @@
+# Node prerequisites for kubeadm.
+#
+# Ends with kubelet enabled and crash-looping, which is correct: it has no
+# configuration until `kubeadm init` or `join` writes one, and systemd restarts
+# it every few seconds until then. Nothing here waits for it.
+---
+# ---- kernel ------------------------------------------------------------------
+
+- name: Load the kernel modules kubeadm needs at boot
+  ansible.builtin.copy:
+    dest: "{{ kubeadm_node_modules_file }}"
+    content: "{{ kubeadm_node_modules | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+# And now, because modules-load.d is only read at boot, and the sysctls below
+# fail to apply while br_netfilter is absent.
+- name: Load the kernel modules kubeadm needs now
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ kubeadm_node_modules }}"
+
+- name: Apply the kubeadm kernel tunables
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "{{ kubeadm_node_sysctl_file }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop: "{{ kubeadm_node_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# ---- swap --------------------------------------------------------------------
+# kubelet refuses to start with swap enabled unless configured for it, and this
+# cluster does not configure it.
+#
+# Real work on bare metal, not the belt-and-braces it was on k8s-aio's guests.
+# Cloud images ship without swap; the Ubuntu Server installer creates /swap.img
+# and an fstab line naming it.
+
+# The fstab entry first, so a reboot between these tasks cannot bring swap back.
+# Commented out rather than deleted, so the installer's line stays readable.
+- name: Disable swap entries in fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#\s]\S*\s+\S+\s+swap\s.*)$'
+    replace: '# disabled by infra (kubeadm_node): \1'
+
+- name: Turn swap off
+  ansible.builtin.command: swapoff -a
+  when: ansible_facts['swaptotal_mb'] | int > 0
+
+# Only the installer's default file, and only once nothing uses it. A swap file
+# elsewhere is someone's decision and is left alone — the fstab entry above is
+# what stops it being used.
+- name: Remove the installer's swap file
+  ansible.builtin.file:
+    path: /swap.img
+    state: absent
+
+# ---- packages ----------------------------------------------------------------
+
+# deb822_repository imports the `debian` Python module on the target, which the
+# Server install does not ship. Without it the module fails naming a library
+# rather than the repository.
+- name: Install the repository module's dependency
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+
+# deb822 with the key fetched into the source's own Signed-By, so the key is
+# scoped to this repository rather than trusted for every source on the host.
+- name: Add the Kubernetes package repository
+  ansible.builtin.deb822_repository:
+    name: kubernetes
+    types: deb
+    uris: "{{ kubeadm_node_repo_url }}"
+    suites: /
+    signed_by: "{{ kubeadm_node_repo_url }}Release.key"
+    state: present
+  register: kubeadm_node_repo
+
+- name: Refresh the apt cache for the new repository
+  ansible.builtin.apt:
+    update_cache: true
+  when: kubeadm_node_repo is changed
+
+# Exact versions, and allowed through the hold below. Without that, a pin bump
+# stops at the hold with a message about held packages rather than upgrading.
+- name: Install the pinned kubelet, kubeadm and kubectl
+  ansible.builtin.apt:
+    name: >-
+      {{ kubeadm_node_packages
+         | map('regex_replace', '$', '=' ~ kubernetes_version ~ '-' ~ kubernetes_package_revision)
+         | list }}
+    state: present
+    allow_change_held_packages: true
+    allow_downgrade: false
+  # Skipped under --check on a node without the repository yet. The task above
+  # only simulated adding it, so apt has no kubelet to find and the dry run
+  # would fail on a package that a real run installs. The repository shows as
+  # the pending change in its place.
+  when: not (ansible_check_mode and kubeadm_node_repo is changed)
+
+# Held, so an unattended upgrade cannot step one node onto a new minor and break
+# the control plane a node at a time. Upgrades are a pin change here, followed by
+# kubeadm's own upgrade procedure — never apt on its own.
+- name: Hold the Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ kubeadm_node_packages }}"
+  # Same condition as the install: in a dry run on a node without the
+  # repository, the packages were never installed and there is nothing to hold.
+  when: not (ansible_check_mode and kubeadm_node_repo is changed)
+
+# Enabled, not started. It restart-loops until kubeadm configures it, and
+# starting it here would only produce a failure to explain.
+- name: Enable kubelet
+  ansible.builtin.systemd_service:
+    name: kubelet.service
+    enabled: true
+  when: not ansible_check_mode

@@ -1,0 +1,68 @@
+# Converge a cluster node to the state a clabernetes topology needs.
+#
+# Ordering is load-bearing in one place: the extra-modules package, where one is
+# needed, must be installed before modprobe is attempted. Everything else is
+# independent.
+---
+- name: Install the extra kernel modules package
+  ansible.builtin.apt:
+    name: "{{ clabernetes_modules_extra_package }}"
+    state: present
+  when: clabernetes_modules_extra_package | length > 0
+  register: clabernetes_modules_pkg
+  retries: 3
+  delay: 30
+  until: clabernetes_modules_pkg is succeeded
+
+# Rebuild the dependency index so modprobe can find what was just unpacked.
+# Without it a freshly installed module is on disk and unloadable, which reads as
+# "the package did not help" rather than "the index is stale".
+- name: Refresh the module dependency index
+  ansible.builtin.command: depmod -a
+  changed_when: false
+  when: clabernetes_modules_pkg is defined and clabernetes_modules_pkg.changed
+
+- name: Load the topology kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ clabernetes_kernel_modules }}"
+  loop_control:
+    label: "{{ item }}"
+  register: clabernetes_modprobe
+  failed_when: false
+
+- name: Assert every topology module loaded
+  ansible.builtin.assert:
+    that:
+      - clabernetes_modprobe_failed | length == 0
+    fail_msg: >-
+      These kernel modules did not load: {{ clabernetes_modprobe_failed | join(', ') }}.
+
+      Running kernel is {{ ansible_facts['kernel'] }}.
+
+      Ask the host whether the module exists at all:  modinfo -n <module>
+
+      A path means it is present and failed to load for another reason. "not
+      found" means this kernel does not carry it, and
+      clabernetes_modules_extra_package needs to name whatever supplies it on this
+      release — it is empty by default because the check has to be made per
+      kernel, and the value roles/containerlab reached was for a different one.
+
+      Without sch_netem there is no impairment and the L1/L2 fault catalogue
+      silently does nothing; without veth no topology comes up at all; without
+      bonding a host cannot form the 802.3ad bundle an MLAG pair terminates.
+    success_msg: "modules loaded: {{ clabernetes_kernel_modules | join(', ') }}"
+  vars:
+    clabernetes_modprobe_failed: >-
+      {{ clabernetes_modprobe.results | default([])
+         | selectattr('failed', 'defined') | selectattr('failed')
+         | map(attribute='item') | list }}
+
+- name: Persist the modules across reboot
+  ansible.builtin.template:
+    src: modules-load.conf.j2
+    dest: "{{ clabernetes_modules_conf }}"
+    owner: root
+    group: root
+    mode: "0644"

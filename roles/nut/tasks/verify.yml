@@ -1,0 +1,95 @@
+# Gates for NUT.
+#
+# Each asks the UPS through upsd rather than asking systemd about units. An
+# active unit proves a process started; a status read over the protocol proves
+# the driver found the UPS, upsd is serving it, and the data is live.
+---
+- name: Read the UPS status
+  ansible.builtin.command: >-
+    upsc {{ nut_ups_name }}@{{ nut_monitor_address }}:{{ nut_listen_port }} ups.status
+  register: nut_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# OL is on line power, OB on battery; either proves live data. The value carries
+# other flags alongside, such as "OL CHRG", so the test is word membership.
+#
+# NOT a regex with \b. Inside a Jinja string literal `\b` is a BACKSPACE — Python
+# resolves the escape long before the regex engine sees it — so
+# `search('\b(OL|OB)\b')` matches nothing at all and the gate fails on a
+# perfectly healthy UPS. Splitting the value needs no escaping to get right.
+- name: Assert the UPS is reporting
+  ansible.builtin.assert:
+    that:
+      - nut_status.rc == 0
+      - "'OL' in nut_status.stdout.split() or 'OB' in nut_status.stdout.split()"
+    fail_msg: >-
+      Could not read ups.status from {{ nut_ups_name }}.
+      stdout: {{ nut_status.stdout | default('') | trim | default('(empty)', true) }} —
+      stderr: {{ nut_status.stderr | default('') | trim | default('(empty)', true) }}
+
+      "Data stale" or "Driver not connected" means upsd is running and the
+      driver has no UPS. Check the USB cable, then on {{ inventory_hostname }}:
+      lsusb, journalctl -u nut-driver@{{ nut_ups_name }}
+
+      On a netclient the read crosses the network to {{ nut_server_host }}:
+      "Connection refused" means upsd there is down or not listening off
+      loopback, and an unknown host means {{ nut_server_address }} does not
+      resolve from {{ inventory_hostname }}.
+
+      "Init SSL without certificate database" is NOT an error. NUT prints it on
+      stderr whenever upsc runs without a certificate database, and the value
+      still arrives on stdout.
+    success_msg: "{{ nut_ups_name }} reports {{ nut_status.stdout | trim }}"
+
+- name: List the clients logged in to the UPS
+  ansible.builtin.command: >-
+    upsc -c {{ nut_ups_name }}@{{ nut_monitor_address }}:{{ nut_listen_port }}
+  register: nut_clients
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The gate that matters most, because its failure is silent until the outage it
+# exists for. With upsmon not logged in, the UPS reports perfectly and nothing
+# shuts this host down when the battery runs out.
+- name: Assert the shutdown monitor is watching the UPS
+  ansible.builtin.assert:
+    that:
+      - nut_clients.rc == 0
+      - nut_monitor_source in nut_clients.stdout_lines
+    fail_msg: >-
+      upsmon is not logged in to {{ nut_ups_name }}, so nothing will shut
+      {{ inventory_hostname }} down when the battery runs low.
+
+      Check: systemctl status nut-monitor, journalctl -u nut-monitor. A password
+      that differs between upsd.users and upsmon.conf shows there as a login
+      failure.
+    success_msg: "upsmon logged in to {{ nut_ups_name }}"
+
+- name: Read the upsmon configuration
+  ansible.builtin.slurp:
+    src: "{{ nut_config_dir }}/upsmon.conf"
+  register: nut_upsmon_verify_raw
+  no_log: true
+
+# Asserted in both directions. Killpower switched on by accident powers off
+# every outlet on the UPS; switched off by accident, the host stays down after
+# mains returns. Either way the discovery comes during a power cut.
+- name: Assert killpower matches the declared setting
+  ansible.builtin.assert:
+    that:
+      - (nut_powerdown_lines | length > 0) == (nut_killpower | bool and nut_local_ups | bool)
+    fail_msg: >-
+      nut_killpower is {{ nut_killpower }}, but upsmon.conf
+      {{ 'sets' if nut_powerdown_lines | length > 0 else 'does not set' }}
+      POWERDOWNFLAG. Re-run playbooks/{{ inventory_hostname }}/main.yml.
+    success_msg: >-
+      killpower {{ 'on: the UPS cuts its outlets after shutdown'
+                   if nut_killpower | bool
+                   else 'off: only this host shuts down' }}
+  vars:
+    nut_powerdown_lines: >-
+      {{ nut_upsmon_verify_raw.content | b64decode
+         | regex_findall('(?m)^\s*POWERDOWNFLAG\s') }}

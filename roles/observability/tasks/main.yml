@@ -1,0 +1,195 @@
+# Traces, metrics, and the discovery contract.
+#
+# Runs AFTER victoriametrics, so Prometheus has a remote_write target the moment
+# it starts rather than dropping its first minutes of samples.
+---
+- name: Ensure the observability namespace exists
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ observability_namespace }}"
+  # Created if absent, never deleted. The namespace is shared with workloads
+  # this role does not own — a co-tenant guard rather than an ownership claim.
+
+# --- Jaeger -----------------------------------------------------------------
+# One Jaeger serves the estate, on the durable box. templates/jaeger.yaml.j2
+# argues the case: "tracing must not compete for resources with the thing being
+# traced, and a lab node is redeployed often". A host that reloads routinely
+# sends its traces to the shared instance and runs none of its own.
+- name: Apply the Jaeger pipeline configuration
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: jaeger-config
+        namespace: "{{ observability_namespace }}"
+      data:
+        jaeger-config.yaml: "{{ lookup('file', 'jaeger-config.yaml') }}"
+    apply: true
+  when: observability_jaeger_enabled | bool
+
+- name: Apply Jaeger
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition: "{{ lookup('template', 'jaeger.yaml.j2') | from_yaml_all | list }}"
+    apply: true
+    wait: true
+    wait_timeout: 300
+  when: observability_jaeger_enabled | bool
+
+# --- kube-prometheus-stack --------------------------------------------------
+- name: Ensure the render directory exists
+  ansible.builtin.file:
+    path: "{{ observability_render_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+
+- name: Render the per-host values overlay
+  ansible.builtin.template:
+    src: host-values.yaml.j2
+    dest: "{{ observability_values_render_path }}"
+    mode: "0644"
+  delegate_to: localhost
+  register: obs_host_values
+  # Written into the repo's gitignored .ansible/ rather than a temp file, on
+  # purpose: when a chart install fails on a values problem, the exact file helm
+  # was given is the first thing worth reading, and a deleted tempfile cannot be.
+
+- name: Install kube-prometheus-stack
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ observability_release }}"
+    chart_ref: kube-prometheus-stack
+    chart_repo_url: https://prometheus-community.github.io/helm-charts
+    chart_version: "{{ kube_prometheus_stack_version }}"
+    release_namespace: "{{ observability_namespace }}"
+    create_namespace: false
+    # Order is the contract: base carries workload requirements, the rendered
+    # overlay carries this cluster's facts, and later wins.
+    values_files:
+      - "{{ role_path }}/../../charts/values/kube-prometheus-stack.base.yaml"
+      - "{{ observability_values_render_path }}"
+    wait: true
+    wait_timeout: "15m"
+
+# --- the discovery contract -------------------------------------------------
+# Addresses are asked of the cluster, never stored in git, so these files stay
+# correct when DHCP moves the node.
+# Dashboards ship to the host that RUNS Grafana, which is the metrics store —
+# the same discriminator prometheus_remote_write_url uses. A lab node writes its
+# series to the shared store and is read from the shared Grafana; shipping a
+# dashboard to a cluster with no Grafana would be applying a ConfigMap nothing
+# reads.
+#
+# Discovered by the chart's sidecar via the grafana_dashboard=1 label, so no
+# Grafana restart and no provisioning file. Applied from files/dashboards/, one
+# ConfigMap per file, so adding a dashboard is dropping a .json in.
+- name: Find the dashboards to publish
+  ansible.builtin.find:
+    paths: "{{ role_path }}/files/dashboards"
+    patterns: "*.json"
+  register: obs_dashboards
+  delegate_to: localhost
+  check_mode: false
+  when: observability_grafana_enabled | bool
+
+- name: Apply the Grafana dashboards
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "dashboard-{{ item.path | basename | splitext | first }}"
+        namespace: "{{ observability_namespace }}"
+        labels:
+          grafana_dashboard: "1"
+      # Built as one expression rather than written as `"{{ ... }}": ...`.
+      # ansible-core 2.19 stopped templating dictionary KEYS in task arguments,
+      # so a templated key reaches the API server as the literal text and the
+      # ConfigMap is rejected. Values are still templated, so the whole mapping
+      # is one.
+      data: "{{ {item.path | basename: lookup('ansible.builtin.file', item.path)} }}"
+  loop: "{{ obs_dashboards.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: observability_grafana_enabled | bool
+
+- name: Ask the cluster for a node address
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+  register: obs_nodes
+  check_mode: false
+
+- name: Resolve the node's internal address
+  ansible.builtin.set_fact:
+    obs_node_ip: >-
+      {{ obs_nodes.resources[0].status.addresses
+         | selectattr('type', 'equalto', 'InternalIP')
+         | map(attribute='address') | first }}
+
+- name: Ensure the consumer configuration directory exists
+  ansible.builtin.file:
+    path: "{{ observability_config_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  when: observability_write_discovery_contract | bool
+
+# This role is the ONLY writer of these two files.
+#
+# The problem they solve: two agent repos each installed part of the stack and
+# each recorded the endpoint differently. One wrote a repo-local file and a
+# user-level file; the other wrote only a repo-local one and read only its own.
+# Installing from the wrong repo left the other agent pointed at nothing, and
+# nothing failed loudly — the agents simply ran without telemetry.
+#
+# Readers resolve in order, first hit wins:
+#   1. AGENT_OTLP_ENDPOINT / AGENT_PROM_URL   explicit override
+#   2. ~/.config/diag-agents/<name>           canonical, written here
+#
+# The filenames carry no host, and that is why exactly ONE host may write them.
+# They name where an agent should send telemetry, which is the shared services
+# cluster — a single answer, not one per machine. A second writer would overwrite
+# the first on every run, and tasks/verify.yml asserts the recorded address
+# matches the cluster it just probed, so the two hosts would fail each other's
+# runs alternately while both stacks were perfectly healthy.
+- name: Record the OTLP endpoint
+  ansible.builtin.copy:
+    content: "{{ obs_node_ip }}:{{ jaeger_otlp_http_node_port }}\n"
+    dest: "{{ observability_config_dir }}/otlp-endpoint"
+    mode: "0644"
+  delegate_to: localhost
+  when: observability_write_discovery_contract | bool
+
+- name: Record the Prometheus URL
+  ansible.builtin.copy:
+    content: "http://{{ obs_node_ip }}:{{ prometheus_node_port }}\n"
+    dest: "{{ observability_config_dir }}/prometheus-url"
+    mode: "0644"
+  delegate_to: localhost
+  when: observability_write_discovery_contract | bool
+
+- name: Report the published endpoints
+  ansible.builtin.debug:
+    msg: "{{ obs_published }}"
+  vars:
+    obs_published: >-
+      {{ ['prometheus      http://' ~ obs_node_ip ~ ':' ~ prometheus_node_port]
+         + (['grafana         http://' ~ obs_node_ip ~ ':' ~ grafana_node_port]
+            if observability_grafana_enabled | bool else [])
+         + (['jaeger ui       http://' ~ obs_node_ip ~ ':' ~ jaeger_ui_node_port]
+            if observability_jaeger_enabled | bool else [])
+         + ['victoriametrics http://' ~ metrics_alias ~ ':' ~ victoriametrics_node_port] }}

@@ -1,0 +1,49 @@
+# The GPU's cluster-side half.
+#
+# Chart VERSIONS live in inventory/group_vars/gpu_hosts.yml, with the reason for
+# each. What is here is naming and timing — properties of the role rather than
+# of the hardware class.
+---
+dcgm_release: dcgm-exporter
+
+# How many nvidia.com/gpu the node should advertise once the plugin has settled.
+#
+# One per physical card when dedicated; two when either sharing mode is on, since
+# both make a single card schedulable twice. Derived rather than declared, so it
+# cannot disagree with the mode actually being installed.
+#
+# The card count is fixed at one because every gpu_hosts member has one. A host
+# with more would override this — and would also want the sharing values files
+# to say a different number of replicas, so the two would move together.
+nvidia_expected_gpu_count: "{{ 1 if nvidia_gpu_sharing == 'none' else 2 }}"
+
+# Both are FIRST-PULL budgets, not steady-state ones. helm --wait blocks until
+# the workload is ready, and on a host that has never held these images that is
+# almost entirely download time.
+#
+# dcgm gets far longer because its image bundles the DCGM libraries and runs to
+# well over a gigabyte, against a device plugin an order of magnitude smaller.
+# The relevant constraint is the link, not the machine: revenant reaches the LAN
+# through a USB wireless adapter.
+#
+# Overrun here is not a failed install — the pull continues and the pod comes up
+# after helm has already given up, leaving a release helm believes failed and a
+# workload that is fine. Generous is the cheaper error.
+nvidia_device_plugin_wait_timeout: "10m"
+dcgm_wait_timeout: "20m"
+
+# 60 attempts at 2s. The DaemonSet has to roll and the plugin has to re-register
+# with kubelet before the node advertises anything, and on a first install that
+# also includes pulling the plugin image.
+nvidia_capacity_retries: 60
+
+# Required by verify. gpu-bench's verify.sh:246-252 gates on these five by name:
+# the campaign's memory-bandwidth-bound finding rests on the three profiling
+# fields, and losing them to a chart upgrade would remove the evidence for a
+# published result without breaking anything visibly.
+dcgm_required_fields:
+  - DCGM_FI_DEV_GPU_UTIL
+  - DCGM_FI_DEV_FB_USED
+  - DCGM_FI_PROF_DRAM_ACTIVE
+  - DCGM_FI_PROF_PIPE_TENSOR_ACTIVE
+  - DCGM_FI_PROF_GR_ENGINE_ACTIVE

@@ -1,0 +1,93 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/victoriametrics.
+#
+# NO Namespace resource here, deliberately. The namespace is shared with
+# unrelated workloads, so nothing in this file may be capable of removing it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ victoriametrics_name }}-storage
+  namespace: {{ victoriametrics_namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Advisory under local-path, which provisions a directory and enforces no
+      # quota. -retentionPeriod is what actually bounds this.
+      storage: {{ victoriametrics_storage_size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ victoriametrics_name }}
+  namespace: {{ victoriametrics_namespace }}
+  labels:
+    app: {{ victoriametrics_name }}
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: a ReadWriteOnce volume cannot be mounted by the
+  # outgoing and incoming pods at once, so a rolling update deadlocks with the
+  # new pod Pending and the old one never terminating.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ victoriametrics_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ victoriametrics_name }}
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: {{ victoriametrics_name }}
+          image: {{ victoriametrics_image }}
+          args:
+            - "-storageDataPath=/storage"
+            - "-retentionPeriod={{ victoriametrics_retention_period }}"
+            - "-httpListenAddr=:{{ victoriametrics_port }}"
+            # Accept remote_write from Prometheus instances that may be behind
+            # on time — a box that was powered off backfills on return, and
+            # rejecting out-of-order samples would silently drop that history.
+            - "-search.maxStalenessInterval=5m"
+          ports:
+            - name: http
+              containerPort: {{ victoriametrics_port }}
+          volumeMounts:
+            - name: storage
+              mountPath: /storage
+          resources: {{ victoriametrics_resources | to_json }}
+          readinessProbe:
+            httpGet: { path: /health, port: {{ victoriametrics_port }} }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: {{ victoriametrics_port }} }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ victoriametrics_name }}-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ victoriametrics_name }}
+  namespace: {{ victoriametrics_namespace }}
+  labels:
+    app: {{ victoriametrics_name }}
+spec:
+  # NodePort because the writers are Prometheus instances on OTHER machines,
+  # reached through the metrics.lan CNAME. In-cluster writers use the ClusterIP
+  # name instead and never traverse this.
+  type: NodePort
+  selector:
+    app: {{ victoriametrics_name }}
+  ports:
+    - name: http
+      port: {{ victoriametrics_port }}
+      targetPort: {{ victoriametrics_port }}
+      nodePort: {{ victoriametrics_node_port }}

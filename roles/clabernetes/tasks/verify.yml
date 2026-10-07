@@ -1,0 +1,110 @@
+# Gates for the clabernetes controller.
+#
+# Each of these asks the CLUSTER rather than helm. A successful release says the
+# chart rendered; it does not say the controller is running, that the CRD the
+# topologies name exists, or that the settings this estate depends on survived
+# the merge into the Config singleton.
+---
+- name: Read the server version
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+  register: clabernetes_nodes
+  check_mode: false
+
+- name: Assert the cluster is new enough for clabernetes
+  ansible.builtin.assert:
+    that:
+      - clabernetes_kube_minor | int >= clabernetes_min_kube_minor | int
+    fail_msg: >-
+      This cluster reports Kubernetes 1.{{ clabernetes_kube_minor }}, and
+      clabernetes 0.7 and later require 1.{{ clabernetes_min_kube_minor }} or
+      newer.
+    success_msg: "Kubernetes 1.{{ clabernetes_kube_minor }}"
+  vars:
+    clabernetes_kube_minor: >-
+      {{ clabernetes_nodes.resources[0].status.nodeInfo.kubeletVersion
+         | regex_replace('^v1\.([0-9]+).*$', '\1') }}
+
+- name: Read the topologies CRD
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: CustomResourceDefinition
+    name: "{{ clabernetes_crd }}"
+  register: clabernetes_crd_info
+  check_mode: false
+
+- name: Assert the topologies CRD is installed under the current API group
+  ansible.builtin.assert:
+    that:
+      - clabernetes_crd_info.resources | length == 1
+    fail_msg: >-
+      {{ clabernetes_crd }} is not present. A topology applied against this
+      cluster would be rejected as an unknown kind.
+    success_msg: "{{ clabernetes_crd }} present"
+
+- name: Read the controller deployment
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    namespace: "{{ clabernetes_namespace }}"
+  register: clabernetes_deployments
+  check_mode: false
+
+- name: Assert the controller is available
+  ansible.builtin.assert:
+    that:
+      - clabernetes_unavailable | length == 0
+    fail_msg: >-
+      Not available in {{ clabernetes_namespace }}:
+      {{ clabernetes_unavailable | join(', ') }}.
+    success_msg: >-
+      {{ clabernetes_deployments.resources | length }} deployment(s) available in
+      {{ clabernetes_namespace }}
+  vars:
+    clabernetes_unavailable: >-
+      {{ clabernetes_deployments.resources | default([])
+         | rejectattr('status.availableReplicas', 'defined')
+         | map(attribute='metadata.name') | list }}
+
+# The settings below are the ones without which an image in the estate registry
+# exists and cannot be pulled. They are declared in charts/values/clabernetes.yaml
+# with mergeMode: overwrite, and this gate is what proves the merge honoured them
+# — "merge" copies only fields absent from an existing Config, so a changed value
+# would be written to the bootstrap ConfigMap and then quietly ignored. That is
+# the same shape as a version pin sitting in group_vars while every host runs
+# something else.
+- name: Read the clabernetes Config singleton
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: c9s.run/v1alpha1
+    kind: Config
+    namespace: "{{ clabernetes_namespace }}"
+  register: clabernetes_config
+  check_mode: false
+
+- name: Assert the image pull is directed at k3s's containerd
+  ansible.builtin.assert:
+    that:
+      - clabernetes_config.resources | length > 0
+      - clabernetes_pull.get('criSockOverride', '') == clabernetes_cri_sock
+      - clabernetes_pull.get('criHostsDir', '') == clabernetes_cri_hosts_dir
+    fail_msg: >-
+      The Config singleton does not carry the CRI settings this estate needs.
+
+      Found: criSockOverride={{ clabernetes_pull.get('criSockOverride', 'unset') }},
+      criHostsDir={{ clabernetes_pull.get('criHostsDir', 'unset') }}
+
+      Expected: {{ clabernetes_cri_sock }} and {{ clabernetes_cri_hosts_dir }}.
+
+      Without these the launcher's pull does not go through the containerd that
+      knows registry.lan, and the failure is an image that is present in the
+      registry and cannot be pulled — reported as ImagePullBackOff naming an
+      image rather than a configuration.
+
+      If the values file already says this, mergeMode did not take.
+    success_msg: "image pull directed at {{ clabernetes_cri_sock }}"
+  vars:
+    clabernetes_pull: >-
+      {{ (clabernetes_config.resources[0].spec | default({})).imagePull
+         | default({}) }}

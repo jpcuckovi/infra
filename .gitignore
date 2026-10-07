@@ -1,0 +1,22 @@
+# Nothing in this repository is secret, and that is deliberate: the estate has
+# no credentials to store, and inventory hostnames are ~/.ssh/config aliases so
+# no address is ever committed. Both inventory and host_vars are tracked on
+# purpose — they are readable, reviewable configuration, not encrypted blobs.
+#
+# What is ignored is only what a run produces.
+
+# Retrieved kubeconfigs and anything fetched off a host.
+*.kubeconfig
+fetched/
+
+# Ansible run artefacts.
+*.retry
+.ansible/
+ansible.log
+
+# Collections installed into the repo rather than the venv bundle. Ignored
+# because ~/.ansible/collections PRECEDES the venv bundle in the search path,
+# so a stray local install silently shadows the pinned version.
+collections/
+
+.DS_Store

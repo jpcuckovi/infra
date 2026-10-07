@@ -1,0 +1,38 @@
+# The clabernetes controller: a cluster capability, like nvidia_device_plugin.
+#
+# Installed on the cluster layer — from the workstation, over the Kubernetes API,
+# with `context:` naming the cluster explicitly. Nothing about it is a property of
+# the machine underneath, which is why it is not part of clabernetes_host.
+---
+
+# The OCI chart reference.
+#
+# NOT ghcr.io/srl-labs/clabernetes — that repository's tags stop at 0.6.0. The
+# project moved, and the same move renamed the API group from
+# clabernetes.containerlab.dev to c9s.run in v0.7.0 with no upgrade path across
+# it. Documentation still published elsewhere, including containerlab.dev's own
+# clabernetes pages, describes the old group and the old reference.
+clabernetes_chart_ref: "oci://ghcr.io/clabernetes/clabernetes/clabernetes"
+
+clabernetes_release: clabernetes
+clabernetes_namespace: c9s
+
+# The CRD the topologies use. Asserted by the gate, because finding the OLD group
+# installed means a pre-0.7 release is in the way and must be REMOVED rather than
+# upgraded.
+clabernetes_crd: topologies.c9s.run
+clabernetes_superseded_crd: topologies.clabernetes.containerlab.dev
+
+# clabernetes 0.7 and later require Kubernetes 1.31 or newer.
+clabernetes_min_kube_minor: 31
+
+# The containerd socket the launcher's image pull is directed at. k3s does not use
+# the conventional path, and the chart's own values file names this one as its
+# k3s example.
+clabernetes_cri_sock: /run/k3s/containerd/containerd.sock
+
+# k3s renders registries.yaml into a containerd hosts directory here rather than
+# at /etc/containerd/certs.d. Without it the pull-through pod succeeds and the
+# launcher's own client does not — which surfaces as an image that exists in the
+# registry and cannot be pulled.
+clabernetes_cri_hosts_dir: /var/lib/rancher/k3s/agent/etc/containerd/certs.d

@@ -1,0 +1,42 @@
+# Stand up the long-term metrics store.
+#
+# Runs BEFORE observability, so Prometheus has somewhere to remote-write to the
+# moment it starts. Installed the other way round, every install drops its first
+# minutes of samples and logs a connection error that reads like a
+# misconfiguration rather than an ordering problem.
+---
+- name: Ensure the observability namespace exists
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ victoriametrics_namespace }}"
+  # Created if absent and never deleted, by this role or any other. The
+  # namespace is shared with workloads neither owns, so no role may be capable
+  # of removing it. Both this role and observability ensure it, so either can
+  # run standalone.
+
+- name: Apply VictoriaMetrics
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition: "{{ lookup('template', 'victoriametrics.yaml.j2') | from_yaml_all | list }}"
+    apply: true
+    wait: true
+    wait_timeout: 300
+
+- name: Wait for VictoriaMetrics to become available
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ victoriametrics_name }}"
+    namespace: "{{ victoriametrics_namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  when: not ansible_check_mode

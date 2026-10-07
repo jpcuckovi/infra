@@ -1,0 +1,33 @@
+# revenant — change how the GPU is shared, and nothing else.
+#
+#   ~/.venv/bin/ansible-playbook playbooks/revenant/gpu-sharing.yml \
+#     -e nvidia_gpu_sharing=timeslicing
+#
+#   modes: none (default, dedicated) | timeslicing | mps
+#
+# Separate from main.yml deliberately. Sharing is NODE-WIDE and STICKY: it makes
+# one card advertise as two for every workload on the machine, until someone
+# reverts it, and nothing in a workload's own spec records that it is in effect.
+# A pod that assumed exclusive access simply gets less of the card, correctly and
+# silently.
+#
+# A value with that reach should not ride along with a routine converge. Running
+# it from here means enabling sharing is an act someone chose on the day they
+# chose it — and `nvidia_gpu_sharing` stays `none` in group_vars/gpu_hosts.yml,
+# so a later main.yml run puts the card back rather than preserving a mode set by
+# a `-e` flag it never saw.
+#
+# That last point is worth stating plainly: THIS DOES NOT PERSIST. main.yml will
+# revert it. To make a mode durable, set nvidia_gpu_sharing in
+# inventory/host_vars/revenant.yml, where it is declared rather than passed.
+#
+# host_roles is empty on purpose. Changing sharing touches nothing on the host —
+# no packages, no driver, no k3s — so the host layer has nothing to do, and the
+# ordering asserts in _layers.yml pass trivially on an empty list.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: revenant
+    host_roles: []
+    cluster_roles:
+      - nvidia_device_plugin

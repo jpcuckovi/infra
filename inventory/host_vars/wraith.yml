@@ -1,0 +1,73 @@
+# wraith — ztlab's headquarters.
+#
+# Raspberry Pi 4, 8 GB, arm64, Ubuntu 26.04 on the raspi kernel. Runs a
+# single-node k3s carrying ztlab's decision plane: SPIRE server, OPA, and the
+# pdp/pa/posture services. Small workloads, all of which publish arm64 images.
+#
+# It was the network lab before that, running containerlab topologies for
+# the FRR fault catalogue. That campaign is paused and its successor targets
+# cEOS, whose images are amd64 and cannot run here, so the board was free. See
+# playbooks/wraith/main.yml for why headquarters landed on the estate's smallest
+# machine.
+
+# ---- link ------------------------------------------------------------------
+# Wireless, and eth0 carries no cable: `ip -br link` reports eth0 NO-CARRIER
+# with wlan0 UP. Hence wifi_hosts membership — see roles/wifi_link for what a
+# sleeping radio costs, measured on phantom.
+#
+# No interface is named here. roles/wifi_link discovers it, which matters
+# because the three wireless hosts in this estate have three different chipsets
+# and two different naming conventions.
+
+# ---- containerlab ----------------------------------------------------------
+# Nothing overridden. The pins, the module list and the runtime live in
+# roles/containerlab/defaults, not in a group_vars file, because exactly one
+# role reads them.
+#
+# That is the same test all.yml applies to the cross-role contracts it carries:
+# a value two capabilities share belongs above both of them, and a value one
+# role owns belongs to that role. gpu_hosts.yml exists because the NVIDIA pins
+# are read by nvidia_runtime AND nvidia_device_plugin; a containerlab_hosts.yml
+# would only restate what the role already says.
+#
+# That includes containerlab_modules_extra_package, which is empty by default
+# and correct here: Ubuntu 26.04's raspi kernel carries sch_netem, mpls_router,
+# vrf and veth in its base module set, and the extra package bootstrap-pi.sh
+# named does not exist on this release at all.
+#
+# None of it is applied any more — playbooks/wraith/main.yml no longer composes
+# the role — and it is kept because the machine still carries the packages and
+# the next topology host will want the reasoning.
+
+# ---- cluster identity ------------------------------------------------------
+# Named for the machine, as revenant's is: a single-node cluster
+# whose lifetime is exactly the machine's.
+kubeconfig_context: wraith
+
+# ---- observability ---------------------------------------------------------
+# REQUIRED and unique across the estate, or identically-named series from two
+# clusters interleave in the one VictoriaMetrics and cannot be separated after.
+prometheus_external_labels:
+  cluster: wraith
+
+# Three things this host does not run, because each should exist once in the
+# estate and phantom already has it. This cluster's series are read from
+# phantom's Grafana, filtered by the label above.
+observability_jaeger_enabled: false
+observability_grafana_enabled: false
+observability_write_discovery_contract: false
+
+# ---- k3s -------------------------------------------------------------------
+# Plain k3s, keeping its bundled flannel and policy controller — deliberately
+# NOT revenant's arrangement. Cilium is there to show enforcement and record what
+# it drops, and enforcement happens where the application is. Headquarters only
+# needs a cluster to run SPIRE, OPA and the PDP in, and an eBPF dataplane on a
+# Pi's raspi kernel would be a dependency bought for nothing.
+#
+# INSTALL-TIME. INSTALL_K3S_EXEC is read once, when k3s is installed — changing
+# this list later configures the NEXT install and has no effect on a running
+# server. See docs/ARCHITECTURE.md, "What is reconciled, and what is only
+# declared".
+k3s_server_args:
+  - "--secrets-encryption"
+  - "--disable=traefik"

@@ -1,0 +1,84 @@
+# Network UPS Tools on a host with a UPS attached over USB: read the UPS, and
+# shut THIS host down cleanly when the UPS reports its battery low.
+#
+# Standalone mode by default. The driver, the upsd data server and the upsmon
+# shutdown monitor all run on the one host the UPS is cabled to, and upsd
+# listens on loopback only.
+#
+# One UPS feeding several hosts is the other shape: the cabled host serves the
+# UPS on the network (netserver) and every other host on it runs upsmon alone
+# (netclient), shutting itself down on the server's word.
+---
+# standalone  driver, upsd and upsmon on this host; nothing off it reads the UPS
+# netserver   the same, with upsd also listening on the network
+# netclient   upsmon only, watching a UPS served by nut_server_address
+nut_mode: standalone
+
+# netserver and netclient only.
+#
+# nut_server_host is the inventory name of the host the UPS is cabled to. It
+# names the workstation directory the shared password lives in, so the server
+# and its clients must agree on it. nut_server_address is what a client
+# connects to.
+nut_server_host: ""
+nut_server_address: ""
+
+# Every interface rather than the node's own address: upsd fails to start when
+# an address it is told to bind does not exist yet, which at boot is a race
+# against DHCP. It replaces the loopback listener rather than joining it, and
+# this host's own upsmon still connects over nut_listen_address.
+nut_server_listen_address: 0.0.0.0
+
+# The account a netclient's upsmon logs in with. A secondary can attach to the
+# UPS and nothing more; reading status needs no login at all, and forcing a
+# shutdown needs the primary's password, which never leaves the server.
+nut_secondary_user: netclient
+
+# The secondary's password, on the WORKSTATION, outside every repository —
+# beside cluster_ca_dir, for the same reason. Generated on first use. Here
+# rather than on the server so a client can be configured while the server is
+# down, and so a host this repository does not manage can be given the value.
+nut_secondary_password_file: "{{ lookup('env', 'HOME') }}/.local/share/infra/nut/{{ nut_server_host }}/secondary-password"
+
+# The name the UPS is known by: `upsc <name>@localhost`.
+nut_ups_name: ups
+
+# usbhid-ups covers USB HID power devices, CyberPower's consumer units among
+# them. `port = auto` is the required value for USB and means the first matching
+# HID UPS, which is unambiguous on a host with exactly one attached.
+nut_driver: usbhid-ups
+nut_port: auto
+
+nut_listen_address: 127.0.0.1
+nut_listen_port: 3493
+
+# Whether the UPS cuts power to its outlets after this host has shut down.
+#
+# This is NUT's usual primary-mode behaviour. Once upsmon has taken the host
+# down on low battery, a systemd shutdown hook commands the UPS to switch its
+# load off, so that when mains returns the UPS restores power and a host whose
+# firmware powers on after AC loss boots by itself. The command switches off
+# EVERY outlet on the UPS, not only this host's.
+#
+# Off by default, and the price is stated rather than hidden: after a
+# low-battery shutdown this host stays off until someone powers it on, even once
+# mains is back. Turn it on only for a UPS whose every outlet can safely lose
+# power, and set the firmware's power-on-after-AC-loss option at the same time,
+# or the host will not come back regardless.
+nut_killpower: false
+nut_powerdown_flag: /etc/killpower
+
+# What upsmon runs when the UPS is on battery AND reports its battery low. The
+# low-battery threshold is the UPS's own, reported by the unit rather than set
+# here.
+nut_shutdown_command: "/sbin/shutdown -h +0"
+
+nut_packages:
+  - nut-server
+  - nut-client
+
+# A netclient has no UPS to drive and nothing to serve.
+nut_client_packages:
+  - nut-client
+
+nut_config_dir: /etc/nut

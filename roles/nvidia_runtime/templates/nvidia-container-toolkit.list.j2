@@ -1,0 +1,8 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nvidia_runtime. Edits here are overwritten on the next run.
+#
+# Upstream publishes this file with a literal $(ARCH) placeholder and expects
+# the reader to substitute it. gpu-bench does that with sed and hardcodes amd64;
+# here the value comes from `dpkg --print-architecture`, so the same template
+# serves an arm64 host that ever gains a card.
+deb [signed-by={{ nvidia_toolkit_keyring }}] {{ nvidia_toolkit_repo_base }}/{{ nvidia_deb_arch.stdout | trim }} /

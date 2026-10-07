@@ -1,0 +1,73 @@
+# Cilium as a cluster's CNI: pod networking, NetworkPolicy enforcement,
+# kube-proxy replacement, and Hubble flow visibility.
+#
+# A cluster capability, installed on the cluster layer from the workstation. It
+# is composed FIRST in that layer: a k3s installed with --flannel-backend=none
+# has no pod network until this role runs, so nothing else in the layer can
+# start a pod before it. playbooks/_layers.yml asserts the position.
+---
+cilium_chart_repo_url: https://helm.cilium.io/
+cilium_release: cilium
+cilium_namespace: kube-system
+
+# Where the agent and operator reach the API server.
+#
+# Required because kube-proxy is disabled. The in-cluster `kubernetes` Service is
+# what kube-proxy would have programmed, so Cilium cannot use it to find the API
+# it needs in order to program that Service itself.
+#
+# 127.0.0.1 is correct on a SINGLE-NODE k3s and only there. The agent and
+# operator run on the host network, beside the API server k3s binds on every
+# interface, so loopback reaches it and keeps reaching it when DHCP moves the
+# node's address. A second node would need an address every node can reach, and
+# this would stop being a default and become a fact about the cluster.
+cilium_k8s_service_host: 127.0.0.1
+cilium_k8s_service_port: 6443
+
+# The pod CIDR Cilium allocates from: k3s's default --cluster-cidr, which Cilium's
+# own k3s installation guide names. The two must agree, so a host that overrides
+# --cluster-cidr in k3s_server_args overrides this in the same host_vars file.
+cilium_pod_cidr: 10.42.0.0/16
+
+# The annotation flannel writes on every node it manages. Its presence means k3s
+# was installed WITH its bundled CNI, and installing Cilium on top would run two.
+cilium_flannel_annotation: flannel.alpha.coreos.com/backend-type
+
+# cluster_hosts, the nodes this cluster is made of, is a cross-role contract in
+# group_vars/all.yml: this role reads every node's facts and Ready condition
+# from it, and roles/longhorn reads it too.
+
+# The chart's operator replica count, here rather than in charts/values/ because
+# it follows the cluster's size. One on a single node: the chart's default of
+# two, with anti-affinity, leaves a replica that can never schedule and a helm
+# wait that times out on a Deployment working as well as it ever will.
+cilium_operator_replicas: 1
+
+# ---- optional capabilities, off unless a cluster turns them on -------------
+# Each is a fact about a cluster's shape, so each is a variable rather than a
+# line in charts/values/cilium.yaml, which every Cilium cluster shares.
+
+# Nodes answer ARP for LoadBalancer addresses, from the pools below.
+cilium_l2_announcements: false
+
+# L2 announcements hold a Lease per announced service and renew it constantly.
+# The upstream client limits (qps 5, burst 10) are far too low and produce
+# stalls that look like flapping announcements rather than throttling —
+# measured on k8s-aio.
+cilium_k8s_client_qps: 50
+cilium_k8s_client_burst: 100
+
+# lb_pools and lb_pool_label are cross-role contracts in group_vars/all.yml:
+# this role declares the pools, and roles/gateway reads them to find its own
+# address.
+
+# Gateway API, with Cilium as the controller (GatewayClass `cilium`). Needs
+# kube-proxy replacement, which every Cilium cluster here has.
+cilium_gateway_api: false
+cilium_gateway_api_crds_url: >-
+  https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/standard-install.yaml
+
+# A ceiling on the nodes turning Ready once the dataplane is up, not a wait: the
+# task returns as soon as every node's condition is True.
+cilium_node_ready_retries: 30
+cilium_node_ready_delay: 10

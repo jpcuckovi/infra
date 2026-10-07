@@ -1,0 +1,56 @@
+# kube-vip's kubeconfig and static pod, from a given source kubeconfig.
+#
+# Included twice by main.yml: with super-admin.conf during init, and with
+# admin.conf everywhere afterwards. The manifest carries a checksum of the
+# kubeconfig, so a change of source recreates the pod and an unchanged one
+# leaves it alone.
+#
+# Expects kubeadm_control_plane_vip_source: the source kubeconfig's text.
+---
+# The loopback rewrite. Both kubeconfigs name the VIP as their server; kube-vip
+# needs the API to take the lease that CREATES the VIP, so pointed at the VIP it
+# waits forever. The API server also listens on the node's own address, so
+# 127.0.0.1 reaches it whether or not the VIP exists — and the init
+# configuration puts 127.0.0.1 in the API certificate's SANs for exactly this.
+#
+# Rendered in the play rather than with sed on the node, so a pattern that
+# matches nothing fails the assert below instead of writing a file unchanged.
+- name: Derive kube-vip's loopback kubeconfig
+  ansible.builtin.set_fact:
+    kubeadm_control_plane_vip_conf_content: >-
+      {{ kubeadm_control_plane_vip_source
+         | regex_replace('(?m)^(\s*server: https://)[^:\s]+(:' ~ kubeadm_control_plane_port ~ ')\s*$',
+                         '\g<1>127.0.0.1\g<2>') }}
+  no_log: true
+
+- name: Assert the rewrite reached the server line
+  ansible.builtin.assert:
+    that:
+      # A block scalar on purpose. Written inline, the `server: ` inside the
+      # pattern is a YAML key separator, the item parses as a mapping, and
+      # Ansible rejects it with "Conditional expressions must be strings".
+      - >-
+        kubeadm_control_plane_vip_conf_content is search('(?m)^\s*server: https://127\.0\.0\.1:'
+        ~ kubeadm_control_plane_port ~ '\s*$')
+    fail_msg: >-
+      The source kubeconfig has no `server: https://<host>:{{ kubeadm_control_plane_port }}`
+      line to rewrite, so kube-vip would be pointed at the VIP it is meant to
+      create, and would never create it.
+    success_msg: "kube-vip kubeconfig points at loopback"
+
+- name: Write kube-vip's kubeconfig
+  ansible.builtin.copy:
+    content: "{{ kubeadm_control_plane_vip_conf_content }}"
+    dest: "{{ kubeadm_control_plane_vip_conf }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Write the kube-vip static pod
+  ansible.builtin.template:
+    src: kube-vip.yaml.j2
+    dest: "{{ kubeadm_control_plane_manifests }}/kube-vip.yaml"
+    owner: root
+    group: root
+    mode: "0600"

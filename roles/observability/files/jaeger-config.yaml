@@ -1,0 +1,57 @@
+# Jaeger v2 pipeline configuration. Ported unchanged from
+# k8s-obs-stack/deploy/jaeger/jaeger-config.yaml.
+#
+# v2 is built on the OpenTelemetry Collector, so it is configured by a pipeline
+# config file rather than by environment variables — hence this file and the
+# ConfigMap that carries it. Validated against the binary itself with:
+#
+#   docker run --rm -v "$PWD:/cfg" \
+#     --entrypoint /cmd/jaeger/jaeger-linux jaegertracing/jaeger:2.20.0 \
+#     validate --config file:/cfg/jaeger-config.yaml
+service:
+  extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: 0.0.0.0:13133
+
+  jaeger_query:
+    storage:
+      traces: badger_store
+    http:
+      endpoint: 0.0.0.0:16686
+    grpc:
+      endpoint: 0.0.0.0:16685
+
+  jaeger_storage:
+    backends:
+      badger_store:
+        badger:
+          directories:
+            keys: /badger/key
+            values: /badger/data
+          ephemeral: false
+          ttl:
+            spans: 720h
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: badger_store

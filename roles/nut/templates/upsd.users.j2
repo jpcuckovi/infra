@@ -1,0 +1,16 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nut.
+#
+# The password is generated on this host at first install and read back from
+# upsmon.conf on every later run. It never enters the repository.
+[upsmon]
+  password = {{ nut_upsmon_password }}
+  upsmon primary
+{% if nut_mode == 'netserver' %}
+
+# The other hosts on this UPS. The password is held on the workstation, not
+# generated here: see nut_secondary_password_file.
+[{{ nut_secondary_user }}]
+  password = {{ nut_secondary_password }}
+  upsmon secondary
+{% endif %}

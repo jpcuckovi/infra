@@ -1,0 +1,178 @@
+# Longhorn node prerequisites, and the data disk.
+#
+# The disk tasks are the only destructive ones in this repository, so they are
+# written to refuse rather than guess. The disk is identified by elimination —
+# the one disk with no partition table, no filesystem and no children — and
+# anything else about the machine's disks stops the run with a list of what was
+# found. A disk carrying any signature is never formatted, and nothing here ever
+# forces.
+---
+- name: Install the Longhorn node packages
+  ansible.builtin.apt:
+    name: "{{ longhorn_node_packages }}"
+    state: present
+
+- name: Load the Longhorn kernel modules at boot
+  ansible.builtin.copy:
+    dest: "{{ longhorn_node_modules_file }}"
+    content: "{{ longhorn_node_modules | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+# A module loaded while iscsid is already running is not seen by it, hence the
+# restart on change rather than just a start.
+- name: Load the Longhorn kernel modules now
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ longhorn_node_modules }}"
+  notify: Restart iscsid
+
+- name: Apply module changes before starting iscsid
+  ansible.builtin.meta: flush_handlers
+
+- name: Start iscsid
+  ansible.builtin.systemd_service:
+    name: iscsid.service
+    state: started
+    enabled: true
+  when: not ansible_check_mode
+
+# ---- multipathd -------------------------------------------------------------
+# Only where multipath-tools is installed, which the Ubuntu Server installer
+# does by default. A blacklist rather than masking the service, because it is
+# the fix Longhorn documents and it leaves multipath working for any device
+# that is not Longhorn's.
+
+- name: Check for multipathd
+  ansible.builtin.stat:
+    path: /usr/sbin/multipathd
+  register: longhorn_node_multipathd
+
+- name: Keep multipathd off Longhorn's devices
+  when: longhorn_node_multipathd.stat.exists
+  block:
+    - name: Ensure the multipath drop-in directory exists
+      ansible.builtin.file:
+        path: "{{ longhorn_node_multipath_conf | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Blacklist Longhorn's devices from multipath
+      ansible.builtin.copy:
+        dest: "{{ longhorn_node_multipath_conf }}"
+        content: |
+          # Managed by infra (roles/longhorn_node). Longhorn presents volumes
+          # as /dev/sd*; left to multipathd they are claimed and fail to mount.
+          blacklist {
+              devnode "^sd[a-z0-9]+"
+          }
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload multipathd
+
+# ---- the data disk ------------------------------------------------------------
+
+- name: Look for an existing Longhorn filesystem
+  ansible.builtin.command: "blkid -L {{ longhorn_node_fs_label }}"
+  register: longhorn_node_labelled
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Prepare the data disk
+  when: longhorn_node_labelled.rc != 0
+  block:
+    # -b for sizes in bytes, and the columns that say whether a disk is in use:
+    # a partition table (PTTYPE), a filesystem or other signature directly on
+    # the disk (FSTYPE), or any child at all.
+    - name: Read the block devices
+      ansible.builtin.command: lsblk --json --bytes --output NAME,PATH,TYPE,SIZE,RM,RO,PTTYPE,FSTYPE,MODEL
+      register: longhorn_node_lsblk
+      changed_when: false
+      check_mode: false
+
+    - name: Identify the blank disk
+      ansible.builtin.set_fact:
+        longhorn_node_blank: >-
+          {{ longhorn_node_disks
+             | rejectattr('pttype')
+             | rejectattr('fstype')
+             | rejectattr('children', 'defined')
+             | list }}
+      vars:
+        longhorn_node_disks: >-
+          {{ (longhorn_node_lsblk.stdout | from_json).blockdevices
+             | selectattr('type', 'equalto', 'disk')
+             | rejectattr('rm') | rejectattr('ro')
+             | rejectattr('name', 'match', '^(loop|zram|ram)')
+             | list }}
+
+    - name: Assert exactly one blank disk
+      ansible.builtin.assert:
+        that:
+          - longhorn_node_blank | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }} has no disk labelled {{ longhorn_node_fs_label }}
+          and {{ longhorn_node_blank | length }} blank disks, where exactly one
+          is required. Nothing has been changed.
+
+          Blank: {{ longhorn_node_blank | map(attribute='path') | join(', ') or 'none' }}
+
+          With none, the data disk already carries a partition table or a
+          filesystem — possibly from the OS installer, which will offer to use
+          every disk it sees. Inspect it with `lsblk -f` and, if it holds nothing
+          worth keeping, clear it by hand with `wipefs -a <disk>`. This role will
+          not do that for you.
+
+          With more than one, the choice is not this role's to make.
+        success_msg: >-
+          data disk: {{ longhorn_node_blank[0].path }}
+          ({{ (longhorn_node_blank[0].size | int / 1e9) | round(0) | int }} GB,
+          {{ longhorn_node_blank[0].model | default('unknown model', true) | trim }})
+
+    - name: Partition the data disk
+      community.general.parted:
+        device: "{{ longhorn_node_blank[0].path }}"
+        label: gpt
+        number: 1
+        name: "{{ longhorn_node_fs_label }}"
+        part_start: "0%"
+        part_end: "100%"
+        state: present
+
+    # The partition's path from the kernel's own naming rule: disks whose names
+    # end in a digit (nvme1n1) take a `p` before the partition number.
+    - name: Create the Longhorn filesystem
+      community.general.filesystem:
+        dev: >-
+          {{ longhorn_node_blank[0].path
+             ~ ('p' if longhorn_node_blank[0].path is match('.*[0-9]$') else '')
+             ~ '1' }}
+        fstype: "{{ longhorn_node_fstype }}"
+        opts: "-L {{ longhorn_node_fs_label }}"
+        # force stays false, deliberately. The filesystem module refuses a
+        # device that already carries a signature, which is a second guard
+        # behind the blank-disk assert above.
+        force: false
+      # Under --check the partition above was only simulated, and the module
+      # fails on a device node that does not exist rather than reporting what
+      # it would do.
+      when: not ansible_check_mode
+
+# nofail, so a dead data disk leaves a node that boots and can be reached rather
+# than one stranded in emergency mode. Longhorn does not then fill the root disk
+# in its place: it records a UUID on each disk it manages and marks a disk whose
+# UUID no longer matches as unschedulable.
+- name: Mount the data disk at Longhorn's data path
+  ansible.posix.mount:
+    path: "{{ longhorn_node_data_path }}"
+    src: "LABEL={{ longhorn_node_fs_label }}"
+    fstype: "{{ longhorn_node_fstype }}"
+    opts: defaults,nofail
+    state: mounted
+  when: not ansible_check_mode or longhorn_node_labelled.rc == 0

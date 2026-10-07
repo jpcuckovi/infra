@@ -1,0 +1,25 @@
+# Merge a cluster into the workstation's kubeconfig under a named context.
+#
+# Replaces four of the five near-identical copies of kubeconfig.sh that used to
+# live one per repo — two byte-identical (frr-diag-agent, k8s-diag-agent), two
+# forks (k8s-obs-stack, gpu-bench). All carried the same doctrine and the same
+# anecdote. All four are retired; frr-diag-agent's turned out to be the clearest
+# case of all, since that repo makes no Kubernetes API calls whatever and had
+# been carrying a cluster-credential script it never called.
+#
+# The fifth, k8s-aio's, reached a kubeadm HA cluster through a VIP. It stayed
+# while this role could not do the same, because deleting it would have removed
+# a working path and replaced it with nothing. That changed with necropolis:
+# this role now reads a kubeadm cluster's admin.conf too (see tasks/main.yml),
+# and k8s-aio's script was retired with its repository.
+#
+# That distinction is the whole test for whether consolidation is real: this
+# role earns each deletion by actually serving the cluster the deleted script
+# served.
+---
+kubeconfig_local_path: "{{ lookup('env', 'HOME') }}/.kube/config"
+
+# k3s serves the API on 6443 and issues its server certificate with the node's
+# own address in the SANs. The kubeconfig it writes points at 127.0.0.1, which
+# is correct on the node and useless anywhere else.
+kubeconfig_api_port: 6443

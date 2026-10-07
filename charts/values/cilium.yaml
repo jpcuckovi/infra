@@ -1,0 +1,75 @@
+# Cilium — what the workload requires, on any cluster in this estate that runs it.
+#
+# Addresses and CIDRs are NOT here. roles/cilium passes them as values, because
+# they are facts about a cluster's shape rather than requirements of the chart.
+#
+# Ported from k8s-aio/charts/values/cilium.values.yaml. L2 announcements, their
+# client rate limit and Gateway API are not here: they are per-cluster choices,
+# which roles/cilium passes when a cluster turns them on. External IPs were
+# dropped outright — nothing in the estate uses them.
+
+# Replaces kube-proxy entirely. k3s is installed with --disable-kube-proxy, so
+# nothing needs cleaning up first — and it is why roles/cilium must name the API
+# server explicitly.
+kubeProxyReplacement: true
+
+# Socket-level load balancing only in the host namespace; pod traffic to a
+# Service is translated per packet at the pod's veth instead. clabernetes links
+# are kernel VXLAN devices inside launcher pods sending to each peer's -vx
+# ClusterIP: those packets never pass through connect() or sendmsg(), so with
+# socket LB covering pods they leave untranslated, are masqueraded to the node
+# address and go out of the node's uplink, and no lab link carries traffic.
+# Measured in netbox-intent: conntrack showed BackendID=0 on every
+# tunnel flow, unchanged across a launcher restart. Cilium documents this
+# setting for workloads where socket LB is ineffective (KubeVirt, Kata, gVisor).
+# See docs/ARCHITECTURE.md, "revenant's CNI".
+socketLB:
+  hostNamespaceOnly: true
+
+ipam:
+  mode: cluster-pool
+  # clusterPoolIPv4PodCIDRList is passed by roles/cilium.
+
+# operator.replicas is passed by roles/cilium: it follows the cluster's size.
+
+# Hubble: flow visibility, including every flow a policy drops and the policy
+# that dropped it. That record is the reason this estate runs Cilium on revenant
+# rather than k3s's bundled flannel (docs/ARCHITECTURE.md, "revenant's CNI").
+#
+# The UI takes a fixed NodePort, passed by roles/cilium from the published ports
+# in group_vars/all.yml, so it is reachable the moment bringup finishes — the
+# convention Prometheus and Grafana already follow. The relay stays ClusterIP;
+# nothing on the workstation needs it yet.
+#
+# Known exposure: Hubble UI has no authentication, and flow records describe
+# every connection in the cluster. The NodePort publishes them to anything on
+# the LAN — the same trade the estate already accepts for Prometheus.
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+    service:
+      type: NodePort
+
+# Metrics OFF for now. Cilium's ServiceMonitors need the Prometheus Operator
+# CRDs, which arrive with roles/observability — composed AFTER this role, because
+# nothing can start before the CNI does. Enabling them means applying those CRDs
+# ahead of Cilium, as k8s-aio's bringup does. Deferred until Cilium's own metrics
+# are wanted in VictoriaMetrics.
+prometheus:
+  enabled: false
+
+# Off, and stated rather than left to the default. ztlab's Envoy sidecars and
+# SPIRE own workload identity; Cilium's SPIFFE-based mutual authentication would
+# be a second enforcement layer keyed on the same identities, with no clear owner
+# of a denied connection.
+authentication:
+  mutual:
+    spire:
+      enabled: false
+
+# Rolls the agents on a chart upgrade instead of leaving half-migrated datapath
+# state behind.
+rollOutCiliumPods: true

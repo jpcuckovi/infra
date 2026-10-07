@@ -1,0 +1,117 @@
+# Gates for k3s.
+#
+# Uses `k3s kubectl` on the host rather than kubernetes.core, deliberately: this
+# file runs in the host-layer play, and the Pi has no reason to carry the
+# `kubernetes` Python library that those modules import.
+---
+- name: Check the k3s service
+  ansible.builtin.systemd_service:
+    name: k3s
+  register: k3s_service
+  check_mode: true
+
+- name: Assert k3s is running
+  ansible.builtin.assert:
+    that:
+      - k3s_service.status.ActiveState == "active"
+    fail_msg: >-
+      k3s is {{ k3s_service.status.ActiveState }}.
+      Check: systemctl status k3s, journalctl -u k3s -n 100
+    success_msg: "k3s active"
+
+- name: Read the node list
+  ansible.builtin.command: "{{ k3s_binary_path }} kubectl get nodes -o json"
+  register: k3s_nodes_raw
+  changed_when: false
+  check_mode: false
+
+- name: Assert exactly one node, named for this host, and Ready
+  ansible.builtin.assert:
+    that:
+      - k3s_node_names == [inventory_hostname]
+      - k3s_node_ready_states == ["True"]
+    fail_msg: >-
+      Expected a single node named '{{ inventory_hostname }}' in Ready state;
+      found {{ k3s_node_names }} with Ready={{ k3s_node_ready_states }}.
+
+      A node named something else means the hostname was set after k3s was
+      installed. k3s derives the Node name from the hostname at registration and
+      a Node object cannot be renamed — correcting it means reinstalling k3s,
+      not editing anything.
+    success_msg: "node {{ k3s_node_names | join(', ') }} Ready"
+  vars:
+    # Subscripted as ['items'], never .items.
+    #
+    # `kubectl -o json` returns a list under the key `items`, and from_json
+    # produces a dict. Jinja resolves dotted access as an ATTRIBUTE first, so
+    # `.items` finds Python's built-in dict.items method rather than the key —
+    # and indexing a bound method fails with `method object has no element 0`,
+    # which names neither Kubernetes nor the key. Subscript access looks the key
+    # up first and is the only correct form for any API list output.
+    k3s_nodes: "{{ (k3s_nodes_raw.stdout | from_json)['items'] }}"
+    k3s_node_names: "{{ k3s_nodes | map(attribute='metadata.name') | list }}"
+    k3s_node_ready_states: >-
+      {{ k3s_nodes | map(attribute='status.conditions') | flatten
+         | selectattr('type', 'equalto', 'Ready')
+         | map(attribute='status') | list }}
+
+# The gate that makes k3s_version mean something.
+#
+# roles/k3s_server guards the install with `creates:`, so on a host that already
+# carries the binary the install task SKIPS and the pin is never applied. Every
+# other task then reports ok, the play goes green, and the machine runs whatever
+# version it happened to arrive with. Phantom sat two minor releases ahead of
+# the pin that way, and nothing in a successful run could have said so.
+#
+# Read from the Node rather than from `k3s --version`, because the question is
+# what is RUNNING. A binary replaced on disk without a service restart would
+# satisfy the other reading and not this one.
+- name: Assert the running version matches the pin
+  ansible.builtin.assert:
+    that:
+      - k3s_node_versions == [k3s_version]
+    fail_msg: >-
+      {{ inventory_hostname }} is running {{ k3s_node_versions | join(', ') }};
+      inventory/group_vars/all.yml pins {{ k3s_version }}.
+
+      The install is guarded by `creates:` and will not replace an existing
+      binary, so re-running the playbook cannot fix this. Either adopt what the
+      host runs by moving the pin — a change with a reason — or reinstall k3s
+      deliberately:
+
+        sudo /usr/local/bin/k3s-uninstall.sh
+        ~/.venv/bin/ansible-playbook playbooks/{{ inventory_hostname }}/main.yml
+
+      Note that uninstalling destroys the datastore and every local-path volume
+      on this node.
+    success_msg: "k3s {{ k3s_version }}"
+  vars:
+    k3s_node_versions: >-
+      {{ (k3s_nodes_raw.stdout | from_json)['items']
+         | map(attribute='status.nodeInfo.kubeletVersion') | list }}
+
+- name: Read the storage classes
+  ansible.builtin.command: "{{ k3s_binary_path }} kubectl get storageclass -o json"
+  register: k3s_sc_raw
+  changed_when: false
+  check_mode: false
+
+- name: Assert local-path is present and is the default
+  ansible.builtin.assert:
+    that:
+      - "'local-path' in k3s_sc_names"
+      - k3s_sc_default == ['local-path']
+    fail_msg: >-
+      Expected local-path to be the default StorageClass; defaults are
+      {{ k3s_sc_default }} and the classes present are {{ k3s_sc_names }}.
+
+      Every PVC in this estate is provisioned through it. Note that local-path
+      enforces no quota, so a PVC's declared size is advisory — retention is
+      what actually bounds disk usage for both Prometheus and VictoriaMetrics.
+    success_msg: "local-path is the default StorageClass"
+  vars:
+    k3s_sc_names: >-
+      {{ (k3s_sc_raw.stdout | from_json) | json_query('items[*].metadata.name') }}
+    k3s_sc_default: >-
+      {{ (k3s_sc_raw.stdout | from_json)
+         | json_query('items[?metadata.annotations."storageclass.kubernetes.io/is-default-class"==`"true"`].metadata.name') }}

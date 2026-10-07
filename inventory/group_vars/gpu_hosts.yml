@@ -1,0 +1,125 @@
+# Defaults shared by every host with an NVIDIA GPU.
+#
+# Ported from gpu-bench/ops/scripts/bringup.sh:44-51, which is the authoritative
+# source for how revenant is built. Each pin is quoted with the reason the
+# original gave, because a version number without one is the shape of value this
+# estate has repeatedly had to unpick.
+---
+# ---- driver ----------------------------------------------------------------
+# The open-kernel-module driver, from Ubuntu's own archive (multiverse). NOT the
+# graphics-drivers PPA and NOT NVIDIA's CUDA repo — gpu-bench uses neither, and
+# adding a third-party apt source to get a package the distro already ships is
+# a supply chain for nothing.
+#
+# Open modules are correct for Turing and newer and are REQUIRED for Blackwell,
+# which the RTX 5060 Ti is.
+#
+# A BRANCH package, not the `nvidia-open` metapackage this used to name. Ubuntu
+# 26.04 shipped `nvidia-open` when gpu-bench was built, then dropped it; found
+# when revenant's first run after a reload failed with "No package
+# matching 'nvidia-open'". Ubuntu names each driver branch as its own package,
+# and 610 was the newest it carried that day (610.57.04). NVIDIA's own repo was
+# one branch ahead, at 615, which nothing on this host needs.
+#
+# So the branch is part of the name, and moving to a newer one is an edit here —
+# a deliberate step, never something an apt run does on its own. Within the
+# branch, nvidia_driver_version below still decides: `latest` takes the newest
+# 610 build at reload and the hold keeps it there.
+nvidia_driver_package: nvidia-driver-610-open
+
+# `latest` means: on a host that has no driver, install the newest available —
+# then HOLD it there until the next reload. It does not mean "keep up to date".
+#
+# This replaced a hardcoded "610.43.02-1ubuntu1", which was worse than useless.
+# The install task was guarded on `nvidia-smi` failing, so on any host that
+# already had a driver it skipped and the pin was never applied; the verify
+# assert compared a MINIMUM major (570), so a driver five releases newer passed;
+# and nothing held the package, so `apt upgrade` moved it freely. The file said
+# 610.43.02, the host could have been running anything >= 570, and both
+# main.yml and verify.yml reported green. A pin that cannot be contradicted is
+# not a pin — the same lesson k3s_version already carries, in a role written
+# afterwards that repeated the mistake.
+#
+# Why `latest` rather than a number: revenant is reloaded routinely, and on a
+# reload the newest driver is what should go on — chasing a specific old version
+# through an archive that may no longer carry it is work for no benefit. What
+# matters is that the version STOPS MOVING once chosen, so a campaign's
+# artifacts describe a substrate that still exists. gpu-bench records the
+# resolved version per run in environment.json, which makes the artifact the
+# durable record and means this file does not need to duplicate it.
+#
+# Set an explicit version to force one instead — the full Debian version of the
+# package above, as `apt-cache policy` prints it ("610.57.04-0ubuntu0.26.04.3").
+# Then the install enforces equality rather than merely presence, and verify asserts
+# it — both behaviours follow from this value being something other than
+# `latest`.
+nvidia_driver_version: latest
+
+# The sm_120 floor, and deliberately not tracking nvidia_driver_version.
+#
+# This is the oldest driver that can execute Blackwell kernels at all; anything
+# older fails at runtime with "no kernel image is available for execution",
+# which reads as a broken build rather than a driver problem. Bumping the pin
+# above does not move this: it is a property of the hardware, not of the package
+# currently chosen.
+nvidia_driver_min_major: 570
+
+# ---- container toolkit -----------------------------------------------------
+# Installed BEFORE k3s, which is asserted in playbooks/_layers.yml. k3s scans
+# PATH for nvidia-container-runtime at startup and writes the nvidia runtime
+# into its own generated containerd config — so the toolkit being present first
+# means the runtime is registered on k3s's very first start, with no explicit
+# containerd configuration and no restart.
+#
+# Same semantics as nvidia_driver_version above: `latest` takes the newest on a
+# host that has none, then holds it. A specific version forces and enforces one.
+#
+# A container runtime is not a good place to take whatever shipped this morning
+# — which is an argument for holding it, not for naming a number that nothing
+# checks. The old "1.19.1-1" was never enforced either: the install was guarded
+# on `nvidia-ctk` being absent from PATH, and the verify assert checked only
+# that the binary existed, with no version comparison at all.
+nvidia_toolkit_package: nvidia-container-toolkit
+nvidia_toolkit_version: latest
+
+# ---- device plugin ---------------------------------------------------------
+# Chart version, without the leading v that gpu-bench strips at the call site.
+nvidia_device_plugin_chart_version: "0.19.3"
+nvidia_device_plugin_namespace: nvidia-device-plugin
+nvidia_device_plugin_release: nvdp
+
+# GPU sharing is opt-in and node-wide: it makes one GPU schedulable as two, and
+# every workload on the box then sees that. Enabling it by default would
+# silently weaken the exclusivity a benchmark depends on, so it stays a
+# deliberate choice rather than a property of the build.
+#
+# Three modes: none (dedicated) | timeslicing | mps. Flip one for a single run
+# with playbooks/revenant/gpu-sharing.yml, which explains why it does not
+# persist; declare it in host_vars to make it durable.
+#
+# `none` is the DEFAULT because sharing was measured and lost. On this hardware
+# — one card, one decode-bound serving workload — splitting across two replicas
+# cost 30-41% of throughput under time slicing and 24-34% under MPS, and won at
+# no concurrency tested, including the high end where extra replicas should have
+# paid off. MPS is the better of the two sharing modes, not a good one.
+#
+# The mechanism is why this generalises further than the numbers do: two
+# replicas hold two copies of the weights and each streams its own every decode
+# step, so the same work moves roughly twice the memory traffic. No scheduler
+# addresses that — MPS demonstrates it by removing the interleaving overhead
+# while leaving the traffic unchanged. Any workload whose efficiency comes from
+# batching should lose by being split, in proportion to how much of it did.
+#
+# Bounds, because a value carried out of its context is how this inventory got
+# into trouble before: ONE GPU. Sharing exists to multiplex a device among
+# workloads that would otherwise queue for it, and a second card changes what is
+# being asked. This lab has no hardware to test that, so nothing here should be
+# read as a claim about multi-GPU.
+#
+# Measurements and artifacts: gpu-bench docs/findings/.
+nvidia_gpu_sharing: none
+
+# ---- DCGM exporter ---------------------------------------------------------
+# GPU hardware metrics — SM utilisation, VRAM, power, temperature. This is what
+# makes a GPU host's telemetry worth remote-writing anywhere.
+dcgm_chart_version: "4.8.2"

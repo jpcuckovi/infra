@@ -1,0 +1,28 @@
+# Collections this repository relies on.
+#
+# Nothing needs installing today: all three ship bundled inside the ansible
+# package in ~/.venv, at the versions below. This file exists so a rebuild
+# elsewhere is reproducible and so the dependency is stated rather than assumed.
+#
+# Before running `ansible-galaxy collection install -r requirements.yml`, know
+# that Galaxy installs land in ~/.ansible/collections, which PRECEDES the venv
+# bundle in the search path. The install therefore SHADOWS the bundled version
+# rather than upgrading it, and `ansible-galaxy collection list` will show both.
+# That is the explanation for a version surprise that otherwise looks impossible.
+
+collections:
+  # kubernetes.core — helm, k8s, k8s_info. Imports the `kubernetes` Python
+  # library from whichever interpreter Ansible itself runs under, which is why
+  # both live in the same venv. A brew ansible plus a pip kubernetes puts them
+  # in different interpreters and produces "No module named 'kubernetes'" on a
+  # machine where it is plainly installed.
+  - name: kubernetes.core
+    version: ">=6.5.0"
+
+  # ansible.posix — sysctl.
+  - name: ansible.posix
+    version: ">=2.2.2"
+
+  # community.general — timezone, misc.
+  - name: community.general
+    version: ">=13.3.0"

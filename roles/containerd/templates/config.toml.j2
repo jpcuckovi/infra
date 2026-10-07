@@ -1,0 +1,22 @@
+{{ ansible_managed | comment }}
+#
+# Only what differs from containerd's built-in defaults. The full file that
+# `containerd config default` prints restates hundreds of defaults, pins every
+# one of them at the version that printed it, and hides the two lines below
+# among them. `containerd config dump` shows the merged result.
+#
+# Not produced by `config default` plus a sed, as k8s-aio did. A sed that
+# matches nothing succeeds, so a changed default layout would have left
+# SystemdCgroup false with no error anywhere.
+version = 3
+
+# kubelet uses the systemd cgroup driver (kubeadm's KubeletConfiguration sets
+# cgroupDriver: systemd). If containerd disagrees, the two contend for cgroup
+# ownership and pods fail to start with an error that names neither.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+  SystemdCgroup = true
+
+# Where per-registry hosts.toml files live. Empty by default in 2.x, which
+# means the estate registry's file would be ignored without an error.
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '{{ containerd_registry_config_path }}'

@@ -1,0 +1,47 @@
+# Gates for cert-manager and the workstation CA.
+---
+- name: Read the workstation CA
+  community.crypto.x509_certificate_info:
+    path: "{{ cert_manager_ca_crt }}"
+    valid_at:
+      one_year: "+365d"
+  register: cert_manager_ca_info
+  delegate_to: localhost
+  become: false
+  check_mode: false
+
+# A year of warning, because replacing a root is a change every trusting
+# browser has to make, not a renewal.
+- name: Assert the CA is a CA, and has a year left
+  ansible.builtin.assert:
+    that:
+      - cert_manager_ca_info.basic_constraints | default([]) | select('equalto', 'CA:TRUE') | list | length == 1
+      - cert_manager_ca_info.valid_at.one_year
+    fail_msg: >-
+      {{ cert_manager_ca_crt }} is not a CA certificate, or expires within a
+      year (not after: {{ cert_manager_ca_info.not_after }}). Replacing it means
+      re-trusting the new root in every browser; plan it, then remove the old
+      files and run the playbook.
+    success_msg: "{{ cert_manager_ca_info.subject.commonName | default('CA') }}, valid to {{ cert_manager_ca_info.not_after }}"
+
+- name: Read the ClusterIssuer
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: cert-manager.io/v1
+    kind: ClusterIssuer
+    name: "{{ cert_manager_issuer }}"
+  register: cert_manager_issuer_info
+  check_mode: false
+
+- name: Assert the ClusterIssuer is Ready
+  ansible.builtin.assert:
+    that:
+      - cert_manager_issuer_info.resources | length == 1
+      - cert_manager_issuer_info.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Ready')
+        | map(attribute='status') | list == ['True']
+    fail_msg: >-
+      ClusterIssuer {{ cert_manager_issuer }} is missing or not Ready. Its
+      condition message names the cause; the usual one is the CA Secret in the
+      wrong namespace — it must be in {{ cert_manager_namespace }}.
+    success_msg: "ClusterIssuer {{ cert_manager_issuer }} ready"

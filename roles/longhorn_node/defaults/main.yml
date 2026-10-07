@@ -1,0 +1,54 @@
+# What a node needs before Longhorn's V1 data engine can place replicas on it,
+# and the dedicated disk those replicas live on.
+#
+# The host half only. The Longhorn chart is a cluster role, installed once the
+# cluster has a CNI; this role makes every node ready for it.
+#
+# Requirements from Longhorn v1.12's install documentation.
+---
+# open-iscsi   V1 volumes attach to the node as iSCSI devices
+# nfs-common   the NFSv4 client, for ReadWriteMany volumes
+# cryptsetup   encrypted volumes; required on every node regardless of use
+# dmsetup      device-mapper, which encryption and V1 volumes both use
+# parted       this role partitions the data disk with it
+# xfsprogs     mkfs.xfs, for the data disk; stated rather than assumed from the
+#              installer, since the filesystem module fails without it
+longhorn_node_packages:
+  - open-iscsi
+  - nfs-common
+  - cryptsetup
+  - dmsetup
+  - parted
+  - xfsprogs
+
+# iscsi_tcp must be loaded BEFORE iscsid starts, per Longhorn's documentation.
+# dm_crypt is loaded ahead of first use rather than on demand, so an encrypted
+# volume's first attach does not depend on autoloading.
+longhorn_node_modules:
+  - iscsi_tcp
+  - dm_crypt
+longhorn_node_modules_file: /etc/modules-load.d/longhorn.conf
+
+# Longhorn's default data path, so the chart needs no disk configuration: the
+# data disk is mounted where Longhorn already looks.
+longhorn_node_data_path: /var/lib/longhorn
+
+# The filesystem label is how the data disk is found on every run after the
+# first, and how fstab names it. Device names are not stable: two NVMe drives
+# can enumerate as nvme0n1 and nvme1n1 in either order across boots.
+longhorn_node_fs_label: longhorn
+
+# XFS. Longhorn V1 accepts ext4 or XFS — it needs file extents — and its
+# documentation recommends neither. XFS because it matches the boot drives, it
+# was built for what this disk holds (a few very large sparse replica files,
+# hole-punched as snapshots are purged), and it reserves nothing: ext4's default
+# 5% root reservation would hide ~50 GB of a disk only Longhorn writes to.
+#
+# The label must fit XFS's 12-character limit.
+longhorn_node_fstype: xfs
+
+# Longhorn's documented fix for multipathd claiming its devices. Longhorn
+# presents volumes as /dev/sd*; multipathd takes them, and the result reads as
+# "device is busy" or data corruption rather than as a claiming conflict. The
+# SER8s boot from NVMe, so no disk this estate uses is named sd*.
+longhorn_node_multipath_conf: /etc/multipath/conf.d/longhorn.conf

@@ -1,0 +1,60 @@
+# Gates for the wireless link.
+#
+# Asserts the RADIO's state, not the unit's. A unit that is enabled and active
+# proves systemd ran `iw`; it does not prove the setting took, and after a
+# driver reload the difference is the whole question. `iw ... get power_save`
+# asks the interface.
+---
+- name: Discover the wireless interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: wireless
+    file_type: directory
+    recurse: true
+    depth: 2
+    follow: true
+  register: wifi_link_found
+  check_mode: false
+
+- name: Settle the interface list
+  ansible.builtin.set_fact:
+    wifi_link_managed: >-
+      {{ wifi_link_interfaces
+         if (wifi_link_interfaces | length > 0)
+         else (wifi_link_found.files | map(attribute='path')
+               | map('dirname') | map('basename') | list) }}
+
+- name: Read the power-save state of each interface
+  ansible.builtin.command: "iw dev {{ item }} get power_save"
+  register: wifi_link_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: "{{ wifi_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assert power save is off on every wireless interface
+  ansible.builtin.assert:
+    that:
+      - wifi_link_on | length == 0
+    fail_msg: >-
+      Power save is still enabled on {{ wifi_link_on | join(', ') }}.
+
+      A sleeping radio misses the reassociation it needs to answer, and the
+      symptom is a host that stays up, healthy and completely unreachable —
+      which is what took phantom off the estate for three and a half hours
+      without a single error on the box itself.
+
+      Check: systemctl status wifi-powersave@<iface>, and whether the driver
+      reloaded after the unit last ran.
+    success_msg: "power save off: {{ wifi_link_managed | join(', ') }}"
+  vars:
+    # `iw get power_save` prints "Power save: on" or "Power save: off". Matched
+    # on the whole word so that "off" never matches inside another token, and
+    # searched case-insensitively because the label has changed case between
+    # iw releases.
+    wifi_link_on: >-
+      {{ wifi_link_state.results
+         | selectattr('stdout', 'search', '(?i)power save:\s*on\b')
+         | map(attribute='item') | list }}

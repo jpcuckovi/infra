@@ -1,0 +1,220 @@
+# Install NUT, configure it for the UPS cabled to this host, and start it.
+#
+# Every task up to the driver start runs without a UPS attached. The driver
+# itself cannot start without the device, so the run stops there with a message
+# naming the cable rather than a unit.
+#
+# A netclient has no UPS cabled to it: everything about the device, the driver
+# and upsd is skipped there, and what remains is upsmon pointed at the server.
+---
+- name: Assert the NUT mode is one this role knows
+  ansible.builtin.assert:
+    that:
+      - nut_mode in ['standalone', 'netserver', 'netclient']
+      - nut_mode == 'standalone' or nut_server_host | length > 0
+      - nut_mode != 'netclient' or nut_server_address | length > 0
+    fail_msg: >-
+      nut_mode is '{{ nut_mode }}', nut_server_host is '{{ nut_server_host }}'
+      and nut_server_address is '{{ nut_server_address }}'.
+
+      nut_mode must be standalone, netserver or netclient. Outside standalone,
+      nut_server_host must name the host the UPS is cabled to, and a netclient
+      also needs nut_server_address, the name it reaches that host by.
+    success_msg: "NUT mode {{ nut_mode }}"
+
+- name: Install NUT
+  ansible.builtin.apt:
+    name: "{{ nut_packages if nut_local_ups | bool else nut_client_packages }}"
+    state: present
+
+# The UPS is normally plugged in before NUT is installed, and that order is what
+# breaks the driver. udev applies the rules NUT ships when a device APPEARS, so
+# a device already attached keeps the ownership it was given at boot — root:root
+# — while the rule that would hand it to the `nut` group never fires. The driver
+# runs unprivileged and dies with "insufficient permissions on everything", on a
+# host where lsusb lists the UPS perfectly. Nothing in that message names udev.
+- name: Reload the udev rules NUT installed
+  ansible.builtin.command: udevadm control --reload-rules
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+# Re-emitting add events does not re-enumerate the bus or reset anything: the
+# kernel drivers stay bound and udev simply re-evaluates its rules against what
+# is already attached, which is what corrects the ownership.
+- name: Re-apply the udev rules to USB devices already attached
+  ansible.builtin.command: udevadm trigger --subsystem-match=usb --action=add
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+# systemd refuses to start a unit that failed five times in ten seconds, and
+# then reports the refusal instead of the original fault. A driver that cannot
+# open the UPS takes upsd down with it that way, so a re-run after the real
+# cause is fixed would still fail — on the rate limit alone, with a message that
+# describes neither the UPS nor the cable.
+- name: Clear any NUT units left failed by an earlier run
+  ansible.builtin.command: >-
+    systemctl reset-failed nut-server.service nut-monitor.service
+    nut-driver@{{ nut_ups_name }}.service
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+# --- the monitoring password -------------------------------------------------
+# The first credential in this repository's scope, and it never enters the
+# repository. It is generated on the first run, lives only in this host's NUT
+# configuration, and is read back from there on every later run. Re-rendering
+# the templates therefore produces identical files, and changed=0 holds. See
+# docs/ARCHITECTURE.md, "Secrets".
+- name: Check for an existing upsmon configuration
+  ansible.builtin.stat:
+    path: "{{ nut_config_dir }}/upsmon.conf"
+  register: nut_upsmon_conf_stat
+  when: nut_local_ups | bool
+
+- name: Read the existing upsmon configuration
+  ansible.builtin.slurp:
+    src: "{{ nut_config_dir }}/upsmon.conf"
+  register: nut_upsmon_conf_raw
+  when:
+    - nut_local_ups | bool
+    - nut_upsmon_conf_stat.stat.exists
+  no_log: true
+
+# The package's stock upsmon.conf is entirely commented out, so on a first run
+# the pattern finds nothing and a password is generated. `/dev/null` as the
+# lookup path generates without writing the value anywhere on the workstation.
+- name: Settle the monitoring password
+  ansible.builtin.set_fact:
+    nut_upsmon_password: >-
+      {{ nut_existing_password
+         if nut_existing_password | length > 0
+         else lookup('ansible.builtin.password', '/dev/null',
+                     chars=['ascii_letters', 'digits'], length=32) }}
+  vars:
+    nut_existing_password: >-
+      {{ (nut_upsmon_conf_raw.content | default('') | b64decode)
+         | regex_findall('(?m)^MONITOR\s+\S+\s+\d+\s+upsmon\s+(\S+)\s+primary\s*$')
+         | first | default('') }}
+  when: nut_local_ups | bool
+  no_log: true
+
+# The second credential, and the one that is shared: the server declares it and
+# every client logs in with it, so it cannot live on one host alone. It is held
+# on the workstation instead, generated on first use and read from the file on
+# every later run. See nut_secondary_password_file.
+- name: Settle the secondary password
+  ansible.builtin.set_fact:
+    nut_secondary_password: >-
+      {{ lookup('ansible.builtin.password', nut_secondary_password_file,
+                chars=['ascii_letters', 'digits'], length=32) }}
+  when: nut_mode != 'standalone'
+  no_log: true
+
+# --- configuration -----------------------------------------------------------
+# root:nut 0640 throughout: upsd drops to the nut user and must read upsd.users,
+# and nothing else on the host has reason to read any of these.
+- name: Set the NUT mode
+  ansible.builtin.template:
+    src: nut.conf.j2
+    dest: "{{ nut_config_dir }}/nut.conf"
+    owner: root
+    group: nut
+    mode: "0640"
+  notify:
+    - Restart NUT server
+    - Restart NUT monitor
+
+- name: Declare the UPS
+  ansible.builtin.template:
+    src: ups.conf.j2
+    dest: "{{ nut_config_dir }}/ups.conf"
+    owner: root
+    group: nut
+    mode: "0640"
+  notify:
+    - Resync NUT driver units
+    - Restart UPS driver
+  when: nut_local_ups | bool
+
+- name: Bind the data server
+  ansible.builtin.template:
+    src: upsd.conf.j2
+    dest: "{{ nut_config_dir }}/upsd.conf"
+    owner: root
+    group: nut
+    mode: "0640"
+  notify: Restart NUT server
+  when: nut_local_ups | bool
+
+# no_log and diff: false on both credential files. no_log alone still prints the
+# rendered file under --diff, which is exactly the dry run someone pastes into a
+# chat window.
+- name: Declare the monitoring users
+  ansible.builtin.template:
+    src: upsd.users.j2
+    dest: "{{ nut_config_dir }}/upsd.users"
+    owner: root
+    group: nut
+    mode: "0640"
+  notify: Restart NUT server
+  when: nut_local_ups | bool
+  no_log: true
+  diff: false
+
+- name: Configure the shutdown monitor
+  ansible.builtin.template:
+    src: upsmon.conf.j2
+    dest: "{{ nut_config_dir }}/upsmon.conf"
+    owner: root
+    group: nut
+    mode: "0640"
+  notify: Restart NUT monitor
+  no_log: true
+  diff: false
+
+# --- services ----------------------------------------------------------------
+- name: Apply configuration changes before starting services
+  ansible.builtin.meta: flush_handlers
+
+# The driver instance is started by name rather than left to nut-driver.target.
+# A target does not retry a unit that already failed, so a driver that failed
+# before the cable was connected would stay down on every later run — with the
+# UPS plugged in and working.
+- name: Start the UPS driver
+  ansible.builtin.systemd_service:
+    name: "nut-driver@{{ nut_ups_name }}.service"
+    state: started
+  register: nut_driver_start
+  failed_when: false
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+- name: Assert the UPS driver is running
+  ansible.builtin.assert:
+    that:
+      - nut_driver_start.state | default('') == 'started'
+    fail_msg: >-
+      nut-driver@{{ nut_ups_name }} did not start: {{ nut_driver_start.msg | default('') }}
+
+      The driver runs only when it can find the UPS, so the usual cause is the
+      USB cable: not connected, or connected to the wrong host. Check on
+      {{ inventory_hostname }}: lsusb, journalctl -u nut-driver@{{ nut_ups_name }}
+    success_msg: "UPS driver running"
+  when:
+    - not ansible_check_mode
+    - nut_local_ups | bool
+
+- name: Enable and start the NUT services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: "{{ nut_services }}"
+  # Same idiom as roles/registry: under --check the packages were only simulated,
+  # so there are no units to act on.
+  when: not ansible_check_mode

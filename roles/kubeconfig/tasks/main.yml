@@ -1,0 +1,271 @@
+# Take the cluster's kubeconfig and merge it into the workstation's, under a
+# name that was chosen rather than inherited.
+#
+# k3s names its cluster, context and user all `default`. That is the exact
+# failure this estate refuses to inherit: a context called `default` is what
+# gets applied to when nobody thought about it, which is how an observability
+# stack once landed on a production cluster. Renaming happens here, before the
+# config ever reaches the workstation.
+#
+# Two sources, one merge. A k3s server's kubeconfig is read from the host
+# itself. A kubeadm cluster's admin.conf is read ONCE, from one member, and
+# every task that touches the workstation runs once — three nodes merging the
+# same file concurrently would race on it.
+---
+- name: Settle which kind of cluster this is
+  ansible.builtin.set_fact:
+    kubeconfig_kubeadm: "{{ 'kubeadm_clusters' in group_names }}"
+
+- name: Read the cluster's kubeconfig
+  ansible.builtin.slurp:
+    src: "{{ k3s_kubeconfig_path }}"
+  register: kubeconfig_remote
+  when:
+    - not ansible_check_mode
+    - not kubeconfig_kubeadm
+
+- name: Rewrite the API address and the inherited names
+  ansible.builtin.set_fact:
+    kubeconfig_rendered: >-
+      {{ kubeconfig_remote.content | b64decode
+         | regex_replace('https://127\.0\.0\.1:' ~ kubeconfig_api_port,
+                         'https://' ~ ansible_facts['default_ipv4']['address']
+                         ~ ':' ~ kubeconfig_api_port)
+         | regex_replace('(?m)^(\s*-?\s*)name: default$', '\1name: ' ~ kubeconfig_context)
+         | regex_replace('(?m)^(\s*)cluster: default$', '\1cluster: ' ~ kubeconfig_context)
+         | regex_replace('(?m)^(\s*)user: default$', '\1user: ' ~ kubeconfig_context)
+         | regex_replace('(?m)^current-context: default$\n?', '') }}
+  when:
+    - not ansible_check_mode
+    - not kubeconfig_kubeadm
+  # Anchored line-by-line rather than a bare replace of the word `default`.
+  # The file embeds base64 certificate data, and the base64 alphabet can
+  # produce that substring — a global replace would silently corrupt a
+  # certificate and present as a TLS error with no obvious cause.
+  #
+  # The `-?` in the first pattern is load-bearing. k3s emits its three `default`
+  # names in two different YAML shapes:
+  #
+  #     contexts:                users:
+  #     - context:               - name: default
+  #         cluster: default       user:
+  #         user: default            client-certificate-data: ...
+  #       name: default
+  #
+  # `^(\s*)name:` matches the indented form under clusters and contexts but not
+  # the list-item form under users, because `- name:` does not begin with
+  # whitespace. Without the dash, the context is renamed to reference a user
+  # that was never renamed, so the credentials stay filed under `default` and
+  # the new context has none.
+  #
+  # That failure is not obvious from the symptom. kubectl finds a context, finds
+  # no credentials for its user, and falls back to prompting `Please enter
+  # Username:`; kubernetes.core reports a bare 401 from the API server. Neither
+  # names the kubeconfig.
+
+# ---- kubeadm ----------------------------------------------------------------
+# admin.conf names its cluster after clusterName, and its user and context
+# after kubeadm's own `kubernetes-admin` — the same user name in EVERY kubeadm
+# cluster, so two of them merged into one workstation config would overwrite
+# each other's credentials. All three are renamed to the context.
+#
+# Its server is the VIP's address, which is correct and is asserted rather than
+# patched: under kubeadm a loopback or node address there is a build defect.
+# The address is then replaced by the endpoint's NAME, which the init
+# configuration put in the API certificate's SANs, so the workstation follows
+# the VIP if it ever moves in DNS.
+#
+# Parsed and re-emitted rather than regex-rewritten: admin.conf holds exactly
+# one of each entry, and building the document is clearer than patching it.
+
+- name: Read admin.conf from a member
+  ansible.builtin.slurp:
+    src: /etc/kubernetes/admin.conf
+  register: kubeconfig_remote
+  # The default is not a fallback anyone relies on. Ansible templates
+  # delegate_to BEFORE it evaluates `when`, so on a k3s host — where this task
+  # is skipped and roles/kubeadm_control_plane never ran — the bare variable is
+  # undefined and fails a task that was never going to run. Found on revenant.
+  delegate_to: "{{ kubeadm_control_plane_api_host | default(inventory_hostname) }}"
+  run_once: true
+  when:
+    - not ansible_check_mode
+    - kubeconfig_kubeadm
+
+- name: Assert admin.conf names the VIP, once
+  ansible.builtin.assert:
+    that:
+      - kubeconfig_admin['clusters'] | length == 1
+      - kubeconfig_admin['users'] | length == 1
+      - kubeconfig_admin['clusters'][0]['cluster']['server']
+        == 'https://' ~ kubeadm_control_plane_vip ~ ':' ~ kubeconfig_api_port
+    fail_msg: >-
+      admin.conf from {{ kubeadm_control_plane_api_host }} should hold one
+      cluster and one user, with server https://{{ kubeadm_control_plane_vip }}:{{ kubeconfig_api_port }}.
+      Found {{ kubeconfig_admin['clusters'] | length }} cluster(s), server
+      {{ kubeconfig_admin['clusters'][0]['cluster']['server'] | default('none') }}.
+
+      A different server means the cluster was initialised against a different
+      controlPlaneEndpoint, and the VIP the workstation would be pointed at is
+      not the one the cluster's certificates were issued for.
+    success_msg: "admin.conf server is the VIP"
+  run_once: true
+  vars:
+    kubeconfig_admin: "{{ kubeconfig_remote.content | b64decode | from_yaml }}"
+  when:
+    - not ansible_check_mode
+    - kubeconfig_kubeadm
+
+- name: Rename to the context and point at the endpoint's name
+  ansible.builtin.set_fact:
+    kubeconfig_rendered: >-
+      {{ {'apiVersion': 'v1',
+          'kind': 'Config',
+          'preferences': {},
+          'clusters': [{'name': kubeconfig_context,
+                        'cluster': kubeconfig_admin['clusters'][0]['cluster']
+                                   | combine({'server': 'https://' ~ kubeadm_control_plane_endpoint
+                                                        ~ ':' ~ kubeconfig_api_port})}],
+          'users': [{'name': kubeconfig_context,
+                     'user': kubeconfig_admin['users'][0]['user']}],
+          'contexts': [{'name': kubeconfig_context,
+                        'context': {'cluster': kubeconfig_context,
+                                    'user': kubeconfig_context}}]}
+         | to_nice_yaml(indent=2) }}
+  run_once: true
+  no_log: true
+  vars:
+    kubeconfig_admin: "{{ kubeconfig_remote.content | b64decode | from_yaml }}"
+  when:
+    - not ansible_check_mode
+    - kubeconfig_kubeadm
+  # No current-context, for the reason given under the k3s rewrite: a fragment
+  # that names none cannot take the workstation's.
+
+
+- name: Assert the rewritten kubeconfig carries credentials for the context
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.assert:
+    that:
+      - "'name: ' ~ kubeconfig_context in kubeconfig_rendered"
+      - "'user: ' ~ kubeconfig_context in kubeconfig_rendered"
+      - "'default' not in (kubeconfig_rendered | regex_findall('(?m)^\\s*-?\\s*name: (.+)$') | join(' '))"
+    fail_msg: >-
+      The rewritten kubeconfig still names `default` somewhere, or does not name
+      {{ kubeconfig_context }} consistently across clusters, contexts and users.
+
+      Merging it would install a context whose user cannot be resolved. The
+      symptom downstream is a 401 from the API server, or kubectl prompting for
+      a username — neither of which points back here.
+
+      Names found: {{ kubeconfig_rendered | regex_findall('(?m)^\\s*-?\\s*name: (.+)$') }}
+    success_msg: "kubeconfig renamed to '{{ kubeconfig_context }}' throughout"
+  when: not ansible_check_mode
+  #
+  # The API address becomes the node's IP rather than its DNS name because k3s
+  # puts the address in the serving certificate's SANs; a hostname that is not
+  # in the SANs fails verification even when it resolves correctly.
+  #
+  # current-context is DELETED from the fragment rather than renamed. The merge
+  # below lists the fragment first so its credentials win over any stale entry
+  # for this context — but first-file-wins applies to current-context too, and
+  # this role must not decide which cluster the workstation is pointed at. A
+  # fragment that names no current-context cannot win one.
+
+- name: Ensure the workstation kube directory exists
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.file:
+    path: "{{ kubeconfig_local_path | dirname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Stage the renamed kubeconfig on the workstation
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.copy:
+    content: "{{ kubeconfig_rendered }}"
+    dest: "{{ kubeconfig_local_path | dirname }}/.infra-{{ kubeconfig_context }}.yaml"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  when: not ansible_check_mode
+  # Scaffolding, not state. This file is created and destroyed within the run,
+  # so it exists in no two runs and would report `changed` in every one.
+  #
+  # That matters because README.md makes `changed=0` on a second run the
+  # acceptance gate — the idempotency claim the shell scripts asserted but never
+  # demonstrated. A task that cannot report unchanged puts the gate permanently
+  # out of reach and quietly turns it into a number nobody can act on.
+  changed_when: false
+
+# kubectl has no merge subcommand and no Ansible module wraps this. `config view
+# --flatten` over a KUBECONFIG list is the supported way to combine them, and it
+# is idempotent: merging the same cluster twice produces the same file.
+#
+# The FRAGMENT IS LISTED FIRST, and the order is the whole correctness argument.
+# kubectl resolves conflicting keys first-file-wins, so with the workstation's
+# existing config first, a stale entry for this context beats the one just
+# rendered off the machine — and the run reports success having changed nothing
+# that mattered.
+#
+# That is not hypothetical. A reloaded host comes back with a new CA and,
+# usually, a new address; the freshly-read credentials are exactly the thing
+# that must win. Any host reloaded routinely hits this on every rebuild.
+#
+# Listing the fragment first inverts it: this context takes its values from the
+# cluster, every other context in the file is preserved untouched, and the merge
+# stays idempotent because re-rendering an unchanged cluster produces identical
+# bytes.
+- name: Merge into the workstation kubeconfig
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      KUBECONFIG="{{ kubeconfig_local_path | dirname }}/.infra-{{ kubeconfig_context }}.yaml:{{ kubeconfig_local_path }}"
+      kubectl config view --flatten
+      > "{{ kubeconfig_local_path }}.merged"
+      && if cmp -s "{{ kubeconfig_local_path }}.merged" "{{ kubeconfig_local_path }}";
+         then rm -f "{{ kubeconfig_local_path }}.merged"; echo IDENTICAL;
+         else mv "{{ kubeconfig_local_path }}.merged" "{{ kubeconfig_local_path }}"; echo REPLACED;
+         fi
+    executable: /bin/bash
+  delegate_to: localhost
+  become: false
+  register: kubeconfig_merge
+  # Reports what actually happened rather than asserting a change every time.
+  #
+  # `changed_when: true` here was the reason a converged estate could never
+  # reach the changed=0 the README calls its acceptance gate. Comparing before
+  # replacing costs one cmp and makes the number mean something — and leaves the
+  # file's mtime alone when nothing moved, which matters to anything watching it.
+  #
+  # cmp against a missing destination exits non-zero, so a first run correctly
+  # reports REPLACED.
+  #
+  # The tokens are REPLACED and IDENTICAL, and compared with `==` rather than
+  # `in`, because the obvious pair does not work: `'CHANGED' in 'UNCHANGED'` is
+  # true, so a substring test reports every run as changed — including the ones
+  # that changed nothing. Two words where neither contains the other, and an
+  # exact match, remove the question.
+  changed_when: "kubeconfig_merge.stdout | trim == 'REPLACED'"
+  when: not ansible_check_mode
+
+- name: Remove the staged fragment
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.file:
+    path: "{{ kubeconfig_local_path | dirname }}/.infra-{{ kubeconfig_context }}.yaml"
+    state: absent
+  delegate_to: localhost
+  become: false
+  # Scaffolding, as with the staging task above: this removes a file the same
+  # run created, so it can never report unchanged and would defeat the gate.
+  changed_when: false
+
+- name: Report the context
+  run_once: "{{ kubeconfig_kubeadm }}"
+  ansible.builtin.debug:
+    msg: >-
+      Cluster merged as context '{{ kubeconfig_context }}'. Reach it with
+      `kubectl --context {{ kubeconfig_context }}`. The current-context of the
+      workstation is deliberately not changed by this role.

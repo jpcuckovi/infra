@@ -1,0 +1,65 @@
+# revenant — the lab box.
+#
+# GPU work, cEOS topologies, k8s failure injection. Reloaded routinely, which is
+# why nothing durable is composed here: no registry, no metrics store, no Jaeger,
+# no Grafana. It consumes what phantom serves and keeps nothing that matters.
+#
+# This file declares WHAT revenant composes. HOW the two layers run lives in
+# ../_layers.yml, stated once for the whole estate, and the ordering constraints
+# in these lists are asserted there rather than described here.
+#
+# Ported from gpu-bench/ops/scripts/, which is the authoritative source for how
+# this machine is built — not from any hand-written notes about it.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: revenant
+
+    # preflight first: nothing changed before the preconditions are known.
+    #
+    # wifi_link early, because a host that loses its link mid-run is worse than
+    # one that never started — phantom demonstrated that by going unreachable
+    # for three and a half hours while perfectly healthy.
+    #
+    # registry_mirror but NOT registry: revenant pulls from phantom and serves
+    # nothing. That is the whole reason the two were split.
+    #
+    # kubeconfig last, because it reads a kubeconfig that does not exist until
+    # k3s_server has run.
+    # clabernetes_host before k3s_server, and the reason is the same shape as
+    # the two ordering constraints _layers.yml already asserts: a lab deployed
+    # onto a kernel missing sch_netem impairs nothing and says nothing, so the
+    # modules have to be there before anything can schedule a topology onto the
+    # node. It sits after base because base owns the sysctls its gate checks.
+    #
+    # nut right after the link, and independent of everything below it: it
+    # guards the machine rather than any workload, so nothing in either layer
+    # depends on it and it depends on nothing but packages.
+    host_roles:
+      - preflight
+      - base
+      - wifi_link
+      - nut
+      - nvidia_runtime
+      - clabernetes_host
+      - registry_mirror
+      - k3s_server
+      - kubeconfig
+
+    # No victoriametrics: the store lives on phantom and this host remote-writes
+    # to it through the metrics.lan CNAME. roles/observability discriminates on
+    # metrics_stores membership to build that URL, so nothing here says so twice.
+    # clabernetes last: it is a controller with no dependency on the other two,
+    # and nothing here depends on it either. The topologies it schedules live in
+    # ceos-diag-agent, which applies a custom resource into its own namespace and
+    # never touches this layer — the same seam that keeps gpu-bench's workloads
+    # out of nvidia_device_plugin.
+    #
+    # cilium first, ahead of everything else in this layer. host_vars installs
+    # k3s without flannel, so no pod can start until the CNI exists — every chart
+    # after it depends on that. _layers.yml asserts the position.
+    cluster_roles:
+      - cilium
+      - observability
+      - nvidia_device_plugin
+      - clabernetes

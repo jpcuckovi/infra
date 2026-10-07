@@ -1,0 +1,265 @@
+# The two layers every managed host is built in, and the mechanics of running
+# them. Imported by playbooks/<host>/main.yml and verify.yml.
+#
+# The split between this file and those is WHAT versus HOW. A host playbook
+# names which roles it composes and in what order — a fact about that machine,
+# visible at the call site. Everything here is a fact about the LAYERS, true of
+# every host, and stated once:
+#
+#   host layer      over SSH, as root, with facts gathered from the target
+#   cluster layer   on the workstation, unprivileged, against the cluster API
+#
+# Underscore-prefixed because it is not an entry point. Running it directly
+# fails on undefined `target`, which is the intended outcome.
+#
+# Parameters:
+#   target         inventory hostname, or a cluster group from inventory/hosts.yml
+#                  (required). A group runs the host layer on every member and
+#                  the cluster layer once.
+#   host_roles     roles for the host layer, in dependency order (required)
+#   cluster_roles  roles for the cluster layer, in dependency order (optional —
+#                  a host with no Kubernetes simply omits it)
+#   layer_mode     `main` to apply, `verify` to run each role's gates
+#                  (optional, default `main`)
+
+- name: "{{ target }} — host layer"
+  hosts: "{{ target }}"
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    # Ordering is a property of the dependency graph, not of a host's wishes, so
+    # it is asserted here rather than restated as prose in every host playbook.
+    # Four hosts times two playbooks is eight places for a comment to drift out
+    # of agreement with the constraint it describes.
+    #
+    # Expressed as "which arrangement is forbidden" rather than by comparing
+    # indices: `.index()` raises when the item is absent, so an index comparison
+    # would have to be guarded for every host that composes only one of the two.
+    # Selecting the pair in list order leaves exactly one invalid result, and a
+    # host carrying neither or only one produces a list that cannot match it.
+    - name: Assert the host role order respects the dependency graph
+      ansible.builtin.assert:
+        that:
+          - host_order_pair != ['k3s_server', 'registry_mirror']
+        fail_msg: >-
+          {{ target }} composes k3s_server before registry_mirror.
+
+          k3s reads /etc/rancher/k3s/registries.yaml ONCE, at first start.
+          Written afterwards, the mirror is correct on disk and inert in the
+          running process, and correcting it takes a restart that bounces every
+          pod on the node. The failure appears later, on a different machine, as
+          an ImagePullBackOff naming an image rather than a config.
+
+          Declared order: {{ host_roles }}
+        success_msg: "host role order valid"
+      vars:
+        # registry_mirror, not registry. The constraint is about the FILE k3s
+        # reads once at startup, and after the two roles were split that file
+        # belongs to registry_mirror. Whether a registry container happens to be
+        # running is not something k3s consults at any point.
+        #
+        # This matters for hosts that pull but do not serve: they compose
+        # registry_mirror alone, and would sail past an assert that named a role
+        # they never carry.
+        host_order_pair: >-
+          {{ host_roles | select('in', ['registry_mirror', 'k3s_server']) | list }}
+
+    - name: Assert the GPU runtime is composed before k3s
+      ansible.builtin.assert:
+        that:
+          - gpu_order_pair != ['k3s_server', 'nvidia_runtime']
+        fail_msg: >-
+          {{ target }} composes k3s_server before nvidia_runtime.
+
+          k3s scans PATH for nvidia-container-runtime ONCE, when it starts, and
+          writes the nvidia runtime into the containerd config it generates. The
+          toolkit installed afterwards is invisible to it: k3s regenerates that
+          config from its own template on every start, so editing it by hand does
+          not survive either.
+
+          The node stays Ready and the device plugin may even advertise a GPU,
+          while every pod requesting the nvidia runtime class fails at start.
+          Correcting it needs a k3s restart, which bounces every pod on the node.
+
+          Declared order: {{ host_roles }}
+        success_msg: "GPU runtime order valid"
+      vars:
+        gpu_order_pair: >-
+          {{ host_roles | select('in', ['nvidia_runtime', 'k3s_server']) | list }}
+      when: "'nvidia_runtime' in host_roles"
+
+    - name: Assert a k3s without its bundled CNI composes one
+      ansible.builtin.assert:
+        that:
+          - "'cilium' in cluster_roles | default([])"
+        fail_msg: >-
+          {{ target }} installs k3s with --flannel-backend=none but composes no
+          CNI in its cluster layer.
+
+          The node would install, register, and then stay NotReady for good: no
+          pod, CoreDNS included, can be given an address. Nothing fails loudly on
+          the way — roles/k3s_server waits only for registration on such a host,
+          and k3s is healthy by every measure except the one that matters.
+
+          Add cilium to cluster_roles, or remove the flag from k3s_server_args.
+        success_msg: "CNI composed for a k3s without flannel"
+      when:
+        - "'k3s_server' in host_roles"
+        - "'--flannel-backend=none' in k3s_server_args | default([])"
+
+  tasks:
+    # loop_var is not cosmetic. The default `item` stays in scope inside an
+    # included role, so any role that loops — base over its sysctls, for one —
+    # collides with this loop and Ansible warns about unexpected behaviour.
+    # A distinct name keeps the layer's variable out of every role's namespace.
+    #
+    # The task name is static because a name is templated ONCE, when the banner
+    # prints, before the loop binds anything. `label` is the hook that shows
+    # which role is running.
+    - name: Host layer
+      ansible.builtin.include_role:
+        name: "{{ layer_role }}"
+        tasks_from: "{{ layer_mode | default('main') }}"
+        # Restores the variable scoping a static `roles:` block provides.
+        #
+        # With `roles:`, every role's defaults load into play scope before any
+        # of them run, so a role can read a value another role owns. Several
+        # here do: kubeconfig reads k3s_server's k3s_kubeconfig_path, and
+        # observability reads victoriametrics' service name and port to build
+        # the remote_write URL and the datasource.
+        #
+        # A dynamic include scopes defaults to the including role, so without
+        # this those reads fail as undefined — and only some of them, because
+        # names that also appear in host_vars keep resolving. That produces a
+        # refactor which looks like it worked.
+        #
+        # This exposes defaults FORWARD only, in loop order, which makes the
+        # ordering assert above load-bearing for variables as well as for side
+        # effects. A role that reads a value owned by a role listed after it
+        # was already relying on parse-time luck.
+        public: true
+      loop: "{{ host_roles }}"
+      loop_control:
+        loop_var: layer_role
+        label: "{{ layer_role }}"
+
+- name: "{{ target }} — cluster layer"
+  # The first host of the target, not every host. A cluster has one API, so a
+  # target that is a multi-node cluster group would otherwise install every
+  # chart once per node, against the same cluster. On a single-host target the
+  # subscript resolves to that host, so nothing changes for them.
+  hosts: "{{ target }}[0]"
+  # Runs on the workstation, where kubectl, helm, the kubeconfig and the
+  # `kubernetes` Python library live. `connection: local` rather than
+  # `hosts: localhost` so inventory_hostname stays {{ target }} and host_vars
+  # still apply — the same variable means the same thing in both layers.
+  connection: local
+  become: false
+  # Facts were gathered against the target in the play above and persist for the
+  # run. Gathering again here would collect the WORKSTATION's facts and file
+  # them under the target's name.
+  gather_facts: false
+
+  vars:
+    # The interpreter is one of those persisted facts, and it is the TARGET's:
+    # discovery ran over SSH in the play above and recorded, for example,
+    # /usr/bin/python3.14. This play is still that host, so Ansible reuses the
+    # path — but `connection: local` executes it on the workstation, where it
+    # does not exist. Every module here fails with rc 127 before running.
+    #
+    # It surfaces as whatever the first task happens to be checking. A probe
+    # carrying `failed_when: false` records the missing interpreter as a
+    # non-zero rc, and the assert below it reports that as the thing it was
+    # testing for — "helm was not found on this workstation", on a machine where
+    # helm is installed and on PATH.
+    #
+    # ansible_playbook_python is the interpreter running ansible-playbook, which
+    # is by definition the one holding the collections and the kubernetes
+    # library. roles/preflight/tasks/controller.yml already asserts imports
+    # against it; this makes the modules run under it too.
+    #
+    # Not `auto`/`auto_silent`: rediscovery against localhost would find the
+    # system python, which has none of those libraries.
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  pre_tasks:
+    - name: Assert the cluster role order respects the dependency graph
+      ansible.builtin.assert:
+        that:
+          - cluster_order_pair != ['observability', 'victoriametrics']
+        fail_msg: >-
+          {{ target }} composes observability before victoriametrics.
+
+          Prometheus should have somewhere to remote-write to before it starts
+          writing. Installed the other way round, every install drops its first
+          minutes of samples and logs a connection error that reads like a
+          misconfiguration rather than an ordering problem.
+
+          Declared order: {{ cluster_roles | default([]) }}
+        success_msg: "cluster role order valid"
+      vars:
+        cluster_order_pair: >-
+          {{ cluster_roles | default([])
+             | select('in', ['victoriametrics', 'observability']) | list }}
+      when: cluster_roles | default([]) | length > 0
+
+    - name: Assert the CNI is the first cluster role
+      ansible.builtin.assert:
+        that:
+          - cluster_roles[0] == 'cilium'
+        fail_msg: >-
+          {{ target }} composes cilium after {{ cluster_roles[0] }}.
+
+          Until the CNI is installed no pod can be given an address, so every
+          chart installed ahead of it waits on pods that cannot start and times
+          out — reported as that chart's failure rather than as a missing
+          network.
+
+          Declared order: {{ cluster_roles }}
+        success_msg: "CNI is the first cluster role"
+      when: "'cilium' in cluster_roles | default([])"
+
+    # The cluster layer needs helm and the kubernetes Python library on THIS
+    # machine, not on the target. Different prerequisites, different failure
+    # mode, so a separate task file rather than a `when:` in the host-layer
+    # asserts.
+    #
+    # Runs in verify mode too: the gates call kubernetes.core.k8s_info, so they
+    # depend on exactly the same libraries the apply does.
+    - name: Controller preconditions
+      ansible.builtin.include_role:
+        name: preflight
+        tasks_from: controller
+      when: cluster_roles | default([]) | length > 0
+
+  tasks:
+    # Same reasoning as the host layer: a distinct loop_var so the layer's
+    # variable does not shadow `item` inside any role that loops, and a static
+    # name because names template before the loop binds.
+    - name: Cluster layer
+      ansible.builtin.include_role:
+        name: "{{ layer_role }}"
+        tasks_from: "{{ layer_mode | default('main') }}"
+        # Restores the variable scoping a static `roles:` block provides.
+        #
+        # With `roles:`, every role's defaults load into play scope before any
+        # of them run, so a role can read a value another role owns. Several
+        # here do: kubeconfig reads k3s_server's k3s_kubeconfig_path, and
+        # observability reads victoriametrics' service name and port to build
+        # the remote_write URL and the datasource.
+        #
+        # A dynamic include scopes defaults to the including role, so without
+        # this those reads fail as undefined — and only some of them, because
+        # names that also appear in host_vars keep resolving. That produces a
+        # refactor which looks like it worked.
+        #
+        # This exposes defaults FORWARD only, in loop order, which makes the
+        # ordering assert above load-bearing for variables as well as for side
+        # effects. A role that reads a value owned by a role listed after it
+        # was already relying on parse-time luck.
+        public: true
+      loop: "{{ cluster_roles | default([]) }}"
+      loop_control:
+        loop_var: layer_role
+        label: "{{ layer_role }}"

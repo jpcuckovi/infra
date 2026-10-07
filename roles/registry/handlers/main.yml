@@ -1,0 +1,9 @@
+# Notified by the unit template above it. The two handlers that restart k3s when
+# the mirror config changes moved to roles/registry_mirror with the file that
+# triggers them.
+---
+- name: Restart local-registry
+  ansible.builtin.systemd_service:
+    name: local-registry
+    state: restarted
+    daemon_reload: true

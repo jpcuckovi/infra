@@ -1,0 +1,42 @@
+# Single-node k3s.
+#
+# The install procedure is identical on every k3s host in the estate; only the
+# server arguments and the architecture differ, and both are inputs rather than
+# branches. That is the test for whether a role should be parameterised or
+# forked — the task list here does not change between phantom and revenant.
+#
+# Spectre is not a k3s host at all. Upstream kubeadm across three KVM guests
+# with stacked etcd, kube-vip and Cilium is a different procedure, so it gets
+# its own role rather than a `when:` in this one.
+---
+k3s_install_url: https://get.k3s.io
+k3s_binary_path: /usr/local/bin/k3s
+k3s_kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+
+# Overridden in group_vars/k3s_servers.yml; repeated here so the role is
+# self-contained and readable on its own.
+k3s_server_args:
+  - "--secrets-encryption"
+  - "--disable=traefik"
+
+# A ceiling, not a wait. The task returns the moment the node reports Ready, so
+# this only bounds how long a genuinely stuck install is allowed to look like a
+# slow one — which is why one value suits every host regardless of how fast it
+# is. Three minutes is longer than the slowest first boot in the estate and
+# shorter than anyone's patience with a hung play.
+#
+# Deliberately NOT justified by a particular machine's hardware. A number
+# defended by "a Pi 4 is not fast" is a fact about phantom living in a value
+# that applies to every k3s host, and the next board added would either inherit
+# reasoning that does not describe it or prompt an override it does not need.
+k3s_ready_timeout: 180
+
+# Whether k3s brings its own CNI. Derived from the install arguments rather than
+# declared beside them, so the two cannot disagree.
+#
+# A k3s installed with --flannel-backend=none has no pod network until a CNI is
+# installed on the cluster layer, and its node reports NotReady until then. The
+# install tasks therefore wait for Ready only when k3s networks its own pods.
+# Otherwise they wait for the node to REGISTER, which proves the server came up,
+# and roles/cilium waits for Ready once the dataplane exists.
+k3s_bundled_cni: "{{ '--flannel-backend=none' not in k3s_server_args }}"

@@ -1,0 +1,101 @@
+# Gates for kubeadm node prerequisites.
+#
+# Each reads the kernel or the package database directly. The files this role
+# writes are only instructions for the next boot; these are what kubeadm's own
+# preflight will look at.
+---
+- name: Read the loaded kernel modules
+  ansible.builtin.slurp:
+    src: /proc/modules
+  register: kubeadm_node_proc_modules
+
+- name: Assert the kubeadm kernel modules are loaded
+  ansible.builtin.assert:
+    that:
+      - kubeadm_node_missing_modules | length == 0
+    fail_msg: >-
+      Not loaded: {{ kubeadm_node_missing_modules | join(', ') }}.
+      Without br_netfilter the bridge sysctls do not exist and kubeadm's
+      preflight fails; without overlay containerd cannot unpack an image.
+      `modprobe <name>`, then check {{ kubeadm_node_modules_file }} so it
+      survives a reboot.
+    success_msg: "loaded: {{ kubeadm_node_modules | join(', ') }}"
+  vars:
+    kubeadm_node_loaded: >-
+      {{ (kubeadm_node_proc_modules.content | b64decode).splitlines()
+         | map('split', ' ') | map('first') | list }}
+    kubeadm_node_missing_modules: "{{ kubeadm_node_modules | difference(kubeadm_node_loaded) }}"
+
+- name: Read the kubeadm kernel tunables
+  ansible.builtin.command: "sysctl -n {{ item.key }}"
+  register: kubeadm_node_sysctl_live
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: "{{ kubeadm_node_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Assert the kubeadm kernel tunables are in effect
+  ansible.builtin.assert:
+    that:
+      - kubeadm_node_sysctl_wrong | length == 0
+    fail_msg: >-
+      Not in effect: {{ kubeadm_node_sysctl_wrong | join(', ') }}.
+      A bridge key that reads as missing rather than 0 means br_netfilter is
+      not loaded. `sysctl --system` reapplies {{ kubeadm_node_sysctl_file }}.
+    success_msg: "{{ kubeadm_node_sysctl | dict2items | map(attribute='key') | join(', ') }}"
+  vars:
+    kubeadm_node_sysctl_wrong: >-
+      {{ kubeadm_node_sysctl_live.results
+         | rejectattr('stdout', 'equalto', '1')
+         | map(attribute='item.key') | list }}
+
+- name: Read the active swap areas
+  ansible.builtin.slurp:
+    src: /proc/swaps
+  register: kubeadm_node_proc_swaps
+
+- name: Assert no swap is active
+  ansible.builtin.assert:
+    that:
+      - kubeadm_node_active_swap | length == 0
+    fail_msg: >-
+      Swap is active: {{ kubeadm_node_active_swap | join('; ') }}.
+      kubelet will not start. `swapoff -a`, and find what re-enabled it — an
+      fstab line this role's pattern missed, a systemd .swap unit, or zram.
+    success_msg: "no active swap"
+  vars:
+    # /proc/swaps is a header line followed by one line per active area.
+    kubeadm_node_active_swap: >-
+      {{ (kubeadm_node_proc_swaps.content | b64decode).splitlines()[1:]
+         | select | list }}
+
+- name: Read the installed Kubernetes package versions
+  ansible.builtin.command: >-
+    dpkg-query -W -f='${Package} ${Version} ${db:Status-Want}\n'
+    {{ kubeadm_node_packages | join(' ') }}
+  register: kubeadm_node_dpkg
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the Kubernetes packages are pinned and held
+  ansible.builtin.assert:
+    that:
+      - kubeadm_node_dpkg_wrong | length == 0
+    fail_msg: >-
+      Expected {{ kubeadm_node_packages | join(', ') }} at
+      {{ kubeadm_node_expected }}, each on hold. Found:
+      {{ kubeadm_node_dpkg.stdout_lines | default([]) | join('; ') }}
+      {{ kubeadm_node_dpkg.stderr | default('') }}
+
+      A version mismatch across nodes is how a control plane breaks one node at
+      a time. A package not on hold is how the mismatch arrives unannounced.
+    success_msg: "{{ kubeadm_node_packages | join(', ') }} {{ kubeadm_node_expected }}, held"
+  vars:
+    kubeadm_node_expected: "{{ kubernetes_version }}-{{ kubernetes_package_revision }}"
+    kubeadm_node_dpkg_wrong: >-
+      {{ kubeadm_node_packages
+         | map('regex_replace', '$', ' ' ~ kubeadm_node_expected ~ ' hold')
+         | difference(kubeadm_node_dpkg.stdout_lines | default([])) }}

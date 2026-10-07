@@ -1,0 +1,37 @@
+# What a machine needs to BE a kubeadm node, and nothing that requires knowing
+# about another node. `kubeadm init` and `join` need a token and a certificate
+# key that exist only once the first node is up, so that work belongs to
+# roles/kubeadm_control_plane.
+#
+# Ported from k8s-aio's guest cloud-init, minus what existed only because those
+# nodes were VMs: qemu-guest-agent, and the conditional marker file that
+# compensated for cloud-init carrying on past a failed command.
+---
+# The pins live in group_vars/all.yml. Restated here so the role reads on its own.
+kubernetes_version: "1.36.5"
+kubernetes_package_revision: "1.1"
+
+# pkgs.k8s.io publishes one repository per minor, so the repository follows the
+# pin rather than being declared beside it.
+kubeadm_node_minor: "v{{ (kubernetes_version.split('.'))[:2] | join('.') }}"
+kubeadm_node_repo_url: "https://pkgs.k8s.io/core:/stable:/{{ kubeadm_node_minor }}/deb/"
+
+kubeadm_node_packages:
+  - kubelet
+  - kubeadm
+  - kubectl
+
+# overlay for the container filesystem, br_netfilter so bridged pod traffic
+# passes through iptables — the sysctls below do not exist until it is loaded.
+kubeadm_node_modules:
+  - overlay
+  - br_netfilter
+kubeadm_node_modules_file: /etc/modules-load.d/kubeadm.conf
+
+# kubeadm's preflight refuses to init or join without these. A separate file
+# from roles/base's, because base is every machine and these are not.
+kubeadm_node_sysctl_file: /etc/sysctl.d/70-kubeadm.conf
+kubeadm_node_sysctl:
+  net.bridge.bridge-nf-call-iptables: "1"
+  net.bridge.bridge-nf-call-ip6tables: "1"
+  net.ipv4.ip_forward: "1"

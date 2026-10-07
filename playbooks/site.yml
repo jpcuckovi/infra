@@ -1,0 +1,27 @@
+# The whole estate, in dependency order.
+#
+# Phantom first and alone for now: it serves the registry that revenant's k3s
+# must be able to reach before it first starts, and the metrics store every
+# other box remote-writes to. A host that provides something is built before the
+# hosts that consume it.
+#
+# Adding a machine is an import line here plus a playbooks/<host>/ directory —
+# never a change to a role. A multi-node cluster is one import, of the playbook
+# named for the cluster.
+
+- import_playbook: phantom/main.yml
+
+# Revenant second, and the order is the dependency: its k3s cannot start
+# correctly without registries.yaml naming a registry that answers, and its
+# Prometheus remote-writes to a store phantom serves.
+- import_playbook: revenant/main.yml
+
+# Wraith, and its position carries a real dependency: as ztlab's headquarters
+# it runs k3s, so it reads a registries.yaml naming the registry phantom serves
+# and remote-writes to the store phantom holds.
+- import_playbook: wraith/main.yml
+
+# necropolis last. Its containerd names registry.lan, so it stays after
+# phantom. Last also means a node that is not reachable fails the final play
+# only, after every other host has converged.
+- import_playbook: necropolis/main.yml

@@ -1,0 +1,61 @@
+# Defaults shared by every k3s server.
+#
+# What belongs here is a setting that is correct on every k3s host BECAUSE IT IS
+# A K3S HOST, not one that happens to be true of the machines built so far. A
+# value that needs a per-machine justification belongs in host_vars, even when
+# only one machine exists to justify it.
+#
+# That distinction is not pedantic. This file previously declared itself "the
+# settings that are the same on phantom and revenant" while carrying
+# --kubelet-arg=max-pods=250, transcribed whole from a scratch build log for
+# revenant — an x86 workstation with a GPU — and justified in a comment as
+# suiting "an observability stack plus lab topologies". Phantom is a Pi 4 that
+# runs no lab topologies. The sameness was asserted, never checked, and the
+# assertion is what made it invisible.
+#
+# Where hosts genuinely differ, the difference is a value overridden in
+# host_vars — not a second role and not a `when:` inside this one. The task list
+# is identical on every k3s host; only the inputs change, which is the line at
+# which a role is parameterised rather than forked.
+#
+# Spectre is deliberately NOT in this group. It runs upstream kubeadm across
+# three KVM guests with stacked etcd, kube-vip and Cilium — a different
+# procedure, not different settings, so it gets its own role when it is
+# migrated.
+
+# Passed to INSTALL_K3S_EXEC as `server <args>`.
+#
+#   --secrets-encryption      encrypt Secrets at rest in the datastore
+#   --disable=traefik         nothing is fronted by an ingress controller; the
+#                             consumers are workstations on the LAN reaching
+#                             node ports directly
+#
+# Both are true of a k3s server in this estate regardless of the hardware under
+# it, which is the test for belonging in this file.
+#
+# max-pods is deliberately absent. The kubelet default of 110 is right for a
+# board whose binding constraint is memory, and a host that genuinely needs more
+# — revenant, when it is promoted, running lab topologies alongside the stack —
+# declares it in its own host_vars with its own reason.
+#
+# These are INSTALL-TIME arguments and are declared, not reconciled.
+#
+# INSTALL_K3S_EXEC is read once, when k3s is installed. Changing this list
+# configures the next install and has no effect on a running server; applying it
+# to an existing one means k3s-uninstall.sh and a rebuild, which destroys the
+# datastore and every local-path volume on the node.
+#
+# So a host installed before a change here keeps the arguments it was installed
+# with, and verify.yml does not flag the difference. That is the intended
+# behaviour rather than a missing gate — see docs/ARCHITECTURE.md, "What is
+# reconciled, and what is only declared". Values that a restart can apply, like
+# registries.yaml, ARE enforced; values that cost a reinstall are not, because
+# nothing should reinstall a Kubernetes server because a YAML file changed.
+k3s_server_args:
+  - "--secrets-encryption"
+  - "--disable=traefik"
+
+# Where the k3s local-path provisioner writes PersistentVolumes. Left at the
+# k3s default: the Pi 4s boot from the 2 TB USB SSD and have no SD card, so
+# there is exactly one filesystem and nothing to redirect.
+k3s_storage_path: /var/lib/rancher/k3s/storage

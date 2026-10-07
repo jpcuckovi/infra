@@ -1,0 +1,50 @@
+# Gates for the registry service. The mirror config it serves is gated in
+# roles/registry_mirror, which every k3s host composes.
+---
+- name: Query the registry catalogue from the host itself
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ registry_port }}/v2/_catalog"
+    return_content: true
+  register: registry_local_probe
+  failed_when: false
+  check_mode: false
+
+- name: Assert the registry answers locally
+  ansible.builtin.assert:
+    that:
+      - registry_local_probe.status == 200
+    fail_msg: >-
+      The registry did not answer on 127.0.0.1:{{ registry_port }}.
+      Check: systemctl status local-registry, journalctl -u local-registry
+    success_msg: "registry answers locally ({{ registry_local_probe.json.repositories | default([]) | length }} repositories)"
+
+# The gate that matters. A loopback-bound registry passes every check above and
+# fails for every other machine in the estate — the symptom appears later, on a
+# different host, as an ImagePullBackOff naming an image rather than a bind
+# address. Probing from the workstation over the real DNS alias is the only way
+# to catch it here.
+- name: Query the registry over the LAN, from the workstation
+  ansible.builtin.uri:
+    url: "http://{{ registry_alias }}:{{ registry_port }}/v2/_catalog"
+  register: registry_lan_probe
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+
+- name: Assert the registry answers over the LAN
+  ansible.builtin.assert:
+    that:
+      - registry_lan_probe.status == 200
+    fail_msg: >-
+      {{ registry_alias }}:{{ registry_port }} did not answer from this
+      workstation, though the registry is healthy on the host itself. Two
+      causes, in order of likelihood:
+
+        1. The unit is bound to loopback. Check ExecStart in
+           {{ registry_unit_path }} for `-p 127.0.0.1:` — it must bind
+           {{ registry_bind_address }}. This is what gpu-bench's unit does, and
+           copying it verbatim produces exactly this symptom.
+
+        2. The {{ registry_alias }} CNAME does not resolve, or points elsewhere.
+    success_msg: "registry answers on {{ registry_alias }}:{{ registry_port }}"

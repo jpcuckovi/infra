@@ -1,0 +1,69 @@
+# necropolis — kubeadm HA across cadaver, spectre and banshee.
+#
+# The first playbook in this repository that targets a CLUSTER rather than a
+# machine. The host layer runs on all three nodes; the cluster layer runs
+# once.
+#
+# Three phases are composed: prepared nodes with their Longhorn disks mounted
+# (host layer), one control plane formed across them (host layer), and the
+# addons that make it usable (cluster layer).
+#
+# This file declares WHAT necropolis composes. HOW the two layers run lives in
+# ../_layers.yml, stated once for the whole estate.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: necropolis
+
+    # preflight first: nothing is changed before the preconditions are known.
+    #
+    # wired_link early, for the reason wifi_link leads on the wireless hosts:
+    # everything after it pulls packages across the link, and EEE parking the
+    # PHY stalls exactly that kind of traffic. Stabilise the link, then use it.
+    #
+    # nut right after the link, as on revenant: it guards the machines rather
+    # than any workload. One UPS feeds all three nodes, so the node it is cabled
+    # to serves it and the other two are clients — group_vars/necropolis.yml.
+    #
+    # containerd before kubeadm_node. Not a hard ordering — kubelet is only
+    # enabled here, and nothing starts a pod until kubeadm runs — but it keeps
+    # the runtime ahead of the thing that will use it, as on every other host.
+    #
+    # longhorn_node last and independent of the other two: it prepares storage
+    # for a chart that arrives with the cluster layer.
+    #
+    # kubeadm_control_plane after everything a node needs to BE a node, and
+    # kubeconfig last, because it reads an admin.conf that does not exist until
+    # the control plane has formed — the same position it holds on every k3s
+    # host.
+    #
+    # No registry_mirror: that role writes k3s's registries.yaml. containerd
+    # carries the same declaration for kubeadm nodes, in hosts.toml.
+    host_roles:
+      - preflight
+      - base
+      - wired_link
+      - nut
+      - containerd
+      - kubeadm_node
+      - longhorn_node
+      - kubeadm_control_plane
+      - kubeconfig
+
+    # The cluster layer runs ONCE, on the first node, from the workstation.
+    #
+    # cilium first, which _layers.yml asserts: no pod gets an address until the
+    # CNI exists, so every chart after it depends on that. It also installs the
+    # Gateway API CRDs ahead of its own chart, and the LoadBalancer pools after.
+    #
+    # longhorn next: storage for anything that follows and wants a volume.
+    #
+    # cert_manager before gateway, whose certificate it issues, from a CA held
+    # on the workstation.
+    #
+    # No observability role is composed here.
+    cluster_roles:
+      - cilium
+      - longhorn
+      - cert_manager
+      - gateway

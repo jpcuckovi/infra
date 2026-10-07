@@ -1,0 +1,88 @@
+# Gates for a clabernetes topology node.
+#
+# Every assert here asks the KERNEL, never the task that ran earlier. A converge
+# reporting changed=0 proves the playbook believed its own work; it does not
+# prove a module survived the last reboot, and on a host that is reloaded
+# routinely that difference is the entire question.
+---
+- name: Read the loaded kernel modules
+  ansible.builtin.stat:
+    path: "/sys/module/{{ item }}"
+  register: clabernetes_module_stat
+  loop: "{{ clabernetes_kernel_modules }}"
+  loop_control:
+    label: "{{ item }}"
+  check_mode: false
+
+# /sys/module/<name> rather than /proc/modules, because it is present for a
+# built-in module as well as a loaded one. A kernel that compiles veth in rather
+# than shipping it as a module is correct, and would fail a /proc/modules grep —
+# the gate would be reporting on how the kernel was built, not on whether the
+# capability is there.
+- name: Assert every topology module is present in the running kernel
+  ansible.builtin.assert:
+    that:
+      - clabernetes_modules_absent | length == 0
+    fail_msg: >-
+      Not present in the running kernel: {{ clabernetes_modules_absent | join(', ') }}.
+
+      This is the state that fails silently. tc accepts a netem qdisc against a
+      kernel with no sch_netem by impairing nothing, so a fault scenario runs to
+      completion, the agent correctly diagnoses a healthy network, and the run is
+      scored as a miss against the agent.
+    success_msg: >-
+      present in the running kernel:
+      {{ clabernetes_kernel_modules | join(', ') }}
+  vars:
+    clabernetes_modules_absent: >-
+      {{ clabernetes_module_stat.results | default([])
+         | rejectattr('stat.exists') | map(attribute='item') | list }}
+
+- name: Assert the modules are configured to load at boot
+  ansible.builtin.stat:
+    path: "{{ clabernetes_modules_conf }}"
+  register: clabernetes_modules_conf_stat
+  check_mode: false
+
+- name: Assert the boot-time module list exists
+  ansible.builtin.assert:
+    that:
+      - clabernetes_modules_conf_stat.stat.exists
+    fail_msg: >-
+      {{ clabernetes_modules_conf }} is missing. The modules are loaded now and
+      will not be after the next power cycle, which on this host is a routine
+      event rather than an exceptional one.
+    success_msg: "{{ clabernetes_modules_conf }} present"
+
+# ---- inotify ----------------------------------------------------------------
+# cEOS does not refuse to start when this ceiling is too low. It starts, and its
+# agents fail with "Too many open files" in a log nobody reads, and the lab
+# converges partially — which is indistinguishable from a topology that is simply
+# still coming up.
+- name: Read the inotify instance ceiling
+  ansible.builtin.slurp:
+    src: /proc/sys/fs/inotify/max_user_instances
+  register: clabernetes_inotify
+  check_mode: false
+
+- name: Assert there is inotify headroom for the expected topology size
+  ansible.builtin.assert:
+    that:
+      - clabernetes_inotify_actual | int >= clabernetes_inotify_needed | int
+    fail_msg: >-
+      fs.inotify.max_user_instances is {{ clabernetes_inotify_actual }}, and
+      {{ clabernetes_expected_nodes }} cEOS nodes need about
+      {{ clabernetes_inotify_needed }} by containerlab's own scale note
+      ({{ clabernetes_inotify_per_node }} instances per node) — before k3s and
+      the observability stack take their share.
+
+      Raise it in inventory/host_vars/{{ inventory_hostname }}.yml by restating
+      base_sysctl in full, which is the estate's idiom for a value whose
+      justification belongs to one machine.
+    success_msg: >-
+      inotify ceiling {{ clabernetes_inotify_actual }} covers
+      {{ clabernetes_expected_nodes }} nodes
+  vars:
+    clabernetes_inotify_actual: "{{ clabernetes_inotify.content | b64decode | trim }}"
+    clabernetes_inotify_needed: >-
+      {{ clabernetes_expected_nodes | int * clabernetes_inotify_per_node | int }}

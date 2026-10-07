@@ -1,0 +1,31 @@
+# revenant — the acceptance gate.
+#
+# A composition, not an implementation. Each role owns its assertions in
+# tasks/verify.yml, so a gate lives beside the code that creates the thing it
+# checks and adding a host means listing gates rather than rewriting them.
+#
+#   ~/.venv/bin/ansible-playbook playbooks/revenant/verify.yml
+#
+# Same lists as main.yml minus the roles with nothing to verify: preflight is
+# assertions already, and kubeconfig's product is checked by every cluster gate
+# that reaches the API at all.
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: revenant
+    layer_mode: verify
+
+    host_roles:
+      - base
+      - wifi_link
+      - nut
+      - nvidia_runtime
+      - clabernetes_host
+      - registry_mirror
+      - k3s_server
+
+    cluster_roles:
+      - cilium
+      - observability
+      - nvidia_device_plugin
+      - clabernetes

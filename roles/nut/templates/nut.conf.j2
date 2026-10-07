@@ -1,0 +1,13 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/nut.
+#
+{% if nut_mode == 'netserver' %}
+# Netserver: the driver, upsd and upsmon all run on the host the UPS is cabled
+# to, and upsd also serves the other hosts this UPS feeds.
+{% elif nut_mode == 'netclient' %}
+# Netclient: upsmon only. The UPS is cabled to {{ nut_server_host }}.
+{% else %}
+# Standalone: the driver, upsd and upsmon all run on the host the UPS is cabled
+# to, and nothing else monitors this UPS.
+{% endif %}
+MODE={{ nut_mode }}

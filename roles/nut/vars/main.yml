@@ -1,0 +1,17 @@
+# Derived from nut_mode. Not settings: each restates the mode as the question a
+# task actually asks.
+---
+# Whether a UPS is cabled to this host, and so whether the driver and upsd run.
+nut_local_ups: "{{ nut_mode != 'netclient' }}"
+
+# Where this host's upsmon finds the UPS.
+nut_monitor_address: "{{ nut_server_address if nut_mode == 'netclient' else nut_listen_address }}"
+
+# The address upsd records for this host's upsmon, as `upsc -c` lists it.
+nut_monitor_source: >-
+  {{ ansible_facts['default_ipv4']['address'] if nut_mode == 'netclient'
+     else nut_listen_address }}
+
+nut_services: >-
+  {{ ['nut-driver.target', 'nut-server.service', 'nut-monitor.service']
+     if nut_local_ups | bool else ['nut-monitor.service'] }}

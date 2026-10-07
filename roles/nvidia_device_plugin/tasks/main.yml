@@ -1,0 +1,135 @@
+# The GPU's cluster-side half: the device plugin that makes nvidia.com/gpu a
+# schedulable resource, and the exporter that makes the card's telemetry visible.
+#
+# Ported from gpu-bench/ops/scripts/lib/install-nvidia.sh:174-233 and
+# install-observability.sh:46-48.
+#
+# Composed AFTER observability, and the reason is dcgm-exporter rather than the
+# plugin: its ServiceMonitor needs the CRD that kube-prometheus-stack installs.
+# Not asserted in _layers.yml because the failure is loud — helm refuses a
+# resource whose kind does not exist — unlike the registry ordering, which fails
+# silently and surfaces on another machine days later.
+#
+# The nvidia RuntimeClass is NOT created here. k3s creates it, which is the same
+# reason roles/nvidia_runtime writes no containerd config: both are things k3s
+# does for itself once the toolkit is on PATH before it starts.
+---
+- name: Assert the nvidia RuntimeClass exists
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: node.k8s.io/v1
+    kind: RuntimeClass
+    name: nvidia
+  register: nvidia_runtimeclass
+  check_mode: false
+  failed_when: nvidia_runtimeclass.resources | default([]) | length == 0
+  # Fails rather than creating it, deliberately. If k3s has not created this,
+  # it did not detect nvidia-container-runtime at startup — and creating the
+  # RuntimeClass by hand would paper over that, leaving a cluster that schedules
+  # GPU pods onto a containerd with no runtime to run them. The fix is upstream:
+  # install the toolkit before k3s, or restart k3s.
+
+# Without this the DaemonSet schedules NOTHING, and says so in the worst
+# possible way: its nodeAffinity requires one of three labels, none of which
+# exist on a plain k3s node —
+#
+#   feature.node.kubernetes.io/pci-10de.present=true       Node Feature Discovery
+#   feature.node.kubernetes.io/cpu-model.vendor_id=NVIDIA  Node Feature Discovery
+#   nvidia.com/gpu.present=true                            a plain label
+#
+# So desired becomes 0, and `helm --wait` treats a DaemonSet that is ready 0 of 0
+# as ready. The install reports success, no image is ever pulled, and the node
+# advertises no GPU — a failure that never resolves no matter how long anything
+# waits for it.
+#
+# Node Feature Discovery would supply the first two, and is the wrong tool here:
+# it exists to find which nodes in a cluster have GPUs. This host is in
+# gpu_hosts, and roles/nvidia_runtime has already asserted that lspci sees the
+# card and the driver loads. The label states something verified rather than
+# discovering something unknown.
+- name: Label the node as carrying a GPU
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+    name: "{{ inventory_hostname }}"
+    state: patched
+    definition:
+      metadata:
+        labels:
+          nvidia.com/gpu.present: "true"
+
+# MPS only, and it must precede the install rather than follow it.
+#
+# The chart's mps-control-daemon is gated on this label and sits at 0 desired
+# without it — so the plugin would come up advertising two GPUs with no MPS
+# daemon behind them, and the failure would land at pod start rather than here,
+# on a cluster where every install-time check passed.
+- name: Label the node as MPS-capable
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+    name: "{{ inventory_hostname }}"
+    state: patched
+    definition:
+      metadata:
+        labels:
+          nvidia.com/mps.capable: "true"
+  when: nvidia_gpu_sharing == 'mps'
+
+- name: Install the NVIDIA device plugin
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ nvidia_device_plugin_release }}"
+    chart_ref: nvidia-device-plugin
+    chart_repo_url: https://nvidia.github.io/k8s-device-plugin
+    chart_version: "{{ nvidia_device_plugin_chart_version }}"
+    release_namespace: "{{ nvidia_device_plugin_namespace }}"
+    create_namespace: true
+    # Dedicated passes the runtime class inline; the two sharing modes carry it
+    # in their values files along with the config map the plugin reads. `values`
+    # and `values_files` would both apply, so only one is set — a mode's file is
+    # the whole of its configuration.
+    values: "{{ {'runtimeClassName': 'nvidia'} if nvidia_gpu_sharing == 'none' else omit }}"
+    values_files: "{{ [] if nvidia_gpu_sharing == 'none' else [nvidia_sharing_values_file] }}"
+    wait: true
+    wait_timeout: "{{ nvidia_device_plugin_wait_timeout }}"
+  vars:
+    nvidia_sharing_values_file: >-
+      {{ role_path }}/../../charts/values/nvidia-device-plugin-{{ nvidia_gpu_sharing }}.yaml
+
+- name: Install dcgm-exporter
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ dcgm_release }}"
+    chart_ref: dcgm-exporter
+    chart_repo_url: https://nvidia.github.io/dcgm-exporter/helm-charts
+    chart_version: "{{ dcgm_chart_version }}"
+    release_namespace: "{{ observability_namespace }}"
+    create_namespace: false
+    values_files:
+      - "{{ role_path }}/../../charts/values/dcgm-exporter.yaml"
+    wait: true
+    wait_timeout: "{{ dcgm_wait_timeout }}"
+
+# Capacity is not readable the instant helm returns: the DaemonSet has to roll
+# and the plugin has to re-register with kubelet before the node advertises
+# anything. Reading it immediately reports the OLD value, so a fresh install
+# reports 0 and looks like a failure that succeeded.
+- name: Wait for the node to advertise the expected GPU count
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+    name: "{{ inventory_hostname }}"
+  register: nvidia_node
+  until: >-
+    (nvidia_node.resources | default([{}]) | first)
+      .status.capacity['nvidia.com/gpu'] | default(0) | int
+    == nvidia_expected_gpu_count | int
+  retries: "{{ nvidia_capacity_retries }}"
+  delay: 2
+  when: not ansible_check_mode
+  # Compared for EQUALITY, not for "more than zero". Both sharing modes make one
+  # card advertise as two, so a greater-than test would pass while still showing
+  # the count from before the change — which is exactly what a failed switch
+  # looks like, since the old DaemonSet keeps running until the new one replaces
+  # it. Enabling time slicing would report success having changed nothing.

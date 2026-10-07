@@ -1,0 +1,133 @@
+# Gates for the Gateway.
+#
+# The last gate is end to end, from the workstation: each hostname resolves to
+# the Gateway's address, and an HTTPS request to it succeeds while verifying
+# against the workstation CA. That one request proves DNS, L2 announcement,
+# the Gateway, the certificate chain and the route together — k8s-aio's
+# "curl from ANOTHER machine" check, made a gate.
+---
+- name: Settle the Gateway's address
+  ansible.builtin.set_fact:
+    gateway_address: >-
+      {{ (hostvars[cluster_hosts | first]['ansible_facts']['default_ipv4']['network']).rsplit('.', 1)[0]
+         ~ '.' ~ (lb_pools | selectattr('name', 'equalto', gateway_pool) | first).first }}
+
+- name: Read the Gateway
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: gateway.networking.k8s.io/v1
+    kind: Gateway
+    namespace: "{{ gateway_namespace }}"
+    name: "{{ gateway_name }}"
+  register: gateway_info
+  check_mode: false
+
+- name: Assert the Gateway is programmed on its address
+  ansible.builtin.assert:
+    that:
+      - gateway_info.resources | length == 1
+      - gateway_conditions | selectattr('type', 'equalto', 'Programmed') | map(attribute='status') | list == ['True']
+      - gateway_address in gateway_addresses
+    fail_msg: >-
+      Gateway {{ gateway_namespace }}/{{ gateway_name }}: Programmed
+      {{ gateway_conditions | selectattr('type', 'equalto', 'Programmed') | map(attribute='status') | list }},
+      addresses {{ gateway_addresses }}; expected {{ gateway_address }}.
+
+      No address usually means no pool matched its Service — check the
+      `{{ gateway_pool }}` pool and the {{ lb_pool_label }} label on
+      cilium-gateway-{{ gateway_name }}.
+    success_msg: "Gateway programmed on {{ gateway_address }}"
+  vars:
+    gateway_status: "{{ (gateway_info.resources | first | default({})).status | default({}) }}"
+    gateway_conditions: "{{ gateway_status.conditions | default([]) }}"
+    gateway_addresses: "{{ gateway_status.addresses | default([]) | map(attribute='value') | list }}"
+
+- name: Read the Gateway's certificate
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ gateway_namespace }}"
+    name: "{{ gateway_tls_secret }}"
+  register: gateway_cert
+  check_mode: false
+
+- name: Assert the certificate is issued
+  ansible.builtin.assert:
+    that:
+      - gateway_cert.resources | length == 1
+      - gateway_cert.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list == ['True']
+    fail_msg: >-
+      Certificate {{ gateway_namespace }}/{{ gateway_tls_secret }} is missing or
+      not Ready; the Gateway serves no TLS without it. `kubectl --context
+      {{ kubeconfig_context }} -n {{ gateway_namespace }} describe certificate
+      {{ gateway_tls_secret }}` names the cause.
+    success_msg: "certificate {{ gateway_tls_secret }} ready"
+
+- name: Resolve each hostname from the workstation
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "import socket, sys; print(socket.gethostbyname(sys.argv[1]))"
+      - "{{ item.hostname }}"
+  loop: "{{ gateway_routes }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  register: gateway_dns
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert each hostname points at the Gateway
+  ansible.builtin.assert:
+    that:
+      - gateway_wrong | length == 0
+    fail_msg: >-
+      Not resolving to {{ gateway_address }}:
+      {{ gateway_wrong | join('; ') }}. Each needs an A record at the router
+      for the Gateway's address.
+    success_msg: "{{ gateway_routes | map(attribute='hostname') | join(', ') }} -> {{ gateway_address }}"
+  vars:
+    gateway_wrong: >-
+      {{ gateway_dns.results
+         | rejectattr('stdout', 'equalto', gateway_address)
+         | map(attribute='item.hostname')
+         | zip(gateway_dns.results | rejectattr('stdout', 'equalto', gateway_address)
+               | map(attribute='stdout') | list)
+         | map('join', ' -> ') | list }}
+
+- name: Request each UI over HTTPS, verifying against the workstation CA
+  ansible.builtin.uri:
+    url: "https://{{ item.hostname }}/"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: [200]
+  loop: "{{ gateway_routes }}"
+  loop_control:
+    label: "{{ item.hostname }}"
+  register: gateway_https
+  delegate_to: localhost
+  become: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert each UI answers over verified HTTPS
+  ansible.builtin.assert:
+    that:
+      - gateway_https_failed | length == 0
+    fail_msg: >-
+      Failed: {{ gateway_https_failed | join('; ') }}.
+
+      A certificate error means the leaf was not issued by the workstation CA,
+      or names the wrong host. A timeout with DNS correct means no node answers
+      ARP for {{ gateway_address }} — check the L2 announcement policy. A 404
+      means the route did not attach; `kubectl describe httproute` says why.
+    success_msg: "{{ gateway_routes | map(attribute='hostname') | join(', ') }}: 200 over verified HTTPS"
+  vars:
+    gateway_https_failed: >-
+      {{ gateway_https.results | rejectattr('status', 'equalto', 200)
+         | map(attribute='item.hostname') | list }}

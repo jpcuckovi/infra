@@ -1,0 +1,128 @@
+# Gates for GPU scheduling and GPU telemetry.
+#
+# Two questions, asked separately: can the cluster SCHEDULE onto the card, and
+# can anything SEE what the card is doing. A host can pass the first and fail
+# the second, and the second is what makes remote-writing this cluster's metrics
+# worth anything.
+---
+- name: Read the node's advertised capacity
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+    name: "{{ inventory_hostname }}"
+  register: nvidia_node_gate
+  check_mode: false
+
+- name: Assert the node advertises the GPU count this mode implies
+  ansible.builtin.assert:
+    that:
+      - nvidia_gpu_capacity | int == nvidia_expected_gpu_count | int
+    fail_msg: >-
+      {{ inventory_hostname }} advertises nvidia.com/gpu
+      = {{ nvidia_gpu_capacity | default('nothing') }}, but
+      nvidia_gpu_sharing={{ nvidia_gpu_sharing }} implies
+      {{ nvidia_expected_gpu_count }}.
+
+      Zero: the driver can be loaded and nvidia-smi perfectly happy while this
+      reads nothing — the question is whether the DEVICE PLUGIN registered the
+      card with kubelet, which is a different thing from whether the card works.
+
+      One where two was expected: the sharing mode did not take. The old
+      DaemonSet keeps serving the previous capacity until the new one replaces
+      it, so this is what a failed switch looks like rather than a failed
+      install.
+
+      Two where one was expected: sharing is still enabled from an earlier run.
+      It is node-wide and sticky, and nothing in a workload's spec records that
+      it is in effect — a pod that assumed exclusive access is quietly sharing.
+
+      Check: kubectl -n {{ nvidia_device_plugin_namespace }} logs
+      -l app.kubernetes.io/name=nvidia-device-plugin
+    success_msg: >-
+      nvidia.com/gpu capacity {{ nvidia_gpu_capacity }}
+      (sharing: {{ nvidia_gpu_sharing }})
+  vars:
+    nvidia_gpu_capacity: >-
+      {{ (nvidia_node_gate.resources | default([{}]) | first)
+         .status.capacity['nvidia.com/gpu'] | default(0) }}
+
+- name: Read the device plugin daemonset
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: DaemonSet
+    namespace: "{{ nvidia_device_plugin_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/name=nvidia-device-plugin"
+  register: nvidia_ds_gate
+  check_mode: false
+
+- name: Assert the device plugin is rolled out
+  ansible.builtin.assert:
+    that:
+      - nvidia_ds_scheduled | length > 0
+      - nvidia_ds_unready | length == 0
+    fail_msg: >-
+      No device plugin DaemonSet has a pod scheduled, or one is not ready.
+
+      Rollout: {{ nvidia_ds_census | join(', ') | default('nothing found', true) }}
+
+      All zero means nodeAffinity matched nothing. The chart requires one of
+      feature.node.kubernetes.io/pci-10de.present,
+      feature.node.kubernetes.io/cpu-model.vendor_id or nvidia.com/gpu.present,
+      and a plain k3s node carries none — so desired is 0, `helm --wait` calls
+      0 of 0 ready, and the install reports success having scheduled nothing.
+    success_msg: "device plugin rolled out: {{ nvidia_ds_census | join(', ') }}"
+  vars:
+    # The chart ships TWO DaemonSets under this label — the plugin and the MPS
+    # control daemon. The second is gated on nvidia.com/mps.capable and sits at
+    # 0 by design whenever sharing is off, which is why this counts DaemonSets
+    # that scheduled something rather than requiring exactly one to exist.
+    nvidia_ds_all: "{{ nvidia_ds_gate.resources | default([]) }}"
+    nvidia_ds_scheduled: >-
+      {{ nvidia_ds_all
+         | selectattr('status.desiredNumberScheduled', 'defined')
+         | rejectattr('status.desiredNumberScheduled', 'equalto', 0) | list }}
+    nvidia_ds_unready: >-
+      {{ nvidia_ds_scheduled
+         | rejectattr('status.numberReady', 'defined') | list
+         + (nvidia_ds_scheduled | selectattr('status.numberReady', 'defined')
+            | selectattr('status.numberReady', 'equalto', 0) | list) }}
+    nvidia_ds_census: >-
+      {{ nvidia_ds_all | map(attribute='metadata.name')
+         | zip(nvidia_ds_all | map(attribute='status.numberReady', default=0) | map('string'))
+         | map('join', '=') | list }}
+
+# Asked of Prometheus rather than of the exporter, because the exporter being
+# healthy proves nothing about whether anything is scraping it. The failure this
+# catches is scrapeTimeout > interval, which makes Prometheus drop the entire
+# DCGM job — the exporter stays green and the metrics simply never exist.
+- name: Ask Prometheus which DCGM series it holds
+  ansible.builtin.uri:
+    url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/label/__name__/values"
+    return_content: true
+  register: dcgm_series
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+
+- name: Assert the required DCGM fields are present
+  ansible.builtin.assert:
+    that:
+      - dcgm_series.status == 200
+      - dcgm_missing | length == 0
+    fail_msg: >-
+      Missing from the metrics store: {{ dcgm_missing | join(', ') }}.
+
+      These five are required by name because a chart upgrade that drops them
+      removes the evidence for a published result without breaking anything
+      visibly — the exporter runs, the dashboards render, and the profiling
+      series are simply gone.
+
+      The usual cause is scrapeTimeout exceeding interval in
+      charts/values/dcgm-exporter.yaml, which makes Prometheus drop the whole
+      DCGM job rather than late samples.
+    success_msg: "all {{ dcgm_required_fields | length }} required DCGM fields present"
+  vars:
+    dcgm_present: "{{ dcgm_series.json.data | default([]) }}"
+    dcgm_missing: "{{ dcgm_required_fields | difference(dcgm_present) }}"

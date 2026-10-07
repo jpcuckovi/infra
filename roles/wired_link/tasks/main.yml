@@ -1,0 +1,109 @@
+# Disable Energy-Efficient Ethernet on every wired interface this host carries.
+#
+# Composed only by hosts in wired_hosts. A wireless-only machine needs none of
+# these tasks — not a subset of them with different values — which is the test
+# for a separate role rather than a `when:` inside base.
+#
+# The failure this exists to prevent, measured on phantom: interactive
+# sessions froze for seconds at a time and then delivered everything at once,
+# while bulk transfers ran at ~300 Mbit/s and looked entirely healthy. The wire
+# was blameless — zero CRC, frame, FIFO and overrun errors — and the TCP stack
+# had no backlog drops, no pruning and no listen overflows. What it did have was
+# TcpExtTCPTimeouts at 94, TcpExtTCPLostRetransmit at 73, and
+# `ethtool --show-eee eth0` reporting `enabled - active` with Tx LPI 34 us.
+#
+# EEE parks the link in Low Power Idle during gaps and wakes it when traffic
+# resumes. On bcmgenet the wake costs a packet; a lost packet with no following
+# data generates no duplicate ACKs, so recovery falls through to a retransmission
+# timeout; and the timeout's exponential backoff turns a sub-second radio event
+# into a multi-second stall. A saturated link never idles, which is why every
+# throughput measurement looked fine. Interactive traffic is nothing but gaps.
+#
+# It is also inert without a cable — which is why the symptom appeared the day
+# phantom's address moved from wlan0 to eth0 and never once in the years before.
+---
+- name: Install the wired tools
+  ansible.builtin.apt:
+    name: "{{ wired_link_packages }}"
+    state: present
+
+# A wired interface is one with a device behind it and no radio in front of it.
+#
+# /sys/class/net/<iface>/device exists if and only if the interface is backed by
+# real hardware, which excludes lo and every virtual interface the container
+# runtimes create — cni0, flannel.1, podman0 and the veth pairs all lack it. The
+# wireless interfaces DO have it, so they are subtracted using the same
+# `wireless` directory test wifi_link matches on.
+#
+# Two finds and a difference rather than one clever pattern, because the two
+# facts are independent and a reader should be able to see both.
+#
+# follow: true because the entries under /sys/class/net are symlinks into
+# /sys/devices — without it the search never descends and finds nothing at all.
+- name: Discover the hardware-backed interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: device
+    file_type: any
+    recurse: true
+    depth: 2
+    follow: true
+  register: wired_link_hardware
+  check_mode: false
+
+- name: Discover the wireless interfaces
+  ansible.builtin.find:
+    paths: /sys/class/net
+    patterns: wireless
+    file_type: directory
+    recurse: true
+    depth: 2
+    follow: true
+  register: wired_link_radios
+  check_mode: false
+
+- name: Settle the interface list
+  ansible.builtin.set_fact:
+    wired_link_managed: >-
+      {{ wired_link_interfaces
+         if (wired_link_interfaces | length > 0)
+         else ((wired_link_hardware.files | map(attribute='path')
+                | map('dirname') | map('basename') | list)
+               | difference(wired_link_radios.files | map(attribute='path')
+                            | map('dirname') | map('basename') | list)) }}
+
+- name: Assert a wired interface was found
+  ansible.builtin.assert:
+    that:
+      - wired_link_managed | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} is in wired_hosts but carries no wired interface —
+      nothing under /sys/class/net has a `device` entry without also having a
+      `wireless` directory.
+
+      Either the host is wireless-only and should leave that group, or its NIC
+      driver failed to load and the interface is absent rather than merely down.
+      `ip link` will show the interface in the second case and not in the first.
+    success_msg: "wired interfaces: {{ wired_link_managed | join(', ') }}"
+
+- name: Install the EEE-suppression unit
+  ansible.builtin.template:
+    src: eee-off@.service.j2
+    dest: "{{ wired_link_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start EEE suppression per interface
+  ansible.builtin.systemd_service:
+    name: "eee-off@{{ item }}.service"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  # Under --check the unit above was only simulated, so systemd has no eee-off@
+  # template to instantiate and this fails on a host where nothing is wrong.
+  # Same idiom, and same reason, as wifi_link's start task and the registry's.
+  when: not ansible_check_mode

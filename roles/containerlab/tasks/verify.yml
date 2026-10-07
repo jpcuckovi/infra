@@ -1,0 +1,116 @@
+# Gates for a containerlab host.
+#
+# Every assert here asks the KERNEL or the package database, never the task that
+# ran earlier. A converge that reported changed=0 proves the playbook believed
+# its own work; it does not prove a module survived the last reboot, and after a
+# power cycle that difference is the entire question.
+---
+- name: Read the loaded kernel modules
+  ansible.builtin.stat:
+    path: "/sys/module/{{ item }}"
+  register: containerlab_module_stat
+  loop: "{{ containerlab_kernel_modules }}"
+  loop_control:
+    label: "{{ item }}"
+  check_mode: false
+
+# /sys/module/<name> rather than /proc/modules, because it is present for a
+# built-in module as well as a loaded one. A kernel that compiles veth in rather
+# than shipping it as a module is correct and would fail a /proc/modules grep —
+# the gate would be reporting on how the kernel was built, not on whether the
+# capability is there.
+- name: Assert every topology module is present in the running kernel
+  ansible.builtin.assert:
+    that:
+      - containerlab_modules_absent | length == 0
+    fail_msg: >-
+      Not present in the running kernel: {{ containerlab_modules_absent | join(', ') }}.
+
+      This is the state that fails silently. tc accepts a netem qdisc against a
+      kernel with no sch_netem by impairing nothing, so a fault scenario runs to
+      completion, the agent correctly diagnoses a healthy network, and the run is
+      scored as a miss against the agent rather than against the host.
+
+      Check {{ containerlab_modules_conf }} was read at boot: systemd-modules-load
+      reports failures with `systemctl status systemd-modules-load`.
+    success_msg: "modules present: {{ containerlab_kernel_modules | join(', ') }}"
+  vars:
+    containerlab_modules_absent: >-
+      {{ containerlab_module_stat.results
+         | rejectattr('stat.exists')
+         | map(attribute='item') | list }}
+
+- name: Read the module persistence file
+  ansible.builtin.slurp:
+    src: "{{ containerlab_modules_conf }}"
+  register: containerlab_conf_raw
+  failed_when: false
+  check_mode: false
+
+# Checked separately from the loaded state above, because the two fail at
+# different times. Modules loaded but not persisted works perfectly until the
+# next reboot; persisted but not loaded means the file is right and something
+# stopped systemd-modules-load from acting on it. One assert covering both would
+# name the wrong cause half the time.
+- name: Assert every module is declared for the next boot
+  ansible.builtin.assert:
+    that:
+      - containerlab_conf_raw.content is defined
+      - containerlab_undeclared | length == 0
+    fail_msg: >-
+      {{ containerlab_modules_conf }} does not declare:
+      {{ containerlab_undeclared | default(['(file missing entirely)']) | join(', ') }}.
+
+      The modules may well be loaded right now. They will not be after the next
+      power cycle, and the failure that follows is the silent one described above.
+    success_msg: "declared for boot: {{ containerlab_kernel_modules | join(', ') }}"
+  vars:
+    containerlab_conf_lines: >-
+      {{ (containerlab_conf_raw.content | default('') | b64decode).splitlines()
+         | map('trim') | reject('match', '^#') | reject('equalto', '') | list }}
+    containerlab_undeclared: >-
+      {{ containerlab_kernel_modules | reject('in', containerlab_conf_lines) | list }}
+
+- name: Read the installed containerlab version
+  ansible.builtin.command: dpkg-query -W -f='${Version}' containerlab
+  register: containerlab_verify_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert the running containerlab matches the pin
+  ansible.builtin.assert:
+    that:
+      - containerlab_verify_version.rc == 0
+      - containerlab_verify_version.stdout | trim == containerlab_version
+    fail_msg: >-
+      containerlab is {{ containerlab_verify_version.stdout | trim | default('absent', true) }},
+      the pin is {{ containerlab_version }}.
+
+      A pin nothing compares against is not a pin — which this repository learned
+      from a k3s version that sat in group_vars for months while every host ran
+      something else, because the install task was guarded on the binary
+      existing rather than on its version.
+    success_msg: "containerlab {{ containerlab_version }}"
+
+- name: Ask podman to report itself
+  ansible.builtin.command: podman --version
+  register: containerlab_podman
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Rootless, so this runs as the connecting user and not under become. A podman
+# that only answers as root is a podman containerlab cannot drive, and the whole
+# reason for choosing it over docker was to avoid a root-equivalent group.
+- name: Assert podman runs as this user
+  ansible.builtin.assert:
+    that:
+      - containerlab_podman.rc == 0
+    fail_msg: >-
+      `podman --version` failed as the SSH user:
+      {{ containerlab_podman.stderr | default('') | trim }}
+
+      Check, on the host: grep "^$(id -un):" /etc/subuid /etc/subgid
+    success_msg: "{{ containerlab_podman.stdout | trim }}"
+  become: false

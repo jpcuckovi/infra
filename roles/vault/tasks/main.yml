@@ -1,0 +1,203 @@
+---
+- name: Install Hashicorp Vault Helm Chart
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ vault_release }}"
+    chart_ref: vault
+    chart_repo_url: "{{ vault_chart_repo_url }}"
+    chart_version: "{{ vault_chart_version }}"
+    release_namespace: "{{ vault_namespace }}"
+    create_namespace: true
+    values:
+      injector:
+        enabled: "{{ vault_injector_enabled | bool }}"
+      ui:
+        enabled: "{{ vault_ui_enabled | bool }}"
+      server:
+        dataStorage:
+          size: "{{ vault_storage_size }}"
+          storageClass: "{{ vault_storage_class }}"
+        ha:
+          enabled: true
+          replicas: "{{ vault_replicas | int }}"
+          raft:
+            enabled: true
+            setNodeId: true
+            config: |
+              ui = true
+
+              listener "tcp" {
+                tls_disable = 1
+                address = "[::]:8200"
+                cluster_address = "[::]:8201"
+              }
+
+              storage "raft" {
+                path = "/vault/data"
+                retry_join {
+                  leader_api_addr = "http://{{ vault_release }}-0.{{ vault_release }}-internal:8200"
+                }
+              }
+
+              service_registration "kubernetes" {}
+
+- name: Wait for Hashicorp Vault to be running
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Pod
+    label_selectors: ["app.kubernetes.io/name=vault"]
+    namespace: "{{ vault_namespace }}"
+  register: vault_info
+  until: >-
+    vault_info.resources | length == vault_replicas | int
+    and (vault_info.resources
+         | selectattr('status.phase', 'equalto', 'Running') | list | length)
+        == vault_replicas | int
+  retries: "{{ vault_wait_retries }}"
+  delay: "{{ vault_wait_delay }}"
+  when: not ansible_check_mode
+
+- name: Get status of Vault seal
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/seal-status"
+    ca_path: "{{ gateway_ca_crt }}"
+    method: GET
+    validate_certs: true
+    return_content: true
+  check_mode: false
+  register: vault_seal
+  until: vault_seal.json.initialized is defined
+  retries: "{{ vault_wait_retries }}"
+  delay: "{{ vault_wait_delay }}"
+
+- name: Get status of existing init file
+  ansible.builtin.stat:
+    path: "{{ vault_init_file }}"
+  check_mode: false
+  register: vault_init_stat
+
+- name: Refuse to initialize over an existing init file
+  ansible.builtin.assert:
+    that:
+      - vault_seal.json.initialized or not vault_init_stat.stat.exists
+    fail_msg: >-
+      Vault reports uninitialized, but {{ vault_init_file }} already exists.
+      Initializing would overwrite the keys in it. If Vault's storage was
+      deliberately rebuilt, move the file aside and run again.
+
+- name: Initialize Vault
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/init"
+    method: PUT
+    body_format: json
+    body:
+      secret_shares: 1
+      secret_threshold: 1
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: vault_init
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - not vault_seal.json.initialized
+
+# Written straight after init: the response is shown once, and losing it loses
+# Vault.
+- name: Ensure the init file's directory exists
+  ansible.builtin.file:
+    path: "{{ vault_init_file | dirname }}"
+    state: directory
+    mode: "0700"
+  when:
+    - not ansible_check_mode
+    - not vault_seal.json.initialized
+
+- name: Write the init response to the workstation
+  ansible.builtin.copy:
+    content: "{{ vault_init.json | to_nice_json }}"
+    dest: "{{ vault_init_file }}"
+    mode: "0600"
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - not vault_seal.json.initialized
+
+- name: Unseal Vault
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/unseal"
+    method: PUT
+    body_format: json
+    body:
+      key: "{{ (lookup('ansible.builtin.file', vault_init_file) | from_json).keys_base64[0] }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: vault_unseal
+  no_log: true
+  failed_when: vault_unseal.status != 200 or vault_unseal.json.sealed
+  when:
+    - not ansible_check_mode
+    - vault_seal.json.sealed
+
+# The readiness probe passes only once a server is unsealed.
+- name: Wait for the Vault pods to be Ready
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Pod
+    namespace: "{{ vault_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ vault_release }}"
+      - component=server
+  register: vault_ready_pods
+  until: >-
+    vault_ready_pods.resources
+    | community.general.json_query("[?status.conditions[?type=='Ready' && status=='True']]")
+    | length == vault_replicas | int
+  retries: "{{ vault_wait_retries }}"
+  delay: "{{ vault_wait_delay }}"
+  when: not ansible_check_mode
+
+# Needs an active, unsealed Vault, which the wait above guarantees. The uri
+# tasks log their headers at -vvv, so configuration runs on a child token that
+# expires within minutes and is revoked at the end, not on the root token.
+- name: Configure Vault's engines, policies and auth
+  when: not ansible_check_mode
+  block:
+    - name: Issue a short-lived token for configuration
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/v1/auth/token/create"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (lookup('ansible.builtin.file', vault_init_file) | from_json).root_token }}"
+        body_format: json
+        body:
+          display_name: infra-configure
+          ttl: "{{ vault_config_token_ttl }}s"
+          explicit_max_ttl: "{{ vault_config_token_ttl }}s"
+        ca_path: "{{ gateway_ca_crt }}"
+        validate_certs: true
+        return_content: true
+      register: vault_config_token_response
+      no_log: true
+
+    - name: Hold the configuration token
+      ansible.builtin.set_fact:
+        vault_config_token: "{{ vault_config_token_response.json.auth.client_token }}"
+      no_log: true
+
+    - name: Apply the configuration
+      ansible.builtin.include_tasks: configure.yml
+
+  always:
+    - name: Revoke the configuration token
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/v1/auth/token/revoke-self"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_config_token }}"
+        ca_path: "{{ gateway_ca_crt }}"
+        validate_certs: true
+        status_code: 204
+      no_log: true
+      when: vault_config_token is defined

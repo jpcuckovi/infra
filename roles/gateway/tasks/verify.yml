@@ -1,10 +1,5 @@
-# Gates for the Gateway.
-#
-# The last gate is end to end, from the workstation: each hostname resolves to
-# the Gateway's address, and an HTTPS request to it succeeds while verifying
-# against the workstation CA. That one request proves DNS, L2 announcement,
-# the Gateway, the certificate chain and the route together — k8s-aio's
-# "curl from ANOTHER machine" check, made a gate.
+# Gates for the Gateway. The last is a verified HTTPS request from the
+# workstation, proving DNS, L2 announcement, certificate and route together.
 ---
 - name: Settle the Gateway's address
   ansible.builtin.set_fact:

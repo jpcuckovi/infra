@@ -1,45 +1,14 @@
-# Disable Energy-Efficient Ethernet on every wired interface this host carries.
-#
-# Composed only by hosts in wired_hosts. A wireless-only machine needs none of
-# these tasks — not a subset of them with different values — which is the test
-# for a separate role rather than a `when:` inside base.
-#
-# The failure this exists to prevent, measured on phantom: interactive
-# sessions froze for seconds at a time and then delivered everything at once,
-# while bulk transfers ran at ~300 Mbit/s and looked entirely healthy. The wire
-# was blameless — zero CRC, frame, FIFO and overrun errors — and the TCP stack
-# had no backlog drops, no pruning and no listen overflows. What it did have was
-# TcpExtTCPTimeouts at 94, TcpExtTCPLostRetransmit at 73, and
-# `ethtool --show-eee eth0` reporting `enabled - active` with Tx LPI 34 us.
-#
-# EEE parks the link in Low Power Idle during gaps and wakes it when traffic
-# resumes. On bcmgenet the wake costs a packet; a lost packet with no following
-# data generates no duplicate ACKs, so recovery falls through to a retransmission
-# timeout; and the timeout's exponential backoff turns a sub-second radio event
-# into a multi-second stall. A saturated link never idles, which is why every
-# throughput measurement looked fine. Interactive traffic is nothing but gaps.
-#
-# It is also inert without a cable — which is why the symptom appeared the day
-# phantom's address moved from wlan0 to eth0 and never once in the years before.
+# Disable Energy-Efficient Ethernet on every wired interface (wired_hosts only).
+# EEE wake on bcmgenet drops a packet, and in idle interactive traffic that
+# becomes a multi-second RTO stall while bulk throughput looks healthy.
 ---
 - name: Install the wired tools
   ansible.builtin.apt:
     name: "{{ wired_link_packages }}"
     state: present
 
-# A wired interface is one with a device behind it and no radio in front of it.
-#
-# /sys/class/net/<iface>/device exists if and only if the interface is backed by
-# real hardware, which excludes lo and every virtual interface the container
-# runtimes create — cni0, flannel.1, podman0 and the veth pairs all lack it. The
-# wireless interfaces DO have it, so they are subtracted using the same
-# `wireless` directory test wifi_link matches on.
-#
-# Two finds and a difference rather than one clever pattern, because the two
-# facts are independent and a reader should be able to see both.
-#
-# follow: true because the entries under /sys/class/net are symlinks into
-# /sys/devices — without it the search never descends and finds nothing at all.
+# Wired means a `device` entry (real hardware, so no lo, veth or cni0) minus
+# those with a `wireless` directory. follow is needed: /sys/class/net is symlinks.
 - name: Discover the hardware-backed interfaces
   ansible.builtin.find:
     paths: /sys/class/net
@@ -93,6 +62,7 @@
     owner: root
     group: root
     mode: "0644"
+  register: wired_link_unit
 
 - name: Enable and start EEE suppression per interface
   ansible.builtin.systemd_service:
@@ -103,7 +73,17 @@
   loop: "{{ wired_link_managed }}"
   loop_control:
     label: "{{ item }}"
-  # Under --check the unit above was only simulated, so systemd has no eee-off@
-  # template to instantiate and this fails on a host where nothing is wrong.
-  # Same idiom, and same reason, as wifi_link's start task and the registry's.
+  # Under --check the unit was only simulated, so there is no template to start.
   when: not ansible_check_mode
+
+# An already-enabled unit is left alone by `enabled: true`, so a changed
+# [Install] section needs a reenable to create its new links.
+- name: Re-enable EEE suppression after the unit's install targets change
+  ansible.builtin.command: "systemctl reenable eee-off@{{ item }}.service"
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - wired_link_unit is changed

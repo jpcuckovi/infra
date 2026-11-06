@@ -1,0 +1,123 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/llama_server.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ llama_server_name }}
+  namespace: {{ llama_server_namespace }}
+  labels:
+    app: {{ llama_server_name }}
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the incoming pod cannot be scheduled while the
+  # outgoing one holds the node's only GPU.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ llama_server_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ llama_server_name }}
+      # A changed key changes the pod template and so rolls the pod; otherwise
+      # the running server keeps the key it read at start.
+      annotations:
+        infra/api-key-sha256: "{{ llama_server_api_key | hash('sha256') }}"
+    spec:
+      runtimeClassName: nvidia
+      # An init container, so the download is not charged to the startup probe.
+      # The final name appears only after the checksum passes, which makes its
+      # presence proof of a good file and spares hashing it on every start.
+      initContainers:
+        - name: fetch-model
+          image: {{ llama_server_image }}
+          command:
+            - sh
+            - -ec
+            - |
+              cd /models
+              printf '%s' "$MODEL_FILES" | while read -r sha file; do
+                name="${file##*/}"
+                [ -f "$name" ] && continue
+                curl -fL --retry 10 --retry-all-errors -C - -o "$name.part" "$MODEL_URL/$file"
+                if ! echo "$sha  $name.part" | sha256sum -c --strict -; then
+                  rm -f "$name.part"
+                  exit 1
+                fi
+                mv "$name.part" "$name"
+              done
+          env:
+            - name: MODEL_URL
+              value: https://huggingface.co/{{ llama_server_model_spec.repo }}/resolve/{{ llama_server_model_spec.revision }}
+            - name: MODEL_FILES
+              value: |
+{% for file in llama_server_model_spec.files %}
+                {{ file.sha256 }} {{ file.name }}
+{% endfor %}
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: {{ llama_server_name }}
+          image: {{ llama_server_image }}
+          args: {{ llama_server_args | to_json }}
+          env:
+            # The image's default too; the Service and probes rely on it.
+            - name: LLAMA_ARG_PORT
+              value: "{{ llama_server_port }}"
+            - name: LLAMA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ llama_server_key_secret }}
+                  key: api-key
+          ports:
+            - name: http
+              containerPort: {{ llama_server_port }}
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          resources: {{ llama_server_resources | to_json }}
+          # /health answers 503 until the weights are loaded, and needs no key.
+          # Liveness is slow to give up, since a restart costs a full reload.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: {{ llama_server_startup_failure_threshold }}
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        # hostPath, not a PVC: local-path would put the weights under /var/lib
+        # and delete them with the claim.
+        - name: models
+          hostPath:
+            path: {{ llama_server_model_dir }}
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ llama_server_name }}
+  namespace: {{ llama_server_namespace }}
+  labels:
+    app: {{ llama_server_name }}
+spec:
+  # NodePort because clients are on other machines, on the same fixed-port
+  # pattern as Grafana and Prometheus. The key above is what guards it.
+  type: NodePort
+  selector:
+    app: {{ llama_server_name }}
+  ports:
+    - name: http
+      port: {{ llama_server_port }}
+      targetPort: http
+      nodePort: {{ llama_server_node_port }}

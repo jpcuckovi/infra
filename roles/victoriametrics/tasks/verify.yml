@@ -32,10 +32,8 @@
     vm_pvc.resources | length != 1 or
     vm_pvc.resources[0].status.phase != 'Bound'
 
-# Probed through the CNAME from the workstation, not through the ClusterIP.
-# That is the path every other box's Prometheus takes, so it is the path worth
-# proving — a store reachable only from inside the cluster it runs in collects
-# nothing from the estate.
+# Probed through the CNAME from the workstation, because that is the path every
+# other host's Prometheus takes.
 - name: Probe VictoriaMetrics health over the LAN
   ansible.builtin.uri:
     url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/health"
@@ -58,22 +56,13 @@
       samples while continuing to look healthy.
     success_msg: "VictoriaMetrics answers on {{ metrics_alias }}:{{ victoriametrics_node_port }}"
 
-# Proves data is actually landing, not merely that both ends are running. A
-# Prometheus remote-writing into a black hole reports no error a dashboard would
-# show, and the loss is only discovered when someone queries a window that no
-# longer exists.
+# Proves data is landing, since a remote-write into a black hole shows no error
+# anywhere a dashboard would.
 - name: Ask VictoriaMetrics how many series it holds
   ansible.builtin.uri:
     url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/query"
-    # POST, not GET. The uri module sends `body` as a request body, and the
-    # Prometheus query API reads `query` from the URL string on GET — so a GET
-    # with a form body arrives carrying no query at all and is rejected. POST
-    # with a form-urlencoded body is the form Prometheus documents for queries,
-    # and VictoriaMetrics is compatible with it.
-    #
-    # The old GET failed at the transport layer while the store was healthy and
-    # holding series, which the combined assert below then reported as "nothing
-    # is arriving".
+    # POST, because on GET the query API reads `query` from the URL and ignores
+    # the form body, so the request arrives with no query and is rejected.
     method: POST
     body_format: form-urlencoded
     body:

@@ -1,8 +1,5 @@
-# Install k3s and wait for the node to be usable.
-#
-# Runs AFTER the registry role, so /etc/rancher/k3s/registries.yaml already
-# exists and k3s reads the mirror at first start rather than needing a restart
-# that would bounce every pod.
+# Installs k3s and waits for the node. Runs after registry_mirror so k3s reads
+# the mirror config at first start.
 ---
 - name: Check whether k3s is already installed
   ansible.builtin.stat:
@@ -18,20 +15,16 @@
       sh -
     creates: "{{ k3s_binary_path }}"
   when: not k3s_binary.stat.exists
-  # The one unavoidable shell-out in this role: k3s ships an installer script
-  # and there is no module for it. `creates:` gives it idempotency, and the
-  # `when:` above makes the intent legible in --check output even though the
-  # task itself cannot run there.
+# The one shell-out: k3s ships only an installer script. `creates:` makes it
+# idempotent, and `when:` keeps the intent visible under --check.
 
 - name: Ensure k3s is running and enabled
   ansible.builtin.systemd_service:
     name: k3s
     state: started
     enabled: true
-  # Skipped under --check for the same reason as the registry's start task: on a
-  # host where k3s is not yet installed, the install above could not run, so
-  # there is no k3s.service to act on and the dry run dies here rather than
-  # reporting the rest of the plan.
+# Skipped under --check: on a fresh host the install could not run, so there is
+# no k3s.service and the dry run would stop here.
   when: not ansible_check_mode
 
 - name: Wait for the node to report Ready
@@ -44,10 +37,8 @@
     - not ansible_check_mode
     - k3s_bundled_cni | bool
 
-# The counterpart for a k3s installed without its bundled CNI. Ready cannot
-# happen until a CNI is installed on the cluster layer, so waiting for it here
-# would time out on a server that is working exactly as configured. Registration
-# is the most this layer can prove; roles/cilium owns the Ready wait.
+# Without a bundled CNI, Ready depends on the cluster layer; registration is the
+# most this layer can prove, and roles/cilium owns the Ready wait.
 - name: Wait for the node to register
   ansible.builtin.command: "{{ k3s_binary_path }} kubectl get node {{ inventory_hostname }}"
   register: k3s_node_registered
@@ -60,13 +51,8 @@
     - not (k3s_bundled_cni | bool)
 
 # --- kubeconfig for the login user -----------------------------------------
-# So that `kubectl` works over SSH without sudo. The workstation gets its own
-# copy through the kubeconfig role; this is purely for working on the box.
-#
-# The login user is asked for with become: false, deliberately. This play runs
-# as root, so ansible_user_id — and every other identity fact — reports `root`,
-# and the kubeconfig would land in /root/.kube where the SSH user cannot read
-# it. The home directory is looked up rather than assumed to be under /home.
+# For kubectl over SSH without sudo. The play runs as root, so the login user is
+# read with become: false and its home is looked up rather than assumed.
 - name: Determine the login user
   ansible.builtin.command: id -un
   become: false

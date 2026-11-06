@@ -1,9 +1,5 @@
-# Stand up the long-term metrics store.
-#
-# Runs BEFORE observability, so Prometheus has somewhere to remote-write to the
-# moment it starts. Installed the other way round, every install drops its first
-# minutes of samples and logs a connection error that reads like a
-# misconfiguration rather than an ordering problem.
+# Installs the long-term metrics store; runs before observability so Prometheus
+# has a remote-write target from its first sample.
 ---
 - name: Ensure the observability namespace exists
   kubernetes.core.k8s:
@@ -14,9 +10,7 @@
       kind: Namespace
       metadata:
         name: "{{ victoriametrics_namespace }}"
-  # Created if absent and never deleted, by this role or any other. The
-  # namespace is shared with workloads neither owns, so no role may be capable
-  # of removing it. Both this role and observability ensure it, so either can
+  # Never deleted: the namespace is shared, and ensuring it here lets this role
   # run standalone.
 
 - name: Apply VictoriaMetrics

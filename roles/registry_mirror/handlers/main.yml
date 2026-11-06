@@ -1,15 +1,8 @@
-# Both handlers exist for one situation: the mirror config changed on a host where
-# k3s was ALREADY running. They are mutually exclusive by construction, and which
-# one fires is registry_restart_k3s_on_change.
-#
-# This is the repository's worked example of "reconciled, but the operator chooses
-# the timing" — see docs/ARCHITECTURE.md, "What is reconciled, and what is only
-# declared". The file on disk is always correct; only its application is deferred.
+# For a mirror config change on a host where k3s is already running. Exactly one
+# fires, chosen by registry_restart_k3s_on_change.
 ---
-# k3s reads registries.yaml only at start. If it is already running when the
-# mirror config changes, the config is correct on disk and inert in the process
-# — the failure appears later as an ImagePullBackOff naming an image, not a
-# config.
+# k3s reads registries.yaml only at start, so a running k3s ignores the change
+# until restarted.
 - name: Restart k3s to read the mirror config
   ansible.builtin.systemd_service:
     name: k3s

@@ -1,0 +1,45 @@
+# Defaults for Open WebUI, the chat front end for revenant's llama-server,
+# installed from its Helm chart.
+---
+open_webui_chart_repo_url: https://helm.openwebui.com/
+open_webui_release: seance
+open_webui_namespace: open-webui
+
+# The name the chart gives its StatefulSet and Service: release plus chart name.
+# The wait task, the verify gate and the Gateway route all address it.
+open_webui_fullname: "{{ open_webui_release }}-open-webui"
+
+# Pinned in group_vars/all.yml; restated so the role reads on its own.
+open_webui_chart_version: "18.0.0"
+
+# Routed through the necropolis Gateway (group_vars/necropolis.yml sets the
+# route); the hostname needs a DNS record.
+open_webui_hostname: seance.lan
+open_webui_url: "https://{{ open_webui_hostname }}"
+
+# Holds accounts, uploaded documents, the vector store and chat history, none of
+# which can be re-downloaded. Longhorn can grow the volume later, never shrink it.
+open_webui_storage_class: longhorn
+open_webui_storage_size: 10Gi
+
+# Restated rather than read from roles/llama_server, which never runs against
+# this cluster. The port is shared through group_vars/all.yml.
+open_webui_llm_host: revenant.lan
+open_webui_llm_url: "http://{{ open_webui_llm_host }}:{{ llama_server_node_port }}/v1"
+
+# The Secret this role writes from llama_server_key_file. Same names as on
+# revenant, so the two are recognisably the same key.
+open_webui_key_secret: llama-server-api-key
+open_webui_key_secret_key: api-key
+
+# The embedding model runs in this pod on the CPU. No CPU limit: throttling
+# would stall document embedding, and the request already reserves a share.
+open_webui_resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+open_webui_wait_retries: 30
+open_webui_wait_delay: 10

@@ -1,8 +1,5 @@
-# Gates for kubeadm node prerequisites.
-#
-# Each reads the kernel or the package database directly. The files this role
-# writes are only instructions for the next boot; these are what kubeadm's own
-# preflight will look at.
+# Gates for kubeadm node prerequisites. They read live kernel and package state,
+# which is what kubeadm's preflight checks, not the files written for next boot.
 ---
 - name: Read the loaded kernel modules
   ansible.builtin.slurp:

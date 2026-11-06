@@ -1,22 +1,12 @@
-# Form, or extend, a kubeadm HA control plane across every host in the play.
-#
-# The play's hosts are the cluster's nodes. The first of them initialises when
-# no cluster exists; every node that is not yet a member joins as a control
-# plane, one at a time. On a converged cluster every task here is a no-op.
-#
-# ORDER IS THE WHOLE POINT, as it was in k8s-aio's lib/kubeadm.sh:
+# Forms or extends a kubeadm HA control plane across the play's hosts. Nodes end
+# NotReady until the cluster layer installs Cilium.
 #
 #   init node   certs + kubeconfigs -> kube-vip (super-admin, loopback)
 #               -> the rest of init -> kube-vip (admin, loopback)
 #   the others  join (the init node already holds the VIP) -> kube-vip (admin)
 #
-# Since Kubernetes 1.29 init's admin.conf has no cluster-admin binding until
-# init completes; kube-vip mounting it during bootstrap crash-loops on RBAC and
-# init hangs waiting for a VIP that never comes. super-admin.conf is bound to
-# system:masters, which is why it is swapped out the moment init finishes.
-#
-# Nodes end NotReady. That is correct: there is no CNI until the cluster layer
-# installs Cilium.
+# Since Kubernetes 1.29 admin.conf has no RBAC until init completes, so kube-vip
+# bootstraps on super-admin.conf and is switched to admin.conf afterwards.
 ---
 # ---- where things are ----------------------------------------------------------
 
@@ -30,8 +20,7 @@
       and belongs in the cluster's group_vars (inventory/group_vars/<cluster>.yml).
     success_msg: "API endpoint: {{ kubeadm_control_plane_endpoint }}"
 
-# The node's address and interface are facts: the ones carrying the default
-# route, which on a single-NIC wired node is the LAN.
+# The default-route interface, which is the LAN on these single-NIC nodes.
 - name: Settle this node's address and interface
   ansible.builtin.set_fact:
     kubeadm_control_plane_node_ip: "{{ ansible_facts['default_ipv4']['address'] }}"
@@ -73,8 +62,7 @@
          | map('extract', hostvars, ['ansible_facts', 'default_ipv4', 'address'])
          | list }}
 
-# ARP only reaches the local segment. A VIP behind a router would be announced
-# into a network that never sees it.
+# kube-vip announces by ARP, which only reaches the local segment.
 - name: Read the route to the VIP
   ansible.builtin.command: "ip -4 route get {{ kubeadm_control_plane_vip }}"
   register: kubeadm_control_plane_vip_route
@@ -95,22 +83,15 @@
 
 # ---- what already exists -------------------------------------------------------
 
-# kubelet.conf is written by init and by join, and by nothing else. Its
-# presence is membership.
-#
-# Including after a FAILED init: the kubeconfig phase writes it early, so a
-# node whose init died later looks like a member that serves nothing. The
-# recovery is `kubeadm reset -f` on that node, then run again. Detecting a
-# half-formed node automatically would mean guessing which half, and a wrong
-# guess here re-initialises a cluster.
+# kubelet.conf marks membership. A failed init also leaves it behind; recover
+# with `kubeadm reset -f` on that node rather than guessing here.
 - name: Check for this node's cluster membership
   ansible.builtin.stat:
     path: "{{ kubeadm_control_plane_kubelet_conf }}"
   register: kubeadm_control_plane_member
 
-# A plain TCP connect, from the node. wait_for would do the same, but its
-# timeout is indistinguishable from success once failed_when is overridden;
-# an exit code is not.
+# A TCP connect with an exit code, because wait_for's timeout looks like
+# success once failed_when is overridden.
 - name: Check whether the API answers on the VIP
   ansible.builtin.command:
     argv:
@@ -124,11 +105,8 @@
   failed_when: false
   check_mode: false
 
-# The first host of the play initialises — by position, which names no machine.
-# Position alone is unsafe: under --limit the first host is whoever was named.
-# So formation also requires that no node in the play is a member AND that
-# nothing answers on the VIP. A live API means a cluster exists, and a node
-# that is not a member then joins it rather than founding a second one.
+# The play's first host initialises, but only if no host is a member and nothing
+# answers on the VIP, so a --limit run cannot found a second cluster.
 - name: Settle the cluster's state
   ansible.builtin.set_fact:
     kubeadm_control_plane_init_host: "{{ ansible_play_hosts_all | first }}"
@@ -158,9 +136,8 @@
          if kubeadm_control_plane_forming
          else 'members in this run: ' ~ kubeadm_control_plane_members | join(', ') }}
 
-# Before init only. With no cluster and no API, nothing should answer on the
-# VIP at all. Something that does is another machine holding the address, and
-# kube-vip would fight it for ARP.
+# Before init, anything answering on the VIP is another machine kube-vip would
+# fight for ARP.
 - name: Check that the VIP is unclaimed
   ansible.builtin.command: "ping -c 1 -W 1 {{ kubeadm_control_plane_vip }}"
   register: kubeadm_control_plane_vip_ping
@@ -187,15 +164,8 @@
     - inventory_hostname == kubeadm_control_plane_init_host
 
 # ---- init ------------------------------------------------------------------------
-# In phases, and this is a departure from k8s-aio made on purpose. It rendered
-# kube-vip from super-admin.conf BEFORE `kubeadm init`, through `sed ... | tee`
-# — but super-admin.conf does not exist until init writes it, so sed failed,
-# tee wrote an empty file, and the pipe reported success.
-#
-# Here the certificates and kubeconfigs are generated first, kube-vip's
-# loopback kubeconfig is rendered from a super-admin.conf that now exists, and
-# init then runs with those phases skipped. Every other phase, including the
-# wait for the VIP, runs exactly as a plain init would.
+# Run in phases so super-admin.conf exists before kube-vip is rendered from it;
+# init then runs with the certs and kubeconfig phases skipped.
 
 - name: Initialise the cluster
   when:
@@ -231,8 +201,8 @@
       vars:
         kubeadm_control_plane_vip_source: "{{ kubeadm_control_plane_super_admin.content | b64decode }}"
 
-    # addon/kube-proxy skipped because Cilium replaces kube-proxy entirely;
-    # installing it and removing it later leaves stale iptables rules behind.
+    # kube-proxy is skipped because Cilium replaces it, and removing it later
+    # leaves stale iptables rules.
     - name: Run the rest of kubeadm init
       ansible.builtin.command: >-
         kubeadm init --config {{ kubeadm_control_plane_init_config }}
@@ -259,12 +229,8 @@
       | select | list | length > 0
     - not ansible_check_mode
   block:
-    # Once, for every joiner. `upload-certs` re-encrypts the cluster's CA
-    # material under a NEW key on every call, so generating one per node would
-    # invalidate the key the previous node was given.
-    #
-    # Fresh each run: bootstrap tokens expire after 24 h and the certificate key
-    # after 2 h, so nothing from init's own output can be reused later.
+    # Issued once per run for all joiners: each `upload-certs` call rotates the
+    # key and would invalidate the previous node's. Tokens and keys expire, so never reused.
     - name: Issue a bootstrap token
       ansible.builtin.command: kubeadm token create --print-join-command --ttl 1h
       register: kubeadm_control_plane_join_command
@@ -291,8 +257,7 @@
         kubeadm_control_plane_join_cert_key: "{{ kubeadm_control_plane_upload_certs.stdout_lines | last | trim }}"
       no_log: true
 
-    # The VIP can blink here: init's final kube-vip swap recreates the pod on
-    # the init node, and with one kube-vip there is no one else to hold it.
+    # The VIP can blink while init's kube-vip swap recreates the only kube-vip pod.
     - name: Wait for the API on the VIP
       ansible.builtin.wait_for:
         host: "{{ kubeadm_control_plane_vip }}"
@@ -310,9 +275,8 @@
       when: kubeadm_control_plane_joining
       no_log: true
 
-    # One node at a time. Each control-plane join adds an etcd member, and etcd
-    # adds members one at a time; two concurrent joins can leave the second
-    # waiting on a quorum the first has not finished changing.
+    # Serial, because etcd adds members one at a time and concurrent joins can
+    # stall on quorum.
     - name: Join as a control-plane node
       ansible.builtin.command: kubeadm join --config {{ kubeadm_control_plane_join_config }}
       throttle: 1
@@ -326,19 +290,15 @@
       when: kubeadm_control_plane_joining
 
 # ---- kube-vip, on every node --------------------------------------------------------
-# admin.conf everywhere now: on the init node this is the swap away from
-# super-admin.conf; on a joiner it is kube-vip's first appearance. On a
-# converged node it renders identical bytes and nothing restarts.
+# admin.conf everywhere now; on a converged node nothing changes or restarts.
 
 - name: Check for admin.conf
   ansible.builtin.stat:
     path: "{{ kubeadm_control_plane_admin_conf }}"
   register: kubeadm_control_plane_admin
 
-# A control-plane join writes admin.conf. k8s-aio regenerated it when missing,
-# with `kubeadm init phase kubeconfig admin` and no configuration — which
-# writes one against kubeadm's defaults rather than this cluster's endpoint.
-# Refusing is the honest outcome.
+# Not regenerated when missing: doing so without the config would target
+# kubeadm's defaults rather than this cluster's endpoint.
 - name: Assert admin.conf exists
   ansible.builtin.assert:
     that:
@@ -364,7 +324,6 @@
   when: kubeadm_control_plane_admin.stat.exists
 
 # ---- cluster-wide, once ------------------------------------------------------------
-# Through the API, from one member, with the admin credentials on that node.
 
 - name: Settle which member runs cluster-wide tasks
   ansible.builtin.set_fact:
@@ -381,10 +340,8 @@
   check_mode: false
   when: not ansible_check_mode or not kubeadm_control_plane_forming
 
-# All three are schedulable by design: with three machines, reserving them for
-# the control plane would leave nowhere to run workloads. Only nodes that still
-# carry the taint are touched, so a converged cluster reports no change — where
-# k8s-aio ran `taint --all ... || true` and could not tell.
+# All nodes are schedulable, since three machines leave nowhere else for
+# workloads. Only still-tainted nodes are touched, so a converged run is unchanged.
 - name: Remove the control-plane taint
   ansible.builtin.command: >-
     {{ kubeadm_control_plane_kubectl }} taint node {{ item }}
@@ -397,15 +354,8 @@
   changed_when: true
 
 # ---- kubelet serving certificates ------------------------------------------------------
-# serverTLSBootstrap has each kubelet request its serving certificate through
-# the CSR API. The cluster does not approve these by itself, because nothing in
-# it can verify that a node owns the addresses it asks for. This role can: it
-# gathered every node's addresses as facts.
-#
-# Approved ONLY when the requester is system:node:<name> for a node in this
-# play, and every IP and DNS name requested belongs to that node. Anything else
-# stays Pending for a human. A CSR that arrives after this runs is picked up by
-# the next run, and the verify gate reports it until then.
+# The cluster cannot verify kubelet serving CSRs itself; this role approves one
+# only if it comes from a play node and every name and IP belongs to that node.
 
 - name: Read the certificate signing requests
   ansible.builtin.command: "{{ kubeadm_control_plane_kubectl }} get csr -o json"
@@ -427,8 +377,6 @@
          | list }}
   run_once: true
 
-# The request is PEM inside base64. Decoded here, read by openssl on the node,
-# where it is installed.
 - name: Read the names each pending request asks for
   ansible.builtin.command:
     cmd: openssl req -noout -text

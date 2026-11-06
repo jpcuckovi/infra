@@ -1,9 +1,5 @@
-# Gates for containerd.
-#
-# Asserts what the running daemon reports, not what is on disk. A config.toml
-# with the right lines proves the template rendered; `containerd config dump`
-# proves containerd parsed it and merged it the way kubelet will experience it.
-# A misplaced table header renders perfectly and is silently ignored.
+# Gates for containerd. Asserts `containerd config dump`, not the file on disk,
+# since a line under a misplaced table header renders fine and is ignored.
 ---
 - name: Read the running containerd version
   ansible.builtin.command: "{{ containerd_bin }} --version"

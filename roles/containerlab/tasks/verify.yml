@@ -1,9 +1,5 @@
-# Gates for a containerlab host.
-#
-# Every assert here asks the KERNEL or the package database, never the task that
-# ran earlier. A converge that reported changed=0 proves the playbook believed
-# its own work; it does not prove a module survived the last reboot, and after a
-# power cycle that difference is the entire question.
+# Gates for a containerlab host. Each asks the kernel or dpkg, since changed=0
+# does not prove a module survived the last reboot.
 ---
 - name: Read the loaded kernel modules
   ansible.builtin.stat:
@@ -14,11 +10,7 @@
     label: "{{ item }}"
   check_mode: false
 
-# /sys/module/<name> rather than /proc/modules, because it is present for a
-# built-in module as well as a loaded one. A kernel that compiles veth in rather
-# than shipping it as a module is correct and would fail a /proc/modules grep —
-# the gate would be reporting on how the kernel was built, not on whether the
-# capability is there.
+# /sys/module rather than /proc/modules, which omits built-in modules.
 - name: Assert every topology module is present in the running kernel
   ansible.builtin.assert:
     that:
@@ -47,11 +39,8 @@
   failed_when: false
   check_mode: false
 
-# Checked separately from the loaded state above, because the two fail at
-# different times. Modules loaded but not persisted works perfectly until the
-# next reboot; persisted but not loaded means the file is right and something
-# stopped systemd-modules-load from acting on it. One assert covering both would
-# name the wrong cause half the time.
+# Separate from the loaded check because the two fail at different times and
+# have different causes.
 - name: Assert every module is declared for the next boot
   ansible.builtin.assert:
     that:
@@ -100,9 +89,7 @@
   failed_when: false
   check_mode: false
 
-# Rootless, so this runs as the connecting user and not under become. A podman
-# that only answers as root is a podman containerlab cannot drive, and the whole
-# reason for choosing it over docker was to avoid a root-equivalent group.
+# Runs without become, because podman was chosen to work rootless.
 - name: Assert podman runs as this user
   ansible.builtin.assert:
     that:

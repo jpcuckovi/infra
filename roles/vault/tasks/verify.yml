@@ -1,0 +1,235 @@
+# Gates for Vault. Health is read through the Gateway, the path AWX will use,
+# the init file is checked because it is the only way to unseal, and AWX's
+# access is probed as AWX.
+---
+# /sys/health answers without a token and encodes the state in its status:
+# 200 active, 429 standby, 501 uninitialized, 503 sealed.
+- name: Request Vault's health over HTTPS, verifying against the workstation CA
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/health"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 429, 501, 503]
+  register: vault_health
+  failed_when: false
+  check_mode: false
+
+- name: Assert Vault is initialized, unsealed and active
+  ansible.builtin.assert:
+    that:
+      - vault_health.status == 200
+    fail_msg: >-
+      {{ vault_url }}/v1/sys/health returned {{ vault_health.status }}
+      ({{ vault_health_states[vault_health.status] | default(vault_health.msg | default('no response')) }}).
+
+      A sealed Vault is unsealed by running the necropolis playbook again, which
+      reads the key from {{ vault_init_file }}. Otherwise check:
+        kubectl --context {{ kubeconfig_context }} -n {{ vault_namespace }} exec {{ vault_release }}-0 -- vault status
+    success_msg: "Vault {{ vault_health.json.version | default('') }} active and unsealed"
+  vars:
+    vault_health_states:
+      429: unsealed standby, with no active node to serve requests
+      501: not initialized
+      503: sealed
+
+- name: Read the Vault server pods
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Pod
+    namespace: "{{ vault_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ vault_release }}"
+      - component=server
+  register: vault_pods
+  check_mode: false
+
+# Ready is the readiness probe's verdict, which passes only once unsealed.
+- name: Assert every Vault server pod is Ready
+  ansible.builtin.assert:
+    that:
+      - vault_pods.resources | length == vault_replicas | int
+      - vault_ready | length == vault_replicas | int
+    fail_msg: >-
+      Vault server pods: {{ vault_pods.resources | map(attribute='metadata.name') | join(', ') or 'none' }}
+      (expected {{ vault_replicas }}). Ready: {{ vault_ready | join(', ') or 'none' }}.
+      Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ vault_namespace }} get pods
+    success_msg: "{{ vault_ready | join(', ') }} Ready"
+  vars:
+    vault_ready: >-
+      {{ vault_pods.resources
+         | community.general.json_query("[?status.conditions[?type=='Ready' && status=='True']].metadata.name") }}
+
+- name: Read the Vault data volumes
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: PersistentVolumeClaim
+    namespace: "{{ vault_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ vault_release }}"
+      - component=server
+  register: vault_pvcs
+  check_mode: false
+
+- name: Assert each data volume is bound on the expected storage class
+  ansible.builtin.assert:
+    that:
+      - vault_pvcs.resources | length == vault_replicas | int
+      - vault_pvcs_bound | length == vault_replicas | int
+    fail_msg: >-
+      Vault volumes: {{ vault_pvcs.resources | map(attribute='metadata.name') | join(', ') or 'none' }}
+      (expected {{ vault_replicas }}). Bound on {{ vault_storage_class }}:
+      {{ vault_pvcs_bound | join(', ') or 'none' }}.
+      Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ vault_namespace }} get pvc
+    success_msg: "{{ vault_pvcs_bound | join(', ') }} bound on {{ vault_storage_class }}"
+  vars:
+    vault_pvcs_bound: >-
+      {{ vault_pvcs.resources
+         | selectattr('status.phase', 'equalto', 'Bound')
+         | selectattr('spec.storageClassName', 'equalto', vault_storage_class)
+         | map(attribute='metadata.name') | list }}
+
+- name: Read the init file on the workstation
+  ansible.builtin.stat:
+    path: "{{ vault_init_file }}"
+  register: vault_init_stat
+  check_mode: false
+
+# Without the file Vault cannot be unsealed after its next restart, so a
+# running Vault with no file is a failure waiting for a power cut.
+- name: Assert the init file exists and only its owner can read it
+  ansible.builtin.assert:
+    that:
+      - vault_init_stat.stat.exists
+      - vault_init_stat.stat.mode == '0600'
+    fail_msg: >-
+      {{ vault_init_file }} is
+      {{ 'mode ' ~ vault_init_stat.stat.mode if vault_init_stat.stat.exists else 'missing' }}.
+      It holds the only unseal key and must exist with mode 0600. If it is
+      missing, restore it from backup before Vault next restarts.
+    success_msg: "init file present, mode 0600"
+
+# The AWX-only property: AWX's service account logs in and may read its own
+# path and nothing else, and another account in its namespace is refused.
+# The service account token is requested without an audience, so it carries
+# the same default audience as the one mounted into AWX's pods.
+- name: Request a token for AWX's service account
+  ansible.builtin.command: >-
+    kubectl --context {{ kubeconfig_context }} -n {{ vault_awx_namespace }}
+    create token {{ vault_awx_service_account }} --duration 10m
+  register: vault_awx_jwt
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Log in to Vault as AWX
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/login"
+    method: POST
+    body_format: json
+    body:
+      role: "{{ vault_awx_role }}"
+      jwt: "{{ vault_awx_jwt.stdout }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 400, 403]
+  register: vault_awx_login
+  check_mode: false
+  no_log: true
+
+- name: Assert AWX's service account can log in
+  ansible.builtin.assert:
+    that:
+      - vault_awx_login.status == 200
+    fail_msg: >-
+      Login as {{ vault_awx_namespace }}/{{ vault_awx_service_account }} through
+      auth/{{ vault_k8s_auth_mount }}/role/{{ vault_awx_role }} returned
+      {{ vault_awx_login.status }}: {{ vault_awx_login.json.errors | default([]) | join('; ') }}
+    success_msg: "AWX's service account logs in to Vault"
+
+- name: Name the paths to probe
+  ansible.builtin.set_fact:
+    vault_awx_probe_paths:
+      - "{{ vault_kv_mount }}/data/awx/probe"
+      - "{{ vault_kv_mount }}/data/other/probe"
+      - "sys/policies/acl/{{ vault_awx_policy }}"
+
+- name: Ask Vault what AWX's token may do
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/capabilities-self"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_awx_login.json.auth.client_token }}"
+    body_format: json
+    body:
+      paths: "{{ vault_awx_probe_paths }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: vault_awx_caps
+  check_mode: false
+  no_log: true
+
+- name: Revoke AWX's verification token
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/token/revoke-self"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_awx_login.json.auth.client_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  check_mode: false
+  no_log: true
+
+- name: Assert AWX reads its own path and nothing else
+  ansible.builtin.assert:
+    that:
+      - vault_awx_caps_found == [['read'], ['deny'], ['deny']]
+    fail_msg: >-
+      Capabilities for {{ vault_awx_probe_paths | join(', ') }} were
+      {{ vault_awx_caps_found }}; expected read, deny, deny. Check:
+        vault policy read {{ vault_awx_policy }}
+    success_msg: "AWX may read {{ vault_kv_mount }}/data/awx/* and nothing else"
+  vars:
+    vault_awx_caps_found: >-
+      {{ vault_awx_probe_paths | map('extract', vault_awx_caps.json) | list }}
+
+- name: Request a token for another service account in AWX's namespace
+  ansible.builtin.command: >-
+    kubectl --context {{ kubeconfig_context }} -n {{ vault_awx_namespace }}
+    create token default --duration 10m
+  register: vault_other_jwt
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Attempt to log in to Vault as that account
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/login"
+    method: POST
+    body_format: json
+    body:
+      role: "{{ vault_awx_role }}"
+      jwt: "{{ vault_other_jwt.stdout }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 400, 403]
+  register: vault_other_login
+  check_mode: false
+  no_log: true
+
+- name: Assert Vault refuses any other service account
+  ansible.builtin.assert:
+    that:
+      - vault_other_login.status != 200
+    fail_msg: >-
+      {{ vault_awx_namespace }}/default logged in through role
+      {{ vault_awx_role }}, so the role is not bound to
+      {{ vault_awx_service_account }} alone. Check:
+        vault read auth/{{ vault_k8s_auth_mount }}/role/{{ vault_awx_role }}
+    success_msg: "{{ vault_awx_namespace }}/default refused ({{ vault_other_login.status }})"

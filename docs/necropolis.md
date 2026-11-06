@@ -1,7 +1,8 @@
 # necropolis: the bare-metal kubeadm build
 
-**Status: built and running. Phases 1 to 3 are complete; phase 4,
-observability, is not built.**
+**Status: built and running. Phases 1 to 4 are complete. The clabernetes
+controller is installed with no topology deployed, and AWX and Vault are
+running.**
 
 ## What necropolis is
 
@@ -73,11 +74,13 @@ than one in emergency mode; Longhorn's per-disk UUID marks the empty
 mountpoint unschedulable instead of filling the boot drive.
 
 **One UPS feeds all three nodes, and spectre serves it.** The UPS is cabled
-over USB to spectre. `roles/nut` runs there as a netserver and on cadaver and
-banshee as a netclient, selected by `nut_server_host` in
-`group_vars/necropolis.yml`. The clients' shared password is held on the
-workstation, outside the repository, so a client can be configured while
-spectre is down. `nut_killpower` stays false.
+over USB to spectre. `roles/nut` runs there as a netserver and as a netclient
+on every other host the UPS powers: cadaver, banshee, phantom and wraith. Those
+hosts form the `ups_main` inventory group, and `nut_server_host` in
+`group_vars/ups_main.yml` names the server once for all of them, because the
+UPS belongs to the power domain rather than to the cluster. The clients' shared
+password is held on the workstation, outside the repository, so a client can be
+configured while spectre is down. `nut_killpower` stays false.
 
 **containerd owns the registry configuration.** `roles/registry_mirror` writes
 k3s's `registries.yaml`, which kubeadm nodes do not have. containerd reads
@@ -276,8 +279,9 @@ workstation, against the `necropolis` context.
 
 **Done by hand before the first run:**
 
-1. Router DNS: `hubble.lan` → the `.90` address. `grafana.lan` → a CNAME to
-   `phantom.lan` (the estate's one Grafana, at `:30300`).
+1. Router DNS: `hubble.lan`, `awx.lan` and `vault.lan` → the `.90` address.
+   `grafana.lan` → a CNAME to `phantom.lan` (the estate's one Grafana, at
+   `:30300`).
 2. After the run that creates the CA: trust it in the macOS System keychain,
    once. The playbook prints the `security add-trusted-cert` command with
    the path. Firefox keeps its own store and needs it imported separately.
@@ -345,18 +349,217 @@ generated Service matches the `gateway` pool. HTTPS terminates there with a
 90-day certificate from `necropolis-ca`, written as an explicit Certificate
 rather than relying on cert-manager's opt-in gateway-shim. HTTP only
 redirects. One HTTPRoute per entry in `gateway_routes`, living beside its
-Service; `hubble.lan` is the only one.
+Service: `hubble.lan`, `awx.lan` and `vault.lan`. Every hostname shares the one
+address, and the Gateway chooses the route by the requested hostname.
+
+The role creates each route's namespace before the route. A route's Service
+usually comes from a role later in the cluster layer, whose namespace would not
+yet exist on a fresh build. Helm installs into an existing namespace without
+complaint, so the later role is unaffected.
 
 The last gate is end to end from the workstation: each hostname resolves to
 `.90`, and HTTPS to it returns 200 while verifying against the workstation CA:
 DNS, L2 announcement, the Gateway, the certificate chain and the route,
 proved together.
 
-## Phase 4: observability (not built)
+## Phase 4: observability
 
-`roles/observability`, whose `kubeadm_clusters` scrape branch already exists.
-`prometheus_external_labels: {cluster: necropolis}` in group_vars; Grafana,
-Jaeger and the discovery contract off, as on every host but phantom.
+`roles/observability`, last in the cluster layer, with no role change: its
+`kubeadm_clusters` branch scrapes the scheduler, the controller manager and
+etcd on the ports phase 2 bound off-loopback, and leaves kube-proxy off
+because Cilium replaced it.
+
+Prometheus remote-writes to phantom's VictoriaMetrics through `metrics.lan`,
+the URL the role builds for every cluster outside `metrics_stores`. The series
+carry `cluster="necropolis"`, and phantom's Grafana shows them under that
+label with no change on phantom.
+
+Set in `group_vars/necropolis.yml`:
+
+- `prometheus_external_labels: {cluster: necropolis}`. `necropolis` is nested
+  into `observability_hosts`, so preflight asserts the label before anything
+  is installed.
+- Grafana, Jaeger and the discovery contract off, as on every host but
+  phantom.
+- `prometheus_storage_class: longhorn`. The role's default, `local-path`,
+  exists only on k3s. The 20Gi scrape buffer is replicated three times by the
+  default class.
+
+The gates are the role's own: one Prometheus StatefulSet on a persistent
+volume, the live retention, cluster label and remote-write target, and
+`/-/ready` answering on the Prometheus NodePort.
+
+## clabernetes (controller only)
+
+The controller and its host prerequisites, and no topology. Topologies belong
+to the repository that varies them, and none is deployed here.
+
+`necropolis` is nested into `clabernetes_hosts`. `clabernetes_host` joins the
+host layer on all three nodes and `clabernetes` ends the cluster layer.
+
+**Host layer.** The five kernel modules ship in the nodes' generic kernel, so
+`clabernetes_modules_extra_package` stays empty. `base_sysctl` is restated in
+`group_vars/necropolis.yml` with the inotify ceiling at 32768, as on revenant:
+the role's gate requires headroom for 14 cEOS nodes at 1250 instances each,
+and the estate default of 8192 fails it. Every node carries the full ceiling,
+because nothing pins how a topology spreads across them.
+
+**Cluster layer.** `roles/clabernetes` was written for k3s, and two of its
+settings name where the node's containerd lives. Both are now discriminated on
+`kubeadm_clusters` membership in the role's defaults:
+
+| Setting           | k3s                                                 | kubeadm                           |
+| ----------------- | --------------------------------------------------- | --------------------------------- |
+| `criSockOverride` | `/run/k3s/containerd/containerd.sock`               | `/run/containerd/containerd.sock` |
+| `criHostsDir`     | `/var/lib/rancher/k3s/agent/etc/containerd/certs.d` | `/etc/containerd/certs.d`         |
+
+The role passes them, and the manager's replica count, as chart values.
+`charts/values/clabernetes.yaml` keeps only what every cluster shares. The
+gate compares the live Config against the same variables, so it checks the
+kubeadm paths here and the k3s paths on revenant.
+
+One manager replica, as on revenant. The controller acts only while a topology
+is applied or changed, so standbys buy nothing a lab would notice.
+
+`socketLB.hostNamespaceOnly`, which clabernetes' VXLAN links depend on, is in
+the shared `charts/values/cilium.yaml` and is already live here.
+
+**Not yet known.** A topology on necropolis is spread across nodes, so its
+links cross the pod network between machines. The lab-link MTU that
+ceos-diag-agent measured on a single node is not established for that path.
+
+## AWX
+
+`roles/awx`, last in the cluster layer: after `longhorn`, because its database
+claims a volume, and after `gateway`, because the Gateway is its only way in.
+AWX is the upstream of Ansible Automation Platform and has the same model of
+projects, inventories, credentials and job templates, behind the same REST API.
+
+**Installed through its operator, in two steps.** The role installs the AWX
+Operator chart, then applies one `AWX` resource rendered from
+`templates/awx.yaml.j2`. The operator builds everything else from that
+resource: Postgres, the web and task Deployments, their Services and Secrets,
+and the database migrations. Helm's wait covers only the operator's own pod, so
+the role then waits for the resource's `Successful` condition, which the
+operator sets when a reconcile completes. A first build takes several minutes.
+
+**Postgres runs on Longhorn and needs `postgres_data_volume_init`.** The
+operator's Postgres image runs as a non-root user, and a new Longhorn volume is
+mounted owned by root. Without the setting, Postgres cannot create its data
+directory and crash-loops, and the web and task pods wait on it indefinitely.
+The setting adds an init container that hands the volume to the Postgres user.
+The storage class is named in the resource rather than left to the cluster
+default. The Postgres major version, and with it the claim's name, is the one
+the operator release ships.
+
+**No ingress of its own.** The Service is `ClusterIP`, and the operator's
+`ingress_type` and `hostname` are left unset. `awx.lan` is an entry in
+`gateway_routes`, so AWX gets the cluster certificate and the HTTP redirect
+like every other UI.
+
+**The admin password stays in the cluster.** The operator generates it into the
+`awx-admin-password` Secret at first install. Nothing in the repository
+carries it.
+
+The gates:
+
+- the `AWX` resource reports `Successful`, which covers every workload the
+  operator built, where a Deployment's replica count could be healthy while a
+  migration failed
+- the Postgres claim is `Bound`, on the storage class the role names
+- `https://awx.lan/api/v2/ping/` answers 200 while verifying against the
+  workstation CA, and reports a `controlplane` instance group with capacity
+  above zero, which proves the web pod reached the database and the task pod
+  registered. The `default` instance group is not checked: it is a container
+  group that starts a pod per job, so it always reports zero capacity.
+
+## Vault
+
+`roles/vault`, after `gateway`, because the role initializes and unseals
+Vault through its route. It holds the secrets AWX's jobs use and nothing else;
+`docs/ARCHITECTURE.md` records why no playbook reads from it.
+
+**One server on Raft storage.** Raft is Vault's integrated storage, so no
+external database is needed, and it supports snapshots. One replica, because
+Longhorn already keeps three copies of the volume, and every additional server
+is one more to unseal after each power cut. Losing a node costs a minute or two
+while the pod moves and is unsealed again. The Raft configuration carries a
+`retry_join` to `vault-0`, so raising `vault_replicas` adds members to the
+existing cluster rather than rebuilding it. The chart's agent injector is off:
+AWX reads Vault's API, and nothing needs secrets injected into pods.
+
+**TLS ends at the Gateway.** `vault.lan` is an entry in `gateway_routes`, like
+the other UIs, and Vault's listener is plain HTTP inside the cluster. The route
+targets the `vault` Service, which publishes pods that are not Ready, so the API
+and UI answer while Vault is sealed. The `vault-active` Service would go dark at
+exactly the moment it was needed.
+
+**Helm does not wait.** The chart's readiness probe is `vault status`, which
+fails while Vault is sealed, so a Helm wait would always time out. The role
+waits for the pods to be Running instead.
+
+**Initialization and unsealing go through Vault's HTTP API**, on endpoints that
+need no token:
+
+1. `/v1/sys/seal-status` reports whether Vault is initialized and sealed.
+2. If Vault is uninitialized and the init file already exists, the role stops.
+   That combination means Vault's storage was lost or replaced, and
+   initializing would overwrite the only key to the old data.
+3. Otherwise an uninitialized Vault is initialized through `/v1/sys/init` with
+   one key share, and the response is written straight to the init file on the
+   workstation, mode 0600 in a 0700 directory. The response is shown once.
+4. A sealed Vault is unsealed through `/v1/sys/unseal`, with the key read from
+   that file. A Vault initialized in the same run is still sealed, so this
+   runs then too, and recovery after a power cut is a run of the playbook.
+
+The key and token are sent and received with `no_log`, so neither appears in
+the run's output. Using the API rather than `vault` commands in the pod keeps
+the key out of process arguments as well.
+
+**AWX is the only client, through Kubernetes auth.** Once Vault is unsealed,
+`tasks/configure.yml` sets up three things, reading each first and writing it
+only when it is missing or different:
+
+- a KV v2 engine at `secret/`. An existing v1 engine there stops the run,
+  because the policy below would apply to it and never match.
+- an `awx` policy granting `read` on `secret/data/awx/*` and nothing else. KV v2
+  serves values under `data/`, so that is the path granted.
+- a `kubernetes` auth method with an `awx` role, bound to the `awx` service
+  account in the `awx` namespace. The operator names that account after the
+  `AWX` object.
+
+AWX logs in with the token Kubernetes mounts into its pods, so no login secret
+exists to store, copy or leak. No reviewer token is configured: Vault calls
+TokenReview with its own service account, which the chart binds to
+`system:auth-delegator`. The role's audience is kubeadm's service account
+issuer, the default audience of a mounted token. AWX's tokens last 20 minutes,
+capped at an hour by the mount. AWX logs in again at each job launch, so a
+short lifetime costs nothing.
+
+**Configuration does not use the root token directly.** `uri` logs its request
+headers at `-vvv`, so a root token in a header would reach the terminal of
+anyone debugging a run. The root token is used once, with `no_log`, to issue a
+child token that expires after five minutes. That token is revoked when
+configuration ends, even if a step fails.
+
+The gates:
+
+- `/v1/sys/health` returns 200 through the Gateway, verifying against the
+  workstation CA, which means initialized, unsealed and active. The failure
+  names the state the status code encodes: 429 standby, 501 uninitialized,
+  503 sealed
+- every server pod is Ready, which the readiness probe allows only once
+  unsealed
+- every data volume is Bound on the storage class the role names
+- the init file exists with mode 0600, because without it Vault cannot be
+  unsealed after its next restart
+- a token issued to AWX's service account logs in through the `awx` role, and
+  `sys/capabilities-self` reports `read` on `secret/data/awx/` and `deny` on
+  another KV path and on AWX's own policy. The token is requested without an
+  audience, so a mismatch with the pods' mounted tokens fails here rather than
+  at a job launch.
+- the `default` service account in the same namespace is refused, which
+  proves the role is bound to the account and not just to the namespace
 
 ## Pins
 
@@ -373,6 +576,8 @@ Kubernetes 1.36.
 | Longhorn     | v1.12.1                | Latest; requires Kubernetes ≥ 1.25.                                      | `group_vars/all.yml` |
 | cert-manager | v1.21.2                | Latest.                                                                  | `group_vars/all.yml` |
 | Gateway API  | v1.6.1 (v1.6.2 is out) | The version Cilium 1.20 documents; its CRDs precede Cilium.              | `group_vars/all.yml` |
+| AWX Operator | chart 3.2.1            | Latest. Operator 2.19.1, which deploys AWX 24.6.1.                       | `group_vars/all.yml` |
+| Vault        | chart 0.34.1           | Latest. Deploys Vault 2.0.4.                                             | `group_vars/all.yml` |
 
 Ubuntu 26.04's own containerd package is still not used, for the SIGSEGV
 recorded in roles/containerd. That finding comes from virtual machines and was

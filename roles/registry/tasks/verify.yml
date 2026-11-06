@@ -18,11 +18,8 @@
       Check: systemctl status local-registry, journalctl -u local-registry
     success_msg: "registry answers locally ({{ registry_local_probe.json.repositories | default([]) | length }} repositories)"
 
-# The gate that matters. A loopback-bound registry passes every check above and
-# fails for every other machine in the estate — the symptom appears later, on a
-# different host, as an ImagePullBackOff naming an image rather than a bind
-# address. Probing from the workstation over the real DNS alias is the only way
-# to catch it here.
+# The gate that matters: a loopback-bound registry passes the local check, and
+# only a probe over the real DNS alias catches it here.
 - name: Query the registry over the LAN, from the workstation
   ansible.builtin.uri:
     url: "http://{{ registry_alias }}:{{ registry_port }}/v2/_catalog"

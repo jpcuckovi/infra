@@ -1,16 +1,5 @@
-# The containerd config that lets this host reach the estate's registry.
-#
-# Every k3s host composes this, including the one that SERVES the registry. That
-# is the whole point of the split from roles/registry: serving is a capability
-# one machine has, and knowing where to pull from is a capability they all need.
-# Bundled together, a host could not have the second without also starting a
-# second registry on the LAN.
-#
-# This role starts nothing and listens on nothing. It writes one file.
-#
-# Runs BEFORE k3s_server. k3s reads registries.yaml once, at first start, so on a
-# fresh host this ordering is what makes the mirror take effect without a restart.
-# playbooks/_layers.yml asserts it.
+# Writes the containerd mirror config on every k3s host, including the registry
+# host. Runs before k3s_server, which reads the file only at first start.
 ---
 - name: Record whether k3s is already running
   ansible.builtin.command: systemctl is-active k3s
@@ -23,15 +12,8 @@
   ansible.builtin.set_fact:
     registry_k3s_running: "{{ registry_k3s_active.stdout | trim == 'active' }}"
 
-# Written before the registry is even up, and unconditionally.
-#
-# THIS IS THE BUG FIX. gpu-bench's install-registry.sh:136 writes registries.yaml
-# only when /etc/rancher/k3s already exists — but the registry step runs before
-# k3s is installed, so on a fresh box that directory does not exist, the branch
-# never fires, and the mirror is silently never configured. Nothing fails; pulls
-# just quietly go upstream forever.
-#
-# Creating the directory explicitly is the whole fix.
+# Created unconditionally: on a fresh host the directory does not exist yet, and
+# skipping the write would silently send every pull upstream.
 - name: Ensure the k3s configuration directory exists
   ansible.builtin.file:
     path: "{{ k3s_registries_yaml | dirname }}"

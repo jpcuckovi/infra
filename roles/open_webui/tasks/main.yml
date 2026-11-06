@@ -1,0 +1,107 @@
+# Open WebUI on the necropolis cluster, talking to llama-server on revenant over
+# its NodePort. Revenant need not be running for this role to install.
+---
+# Generated on the first run of either this role or llama_server, then read
+# back, so the two clusters hold the same key whichever runs first.
+- name: Settle the llama-server API key
+  ansible.builtin.set_fact:
+    open_webui_api_key: >-
+      {{ lookup('ansible.builtin.password', llama_server_key_file,
+                chars=['ascii_letters', 'digits'], length=48) }}
+  no_log: true
+
+- name: Look for the namespace
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Namespace
+    name: "{{ open_webui_namespace }}"
+  register: open_webui_ns
+  check_mode: false
+
+- name: Create the namespace
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ open_webui_namespace }}"
+
+# Applied every run, so the Secret always matches the workstation file. A dry
+# run does not create the namespace, so before a first install the API refuses
+# anything inside it; hence the guard here and on the release.
+- name: Write the API key Secret
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ open_webui_key_secret }}"
+        namespace: "{{ open_webui_namespace }}"
+      type: Opaque
+      # Built as an expression, because Ansible does not template mapping keys.
+      stringData: "{{ {open_webui_key_secret_key: open_webui_api_key} }}"
+  no_log: true
+  when: not ansible_check_mode or open_webui_ns.resources | length > 0
+
+# Open WebUI copies connection settings, the key among them, into its database
+# on first start and ignores later changes to the environment. A changed key is
+# therefore set in the admin UI as well as here.
+- name: Install the Open WebUI Helm chart
+  kubernetes.core.helm:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ open_webui_release }}"
+    chart_ref: open-webui
+    chart_repo_url: "{{ open_webui_chart_repo_url }}"
+    chart_version: "{{ open_webui_chart_version }}"
+    release_namespace: "{{ open_webui_namespace }}"
+    values:
+      # Bundled extras this deployment does not use. With Ollama off and no
+      # Ollama URLs, the chart also disables the app's Ollama connection.
+      ollama:
+        enabled: false
+      pipelines:
+        enabled: false
+
+      # One replica, always: the data is SQLite on a ReadWriteOnce volume. The
+      # in-memory websocket manager is then enough, and Redis has nothing to do.
+      websocket:
+        manager: ""
+        redis:
+          enabled: false
+
+      # Pinned so the wait below does not depend on the chart's choice.
+      workload:
+        kind: StatefulSet
+
+      persistence:
+        storageClass: "{{ open_webui_storage_class }}"
+        size: "{{ open_webui_storage_size }}"
+
+      openaiBaseApiUrl: "{{ open_webui_llm_url }}"
+      openaiApiKeyExistingSecret: "{{ open_webui_key_secret }}"
+      openaiApiKeyExistingSecretKey: "{{ open_webui_key_secret_key }}"
+
+      resources: "{{ open_webui_resources }}"
+
+      extraEnvVars:
+        - name: WEBUI_URL
+          value: "{{ open_webui_url }}"
+  when: not ansible_check_mode or open_webui_ns.resources | length > 0
+
+- name: Wait for Open WebUI to be ready
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: StatefulSet
+    name: "{{ open_webui_fullname }}"
+    namespace: "{{ open_webui_namespace }}"
+  register: open_webui_sts
+  until: >-
+    open_webui_sts.resources | length == 1
+    and open_webui_sts.resources[0].status.readyReplicas | default(0) == 1
+  retries: "{{ open_webui_wait_retries }}"
+  delay: "{{ open_webui_wait_delay }}"
+  when: not ansible_check_mode

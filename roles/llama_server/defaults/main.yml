@@ -1,0 +1,100 @@
+# llama.cpp serving one GGUF model. The model outgrows the GPU, so --fit (on by
+# default) splits it: attention stays in VRAM and the rest runs on the CPU.
+---
+# present | absent. Absent frees the GPU and memory and leaves the weights.
+llama_server_state: present
+
+llama_server_name: llama-server
+llama_server_namespace: llm
+llama_server_port: 8080
+
+# Written every run from llama_server_key_file (group_vars/all.yml), the source
+# of truth, so a reload of revenant does not change the key. Never committed.
+llama_server_key_secret: llama-server-api-key
+
+# How clients on the LAN reach the NodePort, and what the gate probes.
+llama_server_lan_host: "{{ inventory_hostname }}.lan"
+
+# A CUDA 12.8 build, the oldest that targets Blackwell. Pinned by build number,
+# since the bare server-cuda tag moves on every upstream commit.
+llama_server_image: ghcr.io/ggml-org/llama.cpp:server-cuda-b12019
+
+# Required, with no default, so a rerun cannot silently swap the served model.
+# A key of llama_server_models. Unused when llama_server_state is absent.
+# llama_server_model:
+
+# Each pinned to a commit and per-file checksums. The files run to tens of GiB,
+# so a silent upstream change would otherwise cost a full download to notice.
+# `files` are paths within the repo, first shard first; llama.cpp finds the rest
+# beside it. `memory` is the pod's limit; see llama_server_resources.
+llama_server_models:
+  gpt-oss-120b:
+    repo: ggml-org/gpt-oss-120b-GGUF
+    revision: 7200b74bea78b0a2964ef9f3897eefa401e890ff
+    memory: 80Gi
+    files:
+      - name: gpt-oss-120b-MXFP4.gguf
+        sha256: 582bd40f6886200101f4c4ed9f25f3fe80cc14c86e9e2b37746cd8904a0c622d
+  qwen3.8-flash-next:
+    repo: unsloth/Qwen3.8-Flash-Next-GGUF
+    revision: 766911a6b7369840a91dbcd95f9f997acaab6cd6
+    memory: 96Gi
+    files:
+      - name: UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+        sha256: 5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4
+      - name: UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf
+        sha256: 577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7
+      - name: UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf
+        sha256: d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833
+
+llama_server_model_spec: "{{ llama_server_models[llama_server_model] }}"
+llama_server_model_path: "/models/{{ llama_server_model_spec.files[0].name | basename }}"
+
+# Outside /var/lib on revenant, so a reload does not repeat the download. Flat,
+# and models share it, so swapping between them does not download again.
+llama_server_model_dir: /srv/models
+
+# Physical cores, not the 32 SMT threads, which share each core's FPU.
+llama_server_threads: 16
+
+# Set rather than left to --fit, which would spend VRAM on the model's full
+# training context. One slot, as parallel requests divide an already slow CPU.
+llama_server_ctx_size: 16384
+llama_server_parallel: 1
+
+# Appended to the arguments below, such as --n-cpu-moe to override --fit.
+llama_server_extra_args: []
+
+llama_server_args: >-
+  {{ ['--model', llama_server_model_path,
+      '--alias', llama_server_model,
+      '--threads', llama_server_threads | string,
+      '--ctx-size', llama_server_ctx_size | string,
+      '--parallel', llama_server_parallel | string]
+     + llama_server_extra_args }}
+
+# The memory limit counts mapped weights, so below the model size plus the
+# server's own use the pod pages from disk or is killed. No CPU limit: throttling
+# stalls every thread at once, and the request already reserves the cores.
+llama_server_resources:
+  requests:
+    cpu: "{{ llama_server_threads | string }}"
+    memory: "{{ llama_server_model_spec.memory }}"
+    nvidia.com/gpu: 1
+  limits:
+    memory: "{{ llama_server_model_spec.memory }}"
+    nvidia.com/gpu: 1
+
+# Seconds. Covers a first download over a slow link; an overrun fails the run
+# but not the download, which resumes when the playbook is run again.
+llama_server_wait_timeout: 14400
+
+# 15 minutes at 10s, for a cold load of the largest model from hard disk.
+llama_server_startup_failure_threshold: 90
+
+# Seconds for one short completion in the verify gate, on a slow model.
+llama_server_probe_timeout: 300
+
+# Well above an idle card, so less means CPU-only inference, which still answers
+# every request and passes every other gate.
+llama_server_min_vram_mib: 2048

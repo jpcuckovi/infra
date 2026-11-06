@@ -1,0 +1,94 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/uptime_kuma.
+#
+# NO Namespace resource here, deliberately. The namespace is shared with
+# unrelated workloads, so nothing in this file may be capable of removing it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ uptime_kuma_name }}-data
+  namespace: {{ uptime_kuma_namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Advisory under local-path, which provisions a directory and enforces no
+      # quota. The SQLite database grows with heartbeat history, which Kuma
+      # prunes by its own retention setting in the UI, not by anything here.
+      storage: {{ uptime_kuma_storage_size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ uptime_kuma_name }}
+  namespace: {{ uptime_kuma_namespace }}
+  labels:
+    app: {{ uptime_kuma_name }}
+spec:
+  # One replica, always. The database is a single SQLite file, and two writers
+  # on it corrupt it.
+  replicas: 1
+  # Recreate, not RollingUpdate: a ReadWriteOnce volume cannot be mounted by the
+  # outgoing and incoming pods at once, so a rolling update deadlocks with the
+  # new pod Pending and the old one never terminating.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ uptime_kuma_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ uptime_kuma_name }}
+    spec:
+      containers:
+        - name: {{ uptime_kuma_name }}
+          image: {{ uptime_kuma_image }}
+          ports:
+            - name: http
+              containerPort: {{ uptime_kuma_port }}
+          volumeMounts:
+            # Fixed by the image: Kuma writes its database here and nowhere
+            # else. Mounted anywhere other than this path, the volume is empty
+            # and every restart starts Kuma from nothing.
+            - name: data
+              mountPath: /app/data
+          resources: {{ uptime_kuma_resources | to_json }}
+          # The first start of a release runs database migrations before the
+          # server listens. The startup probe gives that up to five minutes,
+          # and holds off liveness until it passes, so a slow migration is not
+          # killed halfway through.
+          startupProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ uptime_kuma_name }}-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ uptime_kuma_name }}
+  namespace: {{ uptime_kuma_namespace }}
+  labels:
+    app: {{ uptime_kuma_name }}
+spec:
+  # NodePort because Kuma is a UI opened from browsers outside the cluster, on
+  # the same fixed-port pattern as Grafana and Prometheus.
+  type: NodePort
+  selector:
+    app: {{ uptime_kuma_name }}
+  ports:
+    - name: http
+      port: {{ uptime_kuma_port }}
+      targetPort: http
+      nodePort: {{ uptime_kuma_node_port }}

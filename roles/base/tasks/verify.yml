@@ -1,8 +1,4 @@
-# Gates for the baseline.
-#
-# Included by playbooks/<host>/verify.yml. Assertions live here, beside the
-# tasks that create what they check, so adding a host composes gates rather than
-# copying them.
+# Gates for the baseline, kept beside the tasks so hosts compose them.
 ---
 - name: Read the running kernel tunables
   ansible.builtin.command: "sysctl -n {{ item.key }}"
@@ -13,16 +9,8 @@
   loop_control:
     label: "{{ item.key }}"
 
-# Asserted once over the whole set rather than once per tunable.
-#
-# `loop_control.label` shortens a looped task's HEADER but not its result body,
-# and an assert in a loop carries the entire registered result — for a command
-# that is the full invocation, for kubernetes.core it is the whole resource
-# including managedFields. The gate then buries its own one-line verdict.
-#
-# Reducing to the mismatches first gives one line on success and, on failure,
-# names exactly which tunables are wrong instead of leaving the reader to find
-# the one failing item among several screens of correct ones.
+# One assert over the set: a looped assert prints each full registered result,
+# burying the verdict; this gives one line naming the wrong tunables.
 - name: Assert kernel tunables are live, not merely written
   ansible.builtin.assert:
     that:
@@ -36,10 +24,8 @@
       looks green everywhere else.
     success_msg: "{{ base_sysctl_found | join(', ') }}"
   vars:
-    # Compared as whole lists rather than per item. rejectattr and selectattr
-    # test an attribute against a CONSTANT, so neither can express "this result's
-    # stdout differs from this result's own expected value" — the two sides of
-    # the comparison both live on the item.
+    # Whole lists, since selectattr compares only against a constant, not
+    # against another field of the same item.
     base_sysctl_keys: >-
       {{ base_sysctl_live.results | map(attribute='item.key') | list }}
     base_sysctl_actual: >-
@@ -51,13 +37,8 @@
     base_sysctl_want: >-
       {{ base_sysctl_keys | zip(base_sysctl_expected) | map('join', '=') | list }}
 
-# Asserted on the PROFILE, not the package or the service.
-#
-# A removed package with its AppArmor profile still resident in the kernel is the
-# half-fix that looks complete: no daemon, no unit, and a profile quietly
-# confining container processes and generating denials. The profile is the thing
-# that caused the outage after rsyslog itself was already stopped, so the profile
-# is what this gate reads.
+# Asserted on the loaded profile, not the package: a resident profile kept
+# causing the outage after rsyslog itself was gone.
 - name: Read the loaded AppArmor profiles
   ansible.builtin.slurp:
     src: /sys/kernel/security/apparmor/profiles
@@ -83,9 +64,6 @@
         sudo apparmor_parser -R /etc/apparmor.d/*rsyslog*
     success_msg: "no rsyslog AppArmor profile loaded"
   vars:
-    # The file is one profile per line with a mode in parentheses. Decoded and
-    # searched as a whole rather than parsed, because the question is only
-    # whether the name appears at all.
     base_apparmor_profiles: >-
       {{ base_apparmor_loaded.content | default('') | b64decode }}
 
@@ -117,3 +95,34 @@
       estate makes correlated traces and metrics lie about ordering, which is
       the one thing an observability stack exists to get right.
     success_msg: "chrony active"
+
+- name: Read the automation account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ base_automation_user }}"
+  failed_when: false
+  check_mode: false
+
+- name: Read the automation account's authorized keys
+  ansible.builtin.slurp:
+    src: "/home/{{ base_automation_user }}/.ssh/authorized_keys"
+  register: base_automation_keys
+  failed_when: false
+  check_mode: false
+
+# Compared on the key body, the second field, so a comment change is not a failure.
+- name: Assert AWX's key logs in to its own account
+  ansible.builtin.assert:
+    that:
+      - base_automation_user in (ansible_facts.getent_passwd | default({}))
+      - base_automation_key_body in base_automation_authorized
+    fail_msg: >-
+      {{ base_automation_user }} on {{ inventory_hostname }}:
+      account {{ 'present' if base_automation_user in (ansible_facts.getent_passwd | default({})) else 'missing' }},
+      key {{ 'present' if base_automation_key_body in base_automation_authorized else 'missing' }}.
+      AWX jobs log in as this account with the key in {{ base_automation_pubkey_file }}.
+      Rerun this host's playbook.
+    success_msg: "{{ base_automation_user }} present, AWX key authorized"
+  vars:
+    base_automation_key_body: "{{ lookup('ansible.builtin.file', base_automation_pubkey_file).split()[1] }}"
+    base_automation_authorized: "{{ base_automation_keys.content | default('') | b64decode }}"

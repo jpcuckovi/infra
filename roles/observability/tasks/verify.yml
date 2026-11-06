@@ -1,20 +1,7 @@
 # Gates for the observability stack.
 ---
-# Selected by LABEL, not by name, for everything the chart generates.
-#
-# Chart-generated names are a function of the release name, the chart name, and
-# chart values — the operator prefixes `prometheus-`, the chart appended
-# `-prometheus` until cleanPrometheusOperatorObjectNames turned it off, and
-# Helm's fullname template drops its prefix when the release name already
-# contains the chart name. Encoding that formula here means the gate breaks every
-# time any input to it changes, and it breaks by reporting a healthy workload
-# ABSENT — which reads as the stack being broken rather than the gate being
-# wrong. That is exactly what happened when the release was renamed.
-#
-# Labels are set by the operator and the chart and do not vary with any of it.
-#
-# Jaeger stays addressed by name because this repository names it: it is applied
-# from roles/observability/templates/jaeger.yaml.j2, so the name is ours to know.
+# Chart workloads are selected by label, because generated names change with the
+# release name and chart values; Jaeger is named by this repository, so by name.
 - name: Read the workloads
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"
@@ -28,15 +15,8 @@
   loop_control:
     label: "{{ item.what }}"
   vars:
-    # Gated on the same three variables tasks/main.yml uses, because a gate that
-    # asserts the presence of something the host was configured NOT to install
-    # fails on a correct machine — which is worse than not checking, since it
-    # trains the reader to ignore the gate.
-    #
-    # Assembled by concatenating literal lists rather than filtering one on a
-    # truthiness attribute: `"{{ some_bool }}"` inside a dict renders to the
-    # STRING "False", and every non-empty string is truthy, so selectattr would
-    # keep exactly the entries it was meant to drop.
+    # Gated like tasks/main.yml, and built by list concatenation because a bool
+    # templated into a dict becomes the truthy string "False".
     obs_jaeger_workload:
       - what: Deployment/jaeger
         kind: Deployment
@@ -56,15 +36,8 @@
          + (obs_grafana_workload if observability_grafana_enabled | bool else [])
          + obs_prometheus_workload }}
 
-# Asserted once over the whole set rather than once per workload.
-#
-# `loop_control.label` shortens a looped task's HEADER but not its result body,
-# and an assert in a loop carries the entire registered result — here, three
-# complete Deployment objects including every managedFields entry. The gate's
-# own one-line verdict ends up several screens below its evidence.
-#
-# Reducing to the missing set first gives one line on success and, on failure,
-# names exactly what is absent.
+# Asserted once over the set, because a looped assert prints each full
+# registered object and buries the verdict.
 - name: Assert every workload exists, exactly once
   ansible.builtin.assert:
     that:
@@ -84,24 +57,16 @@
       in a way no single query reveals.
     success_msg: "{{ obs_census | join(', ') }}"
   vars:
-    # k8s_info returns an empty `resources` list when nothing matched, so
-    # rejectattr on its truthiness selects exactly the absent ones.
     obs_absent: "{{ obs_workloads.results | rejectattr('resources') | list }}"
     obs_missing: "{{ obs_absent | map(attribute='item.what') | list }}"
     obs_counts: "{{ obs_workloads.results | map(attribute='resources') | map('length') | list }}"
-    # Reported as a census rather than only the failures, because the count is
-    # the diagnosis in both directions — 0 and 2 are different faults with
-    # different fixes, and the reader should not have to infer which occurred.
-    # map('string') before joining: zip yields integers, and join needs text.
+    # A census, since 0 and 2 are different faults with different fixes.
     obs_census: >-
       {{ obs_workloads.results | map(attribute='item.what')
          | zip(obs_counts | map('string')) | map('join', '=') | list }}
 
-# A StatefulSet's volumeClaimTemplates cannot be modified in place: the operator
-# has to delete and recreate the StatefulSet. When that does not happen,
-# Prometheus keeps running happily on its old emptyDir and every other check
-# still passes — the change is lost in a way that reads as success. This is the
-# check that notices.
+# volumeClaimTemplates are immutable, so a failed storage change leaves
+# Prometheus on emptyDir while every other check passes.
 - name: Assert Prometheus storage is a PersistentVolume, not emptyDir
   ansible.builtin.assert:
     that:
@@ -117,11 +82,7 @@
       assumed.
     success_msg: "Prometheus storage is persistent"
   vars:
-    # Selected by name, not by position. The list above is now assembled
-    # conditionally, so index 2 is the Prometheus StatefulSet on a host that runs
-    # Jaeger and Grafana and does not exist at all on one that runs neither —
-    # and a positional reference into a variable-length list fails with an index
-    # error that names neither the list nor the reason it is short.
+    # By name, because the workload list varies in length per host.
     obs_prom_sts: >-
       {{ (obs_workloads.results
           | selectattr('item.what', 'equalto', 'StatefulSet/prometheus')
@@ -161,11 +122,8 @@
   vars:
     obs_prom_spec: "{{ obs_prom_cr.resources[0].spec }}"
 
-# Asked of the cluster rather than read from the contract file, so that the probe
-# below tests the stack itself and the contract can be checked against it
-# independently. Reading the address from the file would make a stale file
-# invisible: both the probe and the assertion would agree, and both would be
-# pointing at the wrong node.
+# Asked of the cluster, not the contract file, so a stale file cannot agree
+# with itself and pass.
 - name: Ask the cluster for its node address
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"
@@ -191,9 +149,7 @@
   loop_control:
     label: "{{ item.name }}"
   vars:
-    # Same gating, same reason, same assembly-by-concatenation as the workload
-    # list above. A host that runs neither Grafana nor Jaeger publishes neither
-    # NodePort, and probing them would fail correctly-built machines.
+    # Gated and assembled like the workload list above.
     obs_grafana_endpoint:
       - name: grafana
         url: "http://{{ obs_probe_host }}:{{ grafana_node_port }}/api/health"
@@ -227,9 +183,7 @@
   loop:
     - otlp-endpoint
     - prometheus-url
-  # Only the host that WRITES the contract may assert it. These two files name
-  # the shared services cluster, not this one, so a lab node checking them would
-  # be failing — or passing — on another machine's data.
+  # Only the writing host checks, because the files describe the shared cluster.
   when: observability_write_discovery_contract | bool
 
 - name: Assert both contract files exist
@@ -246,9 +200,7 @@
   loop: "{{ obs_contract_stat.results }}"
   loop_control:
     label: "{{ item.item }}"
-  # Only the host that WRITES the contract may assert it. These two files name
-  # the shared services cluster, not this one, so a lab node checking them would
-  # be failing — or passing — on another machine's data.
+  # Only the writing host checks, because the files describe the shared cluster.
   when: observability_write_discovery_contract | bool
 
 - name: Read the recorded endpoints
@@ -260,15 +212,10 @@
   loop:
     - otlp-endpoint
     - prometheus-url
-  # Only the host that WRITES the contract may assert it. These two files name
-  # the shared services cluster, not this one, so a lab node checking them would
-  # be failing — or passing — on another machine's data.
+  # Only the writing host checks, because the files describe the shared cluster.
   when: observability_write_discovery_contract | bool
 
-# Catches a contract recorded against an address the node no longer has. The
-# files are written at install time from whatever the cluster reported then, so
-# a node that moved since is recorded wrong — and every consumer silently points
-# at nothing.
+# Catches a contract left stale by a node address change since install.
 - name: Assert the contract names the address the cluster currently reports
   ansible.builtin.assert:
     that:
@@ -284,13 +231,10 @@
   loop: "{{ obs_contract.results }}"
   loop_control:
     label: "{{ item.item }}"
-  # Only the host that WRITES the contract may assert it. These two files name
-  # the shared services cluster, not this one, so a lab node checking them would
-  # be failing — or passing — on another machine's data.
+  # Only the writing host checks, because the files describe the shared cluster.
   when: observability_write_discovery_contract | bool
 
-# Co-tenant guard. This role shares the namespace; a step that removed something
-# it does not own would show up here first.
+# The namespace is shared; a step that removed a co-tenant would show here first.
 - name: List co-tenant workloads left untouched
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"

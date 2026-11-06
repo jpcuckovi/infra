@@ -1,0 +1,201 @@
+# Configures an unsealed Vault through its HTTP API: a KV v2 engine for
+# secrets, a read-only policy for AWX, and Kubernetes auth that grants that
+# policy to AWX's service account. Each object is read first and written only
+# when missing or different, so a rerun reports no change. Runs with the
+# short-lived token main.yml issues, never the root token itself.
+---
+# Mount listings key each mount by its path with a trailing slash.
+- name: List the secrets engines
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/mounts"
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: vault_mounts
+  check_mode: false
+
+- name: Enable the KV v2 secrets engine
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/mounts/{{ vault_kv_mount }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body:
+      type: kv
+      options:
+        version: "2"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when: (vault_kv_mount ~ '/') not in vault_mounts.json.data
+
+# A KV v1 engine at the same path would accept the policy below but never match
+# it, since only v2 puts data/ in the path.
+- name: Assert the existing engine is KV version 2
+  ansible.builtin.assert:
+    that:
+      - vault_mounts.json.data[vault_kv_mount ~ '/'].type == 'kv'
+      - vault_mounts.json.data[vault_kv_mount ~ '/'].options.version | default('1') == '2'
+    fail_msg: "{{ vault_kv_mount }}/ exists but is not a KV version 2 engine."
+    quiet: true
+  when: (vault_kv_mount ~ '/') in vault_mounts.json.data
+
+- name: Read the AWX policy
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/policies/acl/{{ vault_awx_policy }}"
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 404]
+  register: vault_awx_policy_current
+  check_mode: false
+
+# KV v2 serves secret values under <mount>/data/, so that is the path to grant.
+- name: Write the AWX policy
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/policies/acl/{{ vault_awx_policy }}"
+    method: PUT
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body:
+      policy: "{{ vault_awx_policy_hcl }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when: >-
+    vault_awx_policy_current.status == 404
+    or vault_awx_policy_current.json.data.policy != vault_awx_policy_hcl
+  vars:
+    vault_awx_policy_hcl: |
+      path "{{ vault_kv_mount }}/data/awx/*" {
+        capabilities = ["read"]
+      }
+
+- name: List the auth methods
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/auth"
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: vault_auth_mounts
+  check_mode: false
+
+# The mount's max TTL caps every token issued through it, whatever a role asks.
+- name: Enable Kubernetes auth
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/auth/{{ vault_k8s_auth_mount }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body:
+      type: kubernetes
+      config:
+        max_lease_ttl: "{{ vault_k8s_auth_max_ttl }}s"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when: (vault_k8s_auth_mount ~ '/') not in vault_auth_mounts.json.data
+
+- name: Tune the Kubernetes auth mount's max TTL
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/sys/auth/{{ vault_k8s_auth_mount }}/tune"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body:
+      max_lease_ttl: "{{ vault_k8s_auth_max_ttl }}s"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when:
+    - (vault_k8s_auth_mount ~ '/') in vault_auth_mounts.json.data
+    - >-
+      vault_auth_mounts.json.data[vault_k8s_auth_mount ~ '/'].config.max_lease_ttl
+      != vault_k8s_auth_max_ttl | int
+
+# With no reviewer token or CA given, Vault uses its own pod's service account
+# token and CA to call TokenReview; the chart grants it system:auth-delegator.
+- name: Read the Kubernetes auth config
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/config"
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 404]
+  register: vault_k8s_config_current
+  check_mode: false
+
+- name: Write the Kubernetes auth config
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/config"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body: "{{ vault_k8s_config }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when: >-
+    vault_k8s_config_current.status == 404
+    or (vault_k8s_config_current.json.data | combine(vault_k8s_config))
+       != vault_k8s_config_current.json.data
+  vars:
+    vault_k8s_config:
+      kubernetes_host: "{{ vault_k8s_host }}"
+
+- name: Read the AWX auth role
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/role/{{ vault_awx_role }}"
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+    status_code: [200, 404]
+  register: vault_awx_role_current
+  check_mode: false
+
+# Overlaying the wanted fields on what Vault returns changes nothing when they
+# already match, which also ignores fields this role does not manage.
+- name: Write the AWX auth role
+  ansible.builtin.uri:
+    url: "{{ vault_url }}/v1/auth/{{ vault_k8s_auth_mount }}/role/{{ vault_awx_role }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ vault_config_token }}"
+    body_format: json
+    body: "{{ vault_awx_role_spec }}"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    status_code: 204
+  changed_when: true
+  when: >-
+    vault_awx_role_current.status == 404
+    or (vault_awx_role_current.json.data | combine(vault_awx_role_spec))
+       != vault_awx_role_current.json.data
+  vars:
+    vault_awx_role_spec:
+      bound_service_account_names: ["{{ vault_awx_service_account }}"]
+      bound_service_account_namespaces: ["{{ vault_awx_namespace }}"]
+      audience: "{{ vault_k8s_audience }}"
+      token_policies: ["{{ vault_awx_policy }}"]
+      token_ttl: "{{ vault_awx_token_ttl | int }}"
+      token_max_ttl: "{{ vault_awx_token_max_ttl | int }}"

@@ -1,14 +1,6 @@
-# necropolis — the acceptance gate.
-#
-#   ~/.venv/bin/ansible-playbook playbooks/necropolis/verify.yml
-#
-# A composition, not an implementation: each role owns its assertions in
-# tasks/verify.yml, so a gate lives beside the code that creates the thing it
-# checks.
-#
-# Same list as main.yml minus preflight, which is assertions already, and
-# kubeconfig, whose product is checked by kubeadm_control_plane's last gate:
-# the API reached from the workstation, by name, through the merged context.
+# necropolis acceptance gate; each role owns its checks in tasks/verify.yml.
+# main.yml minus preflight and kubeconfig, whose product kubeadm_control_plane's
+# last gate checks.
 
 - import_playbook: ../_layers.yml
   vars:
@@ -22,6 +14,7 @@
       - containerd
       - kubeadm_node
       - longhorn_node
+      - clabernetes_host
       - kubeadm_control_plane
 
     cluster_roles:
@@ -29,3 +22,8 @@
       - longhorn
       - cert_manager
       - gateway
+      - observability
+      - clabernetes
+      - awx
+      - vault
+      - open_webui

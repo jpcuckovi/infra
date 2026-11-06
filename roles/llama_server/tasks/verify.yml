@@ -1,0 +1,119 @@
+---
+- name: Assert the requested model is known
+  ansible.builtin.include_tasks: assert_model.yml
+  when: llama_server_state == 'present'
+
+- name: Read the server deployment
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ llama_server_name }}"
+    namespace: "{{ llama_server_namespace }}"
+  register: llama_server_deploy
+  check_mode: false
+
+- name: Assert the server was removed
+  ansible.builtin.assert:
+    that:
+      - llama_server_deploy.resources | length == 0
+    fail_msg: "{{ llama_server_name }} still exists in {{ llama_server_namespace }}."
+    success_msg: "{{ llama_server_name }} absent"
+  when: llama_server_state == 'absent'
+
+- name: Verify the running server
+  when: llama_server_state == 'present'
+  block:
+    - name: Assert the server is available
+      ansible.builtin.assert:
+        that:
+          - llama_server_deploy.resources | length == 1
+          - llama_server_deploy.resources[0].status.availableReplicas | default(0) == 1
+        fail_msg: >-
+          The {{ llama_server_name }} deployment is not available in
+          {{ llama_server_namespace }}. It may still be downloading. Check:
+            kubectl --context {{ kubeconfig_context }} -n {{ llama_server_namespace }} logs deploy/{{ llama_server_name }} -c fetch-model
+            kubectl --context {{ kubeconfig_context }} -n {{ llama_server_namespace }} describe deploy/{{ llama_server_name }}
+        success_msg: "{{ llama_server_name }} available"
+
+    - name: Assert the deployment serves the requested model
+      ansible.builtin.assert:
+        that:
+          - llama_server_model_path in llama_server_deploy.resources[0].spec.template.spec.containers[0].args
+        fail_msg: >-
+          {{ llama_server_name }} is not serving {{ llama_server_model }}. Its
+          arguments are {{ llama_server_deploy.resources[0].spec.template.spec.containers[0].args }}.
+        success_msg: "serving {{ llama_server_model }}"
+
+    - name: Find the server pod
+      kubernetes.core.k8s_info:
+        context: "{{ kubeconfig_context }}"
+        kind: Pod
+        namespace: "{{ llama_server_namespace }}"
+        label_selectors:
+          - "app={{ llama_server_name }}"
+        field_selectors:
+          - status.phase=Running
+      register: llama_server_pods
+      check_mode: false
+
+    # Inside the pod, because the Service is not reachable from this workstation.
+    - name: Ask the model for a completion
+      kubernetes.core.k8s_exec:
+        context: "{{ kubeconfig_context }}"
+        namespace: "{{ llama_server_namespace }}"
+        pod: "{{ llama_server_pods.resources[0].metadata.name }}"
+        container: "{{ llama_server_name }}"
+        # A shell, so $LLAMA_API_KEY expands from the container's environment and
+        # the key never reaches this workstation or its logs.
+        command: >-
+          sh -c "curl -sf --max-time {{ llama_server_probe_timeout }}
+          -H \"Authorization: Bearer $LLAMA_API_KEY\"
+          -H 'Content-Type: application/json'
+          -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Say ok.\"}],\"max_tokens\":16}'
+          http://localhost:{{ llama_server_port }}/v1/chat/completions"
+      register: llama_server_completion
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    # /health reports only that the weights loaded.
+    - name: Assert the model answered
+      ansible.builtin.assert:
+        that:
+          - llama_server_completion.stdout | default('') is search('"choices"')
+        fail_msg: >-
+          The server is up but returned no completion within
+          {{ llama_server_probe_timeout }}s. Check:
+            kubectl --context {{ kubeconfig_context }} -n {{ llama_server_namespace }} logs deploy/{{ llama_server_name }}
+        success_msg: "the model answered"
+
+    # Over the LAN with no key, so one probe proves both the NodePort is reachable
+    # and the API refuses strangers. /health would prove only the first.
+    - name: Assert the LAN address answers and demands the key
+      ansible.builtin.uri:
+        url: "http://{{ llama_server_lan_host }}:{{ llama_server_node_port }}/v1/models"
+        status_code: 401
+      check_mode: false
+
+    - name: Read the GPU memory in use
+      kubernetes.core.k8s_exec:
+        context: "{{ kubeconfig_context }}"
+        namespace: "{{ llama_server_namespace }}"
+        pod: "{{ llama_server_pods.resources[0].metadata.name }}"
+        container: "{{ llama_server_name }}"
+        command: nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
+      register: llama_server_vram
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    - name: Assert the model is on the GPU
+      ansible.builtin.assert:
+        that:
+          - llama_server_vram.stdout | default('0') | trim | int >= llama_server_min_vram_mib
+        fail_msg: >-
+          The GPU reports '{{ llama_server_vram.stdout | default("nothing") | trim }}'
+          MiB in use, under the {{ llama_server_min_vram_mib }} MiB floor. The
+          server is answering from the CPU alone. Look for the CUDA backend in:
+            kubectl --context {{ kubeconfig_context }} -n {{ llama_server_namespace }} logs deploy/{{ llama_server_name }}
+        success_msg: "{{ llama_server_vram.stdout | trim }} MiB in VRAM"

@@ -1,0 +1,23 @@
+# Defaults for AWX, the upstream of Red Hat's Ansible Automation Platform,
+# deployed through its operator.
+---
+awx_operator_chart_repo_url: https://ansible-community.github.io/awx-operator-helm/
+awx_operator_release: awx-operator
+awx_namespace: awx
+
+# Pinned in group_vars/all.yml; restated so the role reads on its own.
+awx_operator_version: "3.2.1"
+
+# Set in group_vars/necropolis.yml beside its gateway route; restated here.
+awx_hostname: awx.lan
+awx_url: "https://{{ awx_hostname }}"
+
+awx_name: awx
+awx_postgres_storage_class: longhorn
+awx_postgres_storage_size: 8Gi
+awx_wait_delay: 10
+awx_wait_retries: 60
+
+# Named by the operator, not by this role: its Postgres StatefulSet's volume
+# claim. The 15 is the Postgres major version and changes with it.
+awx_postgres_pvc: "postgres-15-{{ awx_name }}-postgres-15-0"

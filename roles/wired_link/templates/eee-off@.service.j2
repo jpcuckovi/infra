@@ -30,3 +30,6 @@ ExecStart=/usr/sbin/ethtool --set-eee %i eee off
 
 [Install]
 WantedBy=sys-subsystem-net-devices-%i.device
+# Also at boot: a device already present when the system starts (named early,
+# in the initramfs) never "appears", so the device link alone would not run this.
+WantedBy=multi-user.target

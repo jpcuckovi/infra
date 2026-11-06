@@ -1,0 +1,57 @@
+---
+- name: Read the Uptime Kuma deployment
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ uptime_kuma_name }}"
+    namespace: "{{ uptime_kuma_namespace }}"
+  register: uptime_kuma_deploy
+  check_mode: false
+
+- name: Assert Uptime Kuma is available
+  ansible.builtin.assert:
+    that:
+      - uptime_kuma_deploy.resources | length == 1
+      - uptime_kuma_deploy.resources[0].status.availableReplicas | default(0) == 1
+    fail_msg: >-
+      The {{ uptime_kuma_name }} deployment is not available in
+      {{ uptime_kuma_namespace }}. Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ uptime_kuma_namespace }} describe deploy/{{ uptime_kuma_name }}
+    success_msg: "{{ uptime_kuma_name }} available"
+
+- name: Assert the storage volume is bound
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: PersistentVolumeClaim
+    name: "{{ uptime_kuma_name }}-data"
+    namespace: "{{ uptime_kuma_namespace }}"
+  register: uptime_kuma_pvc
+  check_mode: false
+  failed_when: >-
+    uptime_kuma_pvc.resources | length != 1 or
+    uptime_kuma_pvc.resources[0].status.phase != 'Bound'
+
+- name: Probe Uptime Kuma health over the LAN
+  ansible.builtin.uri:
+    url: "http://{{ uptime_kuma_alias }}:{{ uptime_kuma_node_port }}/"
+  register: uptime_kuma_health
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+
+- name: Assert Uptime Kuma answers on the Uptime alias
+  ansible.builtin.assert:
+    that:
+      - uptime_kuma_health.status == 200
+    fail_msg: >-
+      {{ uptime_kuma_alias }}:{{ uptime_kuma_node_port }} did not answer from
+      this workstation. Either the {{ uptime_kuma_alias }} record does not resolve
+      to the host running Kuma, or the NodePort is not published. Check:
+        dig +short {{ uptime_kuma_alias }}
+        kubectl --context {{ kubeconfig_context }} -n {{ uptime_kuma_namespace }} get svc/{{ uptime_kuma_name }}
+
+      Kuma itself may still be running. Its checks and alerts run inside the pod
+      and do not depend on this address, so an unreachable UI does not mean
+      monitoring has stopped. The deployment assert above says which it is.
+    success_msg: "Uptime Kuma answers on {{ uptime_kuma_alias }}:{{ uptime_kuma_node_port }}"
+

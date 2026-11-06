@@ -10,8 +10,7 @@
   become: false
   check_mode: false
 
-# A year of warning, because replacing a root is a change every trusting
-# browser has to make, not a renewal.
+# A year of warning, since replacing a root means re-trusting it everywhere.
 - name: Assert the CA is a CA, and has a year left
   ansible.builtin.assert:
     that:

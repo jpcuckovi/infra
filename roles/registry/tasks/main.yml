@@ -1,14 +1,5 @@
-# The registry service itself — the one host in the estate that serves images.
-#
-# The containerd config that lets a host PULL from it is roles/registry_mirror,
-# composed by every k3s host including this one. The two were one role until the
-# split: serving is a capability one machine has, knowing where to pull from is a
-# capability they all need, and bundled together no host could have the second
-# without also starting a second registry on the LAN.
-#
-# This role has no ordering constraint against k3s_server. registry_mirror does,
-# because registries.yaml is read once at first start — the container being up is
-# not what k3s reads.
+# Runs the registry service on the one host that serves images. Pull config is
+# roles/registry_mirror; only that role must precede k3s_server.
 ---
 - name: Create the registry storage root
   ansible.builtin.file:
@@ -45,19 +36,11 @@
     state: started
     enabled: true
     daemon_reload: true
-  # Under --check the unit above was only simulated, so systemd genuinely has no
-  # local-registry to enable and this fails with "Could not find the requested
-  # service" — on a host where nothing is wrong except that check mode declined
-  # to write the file.
-  #
-  # A dry run that dies partway is worse than one that admits what it cannot
-  # know: the tasks after this never get evaluated, so the operator sees a
-  # failure instead of the plan they asked for. Same idiom as the readiness wait
-  # below, for the same reason.
+  # Under --check the unit was never written, so this would fail with "Could not
+  # find the requested service" and abort the dry run.
   when: not ansible_check_mode
 
-# Applying handlers now rather than at play end: the readiness check below is
-# meaningless if it runs against the pre-restart container.
+# The readiness check is meaningless against the pre-restart container.
 - name: Apply pending restarts before checking readiness
   ansible.builtin.meta: flush_handlers
 

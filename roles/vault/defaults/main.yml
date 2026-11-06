@@ -1,0 +1,46 @@
+# Defaults for Hashicorp Vault, installed from its Helm chart.
+---
+vault_chart_repo_url: https://helm.releases.hashicorp.com/
+vault_release: vault
+vault_namespace: vault
+
+# Pinned in group_vars/all.yml; restated so the role reads on its own.
+vault_chart_version: "0.34.1"
+
+# Set in group_vars/necropolis.yml beside its gateway route; restated here.
+vault_hostname: vault.lan
+vault_url: "https://{{ vault_hostname }}"
+
+vault_replicas: 1
+vault_storage_class: longhorn
+vault_storage_size: 1Gi
+
+vault_wait_delay: 10
+vault_wait_retries: 30
+
+vault_injector_enabled: false
+vault_ui_enabled: true
+
+# The init response (unseal key and root token), written once by this role and
+# kept on the workstation, never in the cluster or the repository.
+vault_init_file: "{{ lookup('env', 'HOME') }}/.local/share/infra/vault/{{ kubeconfig_context }}/init.json"
+
+# Configuration applied after unseal. TTLs are in seconds, the unit Vault
+# reports them in, so a rerun can compare without parsing durations.
+vault_config_token_ttl: 300
+vault_kv_mount: secret
+vault_k8s_auth_mount: kubernetes
+vault_k8s_auth_max_ttl: 3600
+vault_k8s_host: https://kubernetes.default.svc
+# The API server's --service-account-issuer, which is also the audience of the
+# tokens it mounts into pods (kubeadm's default).
+vault_k8s_audience: https://kubernetes.default.svc.cluster.local
+
+# AWX reads secrets as the service account its operator names after the AWX
+# object. Restated here rather than borrowed from the awx role.
+vault_awx_namespace: awx
+vault_awx_service_account: awx
+vault_awx_policy: awx
+vault_awx_role: awx
+vault_awx_token_ttl: 1200
+vault_awx_token_max_ttl: 3600

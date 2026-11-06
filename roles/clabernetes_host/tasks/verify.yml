@@ -1,9 +1,5 @@
-# Gates for a clabernetes topology node.
-#
-# Every assert here asks the KERNEL, never the task that ran earlier. A converge
-# reporting changed=0 proves the playbook believed its own work; it does not
-# prove a module survived the last reboot, and on a host that is reloaded
-# routinely that difference is the entire question.
+# Gates for a clabernetes topology node. Each asks the kernel, since a module
+# loaded by an earlier converge may not have survived a reboot.
 ---
 - name: Read the loaded kernel modules
   ansible.builtin.stat:
@@ -14,11 +10,8 @@
     label: "{{ item }}"
   check_mode: false
 
-# /sys/module/<name> rather than /proc/modules, because it is present for a
-# built-in module as well as a loaded one. A kernel that compiles veth in rather
-# than shipping it as a module is correct, and would fail a /proc/modules grep —
-# the gate would be reporting on how the kernel was built, not on whether the
-# capability is there.
+# /sys/module also covers built-in modules, which /proc/modules omits, so a
+# kernel with veth compiled in still passes.
 - name: Assert every topology module is present in the running kernel
   ansible.builtin.assert:
     that:
@@ -55,10 +48,8 @@
     success_msg: "{{ clabernetes_modules_conf }} present"
 
 # ---- inotify ----------------------------------------------------------------
-# cEOS does not refuse to start when this ceiling is too low. It starts, and its
-# agents fail with "Too many open files" in a log nobody reads, and the lab
-# converges partially — which is indistinguishable from a topology that is simply
-# still coming up.
+# Too low a ceiling does not stop cEOS: its agents fail with "Too many open
+# files" and the lab converges partially, looking merely slow.
 - name: Read the inotify instance ceiling
   ansible.builtin.slurp:
     src: /proc/sys/fs/inotify/max_user_instances

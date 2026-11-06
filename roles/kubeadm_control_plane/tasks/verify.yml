@@ -1,13 +1,5 @@
-# Gates for the control plane.
-#
-# Per node: membership, kube-vip on admin credentials rather than super-admin.
-# Once, through the API: every node registered as a control plane and
-# schedulable, etcd at full membership, the VIP lease held, no kubelet serving
-# request left pending — and the API reachable from the workstation by NAME,
-# which proves the certificate SAN and the DNS record together.
-#
-# Nodes are expected NotReady until the cluster layer installs a CNI, so
-# readiness is deliberately not a gate here.
+# Gates for the control plane. Readiness is not gated, because nodes stay
+# NotReady until the cluster layer installs a CNI.
 ---
 - name: Check for this node's cluster membership
   ansible.builtin.stat:
@@ -23,8 +15,7 @@
       it never completed init or join. Run playbooks/necropolis/main.yml.
     success_msg: "{{ inventory_hostname }} is a member"
 
-# super-admin.conf's user is kubernetes-super-admin, bound to system:masters.
-# kube-vip carrying it after bootstrap is the exposure the swap exists to end.
+# kube-vip must not keep super-admin (system:masters) credentials after bootstrap.
 - name: Read kube-vip's kubeconfig
   ansible.builtin.slurp:
     src: "{{ kubeadm_control_plane_vip_conf }}"
@@ -35,8 +26,7 @@
   ansible.builtin.assert:
     that:
       - "'kubernetes-super-admin' not in kubeadm_control_plane_vip_conf_text"
-      # A block scalar on purpose: inline, the `server: ` inside the pattern is a
-      # YAML key separator and the item parses as a mapping.
+      # Block scalar, because inline the `server: ` would parse as a YAML key.
       - >-
         kubeadm_control_plane_vip_conf_text is search('(?m)^\s*server: https://127\.0\.0\.1:')
     fail_msg: >-
@@ -79,9 +69,7 @@
     kubeadm_control_plane_node_doc: "{{ kubeadm_control_plane_nodes.stdout | from_json }}"
     kubeadm_control_plane_registered: >-
       {{ kubeadm_control_plane_node_doc['items'] | map(attribute='metadata.name') | list }}
-    # Single quotes around the query, so the label name can sit in plain
-    # double quotes. Written as "...\"label\"..." the backslashes reach
-    # JMESPath literally and it rejects the expression.
+    # Single-quoted so the label needs no escaped quotes, which JMESPath rejects.
     kubeadm_control_plane_cp: >-
       {{ kubeadm_control_plane_node_doc
          | community.general.json_query('items[?metadata.labels."node-role.kubernetes.io/control-plane" != null].metadata.name') }}
@@ -89,8 +77,7 @@
       {{ kubeadm_control_plane_node_doc
          | community.general.json_query("items[?spec.taints[?key=='node-role.kubernetes.io/control-plane']].metadata.name") }}
 
-# etcd's own view, through its static pod on this node. Exec works without a
-# CNI: the pod is on the host network.
+# Exec works without a CNI because etcd runs on the host network.
 - name: Read the etcd membership
   ansible.builtin.command: >-
     {{ kubeadm_control_plane_kubectl }} -n kube-system exec etcd-{{ inventory_hostname }} --
@@ -176,8 +163,8 @@
                       ansible_play_hosts_all | map('regex_replace', '^', 'system:node:') | list)
          | map(attribute='metadata.name') | list }}
 
-# From the workstation, by name, through the merged context. The one check that
-# exercises the DNS record, the certificate SAN and roles/kubeconfig together.
+# The one check that exercises the DNS record, the certificate SAN and
+# roles/kubeconfig together.
 - name: Reach the API from the workstation by name
   ansible.builtin.command: "kubectl --context {{ kubeconfig_context }} get --raw /readyz"
   register: kubeadm_control_plane_workstation

@@ -1,0 +1,12 @@
+# revenant: optional local LLM serving, composed by no other playbook because it
+# holds the only GPU and most of the node's memory while it runs.
+#   -e llama_server_model=<name>  required: a key of llama_server_models
+#   -e layer_mode=verify          run its gates, with the model above
+#   -e llama_server_state=absent  remove it, keeping the weights and API key
+
+- import_playbook: ../_layers.yml
+  vars:
+    target: revenant
+    host_roles: []
+    cluster_roles:
+      - llama_server

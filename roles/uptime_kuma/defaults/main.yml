@@ -1,0 +1,13 @@
+uptime_kuma_name: uptime-kuma
+uptime_kuma_namespace: "{{ observability_namespace | default('observability') }}"
+uptime_kuma_port: 3001
+
+uptime_kuma_image: ghcr.io/louislam/uptime-kuma:2
+uptime_kuma_storage_size: 1Gi
+
+uptime_kuma_resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    memory: 1Gi

@@ -1,0 +1,35 @@
+---
+- name: Ensure the observability namespace exists
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ uptime_kuma_namespace }}"
+  # Never deleted by any role, since other workloads share it. Observability
+  # also ensures it, so either role can run standalone.
+
+- name: Apply Uptime Kuma
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition: "{{ lookup('template', 'uptime_kuma.yaml.j2') | from_yaml_all | list }}"
+    apply: true
+    wait: true
+    wait_timeout: 300
+
+- name: Wait for Uptime Kuma to become available
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ uptime_kuma_name }}"
+    namespace: "{{ uptime_kuma_namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+  when: not ansible_check_mode
+

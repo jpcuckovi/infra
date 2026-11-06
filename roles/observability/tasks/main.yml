@@ -1,7 +1,5 @@
-# Traces, metrics, and the discovery contract.
-#
-# Runs AFTER victoriametrics, so Prometheus has a remote_write target the moment
-# it starts rather than dropping its first minutes of samples.
+# Installs traces, metrics and the discovery contract. Runs after
+# victoriametrics so Prometheus has a remote_write target from the start.
 ---
 - name: Ensure the observability namespace exists
   kubernetes.core.k8s:
@@ -12,14 +10,10 @@
       kind: Namespace
       metadata:
         name: "{{ observability_namespace }}"
-  # Created if absent, never deleted. The namespace is shared with workloads
-  # this role does not own — a co-tenant guard rather than an ownership claim.
+  # Never deleted, because the namespace is shared with workloads this role does not own.
 
 # --- Jaeger -----------------------------------------------------------------
-# One Jaeger serves the estate, on the durable box. templates/jaeger.yaml.j2
-# argues the case: "tracing must not compete for resources with the thing being
-# traced, and a lab node is redeployed often". A host that reloads routinely
-# sends its traces to the shared instance and runs none of its own.
+# One Jaeger serves the estate from the durable host; lab nodes run none.
 - name: Apply the Jaeger pipeline configuration
   kubernetes.core.k8s:
     context: "{{ kubeconfig_context }}"
@@ -60,9 +54,7 @@
     mode: "0644"
   delegate_to: localhost
   register: obs_host_values
-  # Written into the repo's gitignored .ansible/ rather than a temp file, on
-  # purpose: when a chart install fails on a values problem, the exact file helm
-  # was given is the first thing worth reading, and a deleted tempfile cannot be.
+  # Kept on disk, not in a tempfile, so a failed install's values can be read.
 
 - name: Install kube-prometheus-stack
   kubernetes.core.helm:
@@ -73,8 +65,7 @@
     chart_version: "{{ kube_prometheus_stack_version }}"
     release_namespace: "{{ observability_namespace }}"
     create_namespace: false
-    # Order is the contract: base carries workload requirements, the rendered
-    # overlay carries this cluster's facts, and later wins.
+    # Later wins: the per-host overlay overrides the shared base.
     values_files:
       - "{{ role_path }}/../../charts/values/kube-prometheus-stack.base.yaml"
       - "{{ observability_values_render_path }}"
@@ -82,17 +73,8 @@
     wait_timeout: "15m"
 
 # --- the discovery contract -------------------------------------------------
-# Addresses are asked of the cluster, never stored in git, so these files stay
-# correct when DHCP moves the node.
-# Dashboards ship to the host that RUNS Grafana, which is the metrics store —
-# the same discriminator prometheus_remote_write_url uses. A lab node writes its
-# series to the shared store and is read from the shared Grafana; shipping a
-# dashboard to a cluster with no Grafana would be applying a ConfigMap nothing
-# reads.
-#
-# Discovered by the chart's sidecar via the grafana_dashboard=1 label, so no
-# Grafana restart and no provisioning file. Applied from files/dashboards/, one
-# ConfigMap per file, so adding a dashboard is dropping a .json in.
+# Addresses are asked of the cluster, not stored in git, so they survive DHCP moves.
+# Dashboards ship only where Grafana runs; its sidecar picks them up by label.
 - name: Find the dashboards to publish
   ansible.builtin.find:
     paths: "{{ role_path }}/files/dashboards"
@@ -115,11 +97,8 @@
         namespace: "{{ observability_namespace }}"
         labels:
           grafana_dashboard: "1"
-      # Built as one expression rather than written as `"{{ ... }}": ...`.
-      # ansible-core 2.19 stopped templating dictionary KEYS in task arguments,
-      # so a templated key reaches the API server as the literal text and the
-      # ConfigMap is rejected. Values are still templated, so the whole mapping
-      # is one.
+      # One expression, because ansible-core 2.19 no longer templates dict keys
+      # in task arguments and the literal key would be rejected.
       data: "{{ {item.path | basename: lookup('ansible.builtin.file', item.path)} }}"
   loop: "{{ obs_dashboards.files | default([]) }}"
   loop_control:
@@ -148,24 +127,9 @@
   delegate_to: localhost
   when: observability_write_discovery_contract | bool
 
-# This role is the ONLY writer of these two files.
-#
-# The problem they solve: two agent repos each installed part of the stack and
-# each recorded the endpoint differently. One wrote a repo-local file and a
-# user-level file; the other wrote only a repo-local one and read only its own.
-# Installing from the wrong repo left the other agent pointed at nothing, and
-# nothing failed loudly — the agents simply ran without telemetry.
-#
-# Readers resolve in order, first hit wins:
-#   1. AGENT_OTLP_ENDPOINT / AGENT_PROM_URL   explicit override
-#   2. ~/.config/diag-agents/<name>           canonical, written here
-#
-# The filenames carry no host, and that is why exactly ONE host may write them.
-# They name where an agent should send telemetry, which is the shared services
-# cluster — a single answer, not one per machine. A second writer would overwrite
-# the first on every run, and tasks/verify.yml asserts the recorded address
-# matches the cluster it just probed, so the two hosts would fail each other's
-# runs alternately while both stacks were perfectly healthy.
+# Only one host may write these: a second writer would overwrite them each run
+# and the two hosts would fail each other's verify gates. Readers check
+# AGENT_OTLP_ENDPOINT / AGENT_PROM_URL first, then these files.
 - name: Record the OTLP endpoint
   ansible.builtin.copy:
     content: "{{ obs_node_ip }}:{{ jaeger_otlp_http_node_port }}\n"

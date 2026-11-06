@@ -1,0 +1,8 @@
+---
+- name: Necropolis — Rolling Patch
+  hosts: necropolis
+  serial: 1
+  max_fail_percentage: 0
+  become: true
+  roles:
+    - rolling_patch

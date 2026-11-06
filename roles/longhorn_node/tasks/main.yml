@@ -1,11 +1,5 @@
-# Longhorn node prerequisites, and the data disk.
-#
-# The disk tasks are the only destructive ones in this repository, so they are
-# written to refuse rather than guess. The disk is identified by elimination —
-# the one disk with no partition table, no filesystem and no children — and
-# anything else about the machine's disks stops the run with a list of what was
-# found. A disk carrying any signature is never formatted, and nothing here ever
-# forces.
+# Longhorn node prerequisites and the data disk. The disk tasks are the only
+# destructive ones in the repository, so they refuse rather than guess.
 ---
 - name: Install the Longhorn node packages
   ansible.builtin.apt:
@@ -40,10 +34,8 @@
   when: not ansible_check_mode
 
 # ---- multipathd -------------------------------------------------------------
-# Only where multipath-tools is installed, which the Ubuntu Server installer
-# does by default. A blacklist rather than masking the service, because it is
-# the fix Longhorn documents and it leaves multipath working for any device
-# that is not Longhorn's.
+# A blacklist rather than masking the service: it is Longhorn's documented fix
+# and leaves multipath working for other devices.
 
 - name: Check for multipathd
   ansible.builtin.stat:
@@ -87,9 +79,7 @@
 - name: Prepare the data disk
   when: longhorn_node_labelled.rc != 0
   block:
-    # -b for sizes in bytes, and the columns that say whether a disk is in use:
-    # a partition table (PTTYPE), a filesystem or other signature directly on
-    # the disk (FSTYPE), or any child at all.
+    # PTTYPE, FSTYPE and children are what mark a disk as in use.
     - name: Read the block devices
       ansible.builtin.command: lsblk --json --bytes --output NAME,PATH,TYPE,SIZE,RM,RO,PTTYPE,FSTYPE,MODEL
       register: longhorn_node_lsblk
@@ -155,19 +145,14 @@
              ~ '1' }}
         fstype: "{{ longhorn_node_fstype }}"
         opts: "-L {{ longhorn_node_fs_label }}"
-        # force stays false, deliberately. The filesystem module refuses a
-        # device that already carries a signature, which is a second guard
-        # behind the blank-disk assert above.
+        # force stays false: the module refuses a device with a signature, a
+        # second guard behind the blank-disk assert.
         force: false
-      # Under --check the partition above was only simulated, and the module
-      # fails on a device node that does not exist rather than reporting what
-      # it would do.
+      # Under --check the partition was only simulated, so the device is absent.
       when: not ansible_check_mode
 
-# nofail, so a dead data disk leaves a node that boots and can be reached rather
-# than one stranded in emergency mode. Longhorn does not then fill the root disk
-# in its place: it records a UUID on each disk it manages and marks a disk whose
-# UUID no longer matches as unschedulable.
+# nofail keeps a node bootable if the disk dies. Longhorn does not fall back to
+# the root disk: a disk whose recorded UUID no longer matches is unschedulable.
 - name: Mount the data disk at Longhorn's data path
   ansible.posix.mount:
     path: "{{ longhorn_node_data_path }}"

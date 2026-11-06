@@ -1,0 +1,60 @@
+---
+- name: Read the AWX deployment
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: AWX
+    name: "{{ awx_name }}"
+    namespace: "{{ awx_namespace }}"
+    api_version: awx.ansible.com/v1beta1
+  register: awx_object
+  check_mode: false
+
+- name: Assert AWX is available
+  ansible.builtin.assert:
+    that:
+      - awx_object.resources | length == 1
+      - >-
+        (awx_object.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Successful')
+        | map(attribute='status') | list) == ['True']
+
+- name: Assert database volume is bound
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: PersistentVolumeClaim
+    name: "{{ awx_postgres_pvc }}"
+    namespace: "{{ awx_namespace }}"
+  register: awx_pvc
+  check_mode: false
+  failed_when: >-
+    awx_pvc.resources | length != 1
+    or awx_pvc.resources[0].status.phase != 'Bound'
+    or awx_pvc.resources[0].spec.storageClassName != awx_postgres_storage_class
+
+- name: Request the AWX API over HTTPS, verifying against the workstation CA
+  ansible.builtin.uri:
+    url: "{{ awx_url }}/api/v2/ping/"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+    return_content: true
+  register: awx_ping
+  failed_when: false
+  check_mode: false
+
+- name: Assert the AWX API answers with a working control plane
+  ansible.builtin.assert:
+    that:
+      - awx_ping.status == 200
+      - awx_controlplane | length == 1
+      - awx_controlplane[0].capacity > 0
+    fail_msg: >-
+      {{ awx_url }}/api/v2/ping/ returned {{ awx_ping.status }}; instance
+      groups: {{ awx_ping.json.instance_groups | default([])
+                 | map(attribute='name') | join(', ') or 'none' }}.
+      Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ awx_namespace }} get pods
+    success_msg: "AWX API answers; controlplane capacity {{ awx_controlplane[0].capacity }}"
+  vars:
+    awx_controlplane: >-
+      {{ awx_ping.json.instance_groups | default([])
+         | selectattr('name', 'equalto', 'controlplane') | list }}

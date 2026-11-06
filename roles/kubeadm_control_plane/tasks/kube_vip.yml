@@ -1,20 +1,8 @@
-# kube-vip's kubeconfig and static pod, from a given source kubeconfig.
-#
-# Included twice by main.yml: with super-admin.conf during init, and with
-# admin.conf everywhere afterwards. The manifest carries a checksum of the
-# kubeconfig, so a change of source recreates the pod and an unchanged one
-# leaves it alone.
-#
-# Expects kubeadm_control_plane_vip_source: the source kubeconfig's text.
+# Writes kube-vip's kubeconfig and static pod from kubeadm_control_plane_vip_source
+# (a kubeconfig's text). The manifest checksums the kubeconfig, so only a change restarts it.
 ---
-# The loopback rewrite. Both kubeconfigs name the VIP as their server; kube-vip
-# needs the API to take the lease that CREATES the VIP, so pointed at the VIP it
-# waits forever. The API server also listens on the node's own address, so
-# 127.0.0.1 reaches it whether or not the VIP exists — and the init
-# configuration puts 127.0.0.1 in the API certificate's SANs for exactly this.
-#
-# Rendered in the play rather than with sed on the node, so a pattern that
-# matches nothing fails the assert below instead of writing a file unchanged.
+# kube-vip needs the API to take the lease that creates the VIP, so it must reach
+# the API on 127.0.0.1 (in the cert SANs), never through the VIP itself.
 - name: Derive kube-vip's loopback kubeconfig
   ansible.builtin.set_fact:
     kubeadm_control_plane_vip_conf_content: >-
@@ -26,9 +14,7 @@
 - name: Assert the rewrite reached the server line
   ansible.builtin.assert:
     that:
-      # A block scalar on purpose. Written inline, the `server: ` inside the
-      # pattern is a YAML key separator, the item parses as a mapping, and
-      # Ansible rejects it with "Conditional expressions must be strings".
+      # Block scalar, because inline the `server: ` would parse as a YAML key.
       - >-
         kubeadm_control_plane_vip_conf_content is search('(?m)^\s*server: https://127\.0\.0\.1:'
         ~ kubeadm_control_plane_port ~ '\s*$')

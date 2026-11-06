@@ -1,0 +1,97 @@
+---
+- name: Assert the requested model is known
+  ansible.builtin.include_tasks: assert_model.yml
+
+- name: Read the node's GPU capacity
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Node
+    name: "{{ inventory_hostname }}"
+  register: llama_server_node
+  check_mode: false
+
+# Read from the node, because gpu-sharing.yml changes this without changing any
+# variable here.
+- name: Assert the node advertises one unshared GPU
+  ansible.builtin.assert:
+    that:
+      - llama_server_gpu_count | int == 1
+    fail_msg: >-
+      {{ inventory_hostname }} advertises {{ llama_server_gpu_count }}
+      nvidia.com/gpu; this role needs exactly one.
+
+      Zero leaves the pod Pending. More than one means sharing is on, and a pod
+      beside this one would compete for memory the model has already filled.
+      Reset it with playbooks/revenant/gpu-sharing.yml.
+    success_msg: "one unshared GPU"
+  vars:
+    llama_server_gpu_count: >-
+      {{ (llama_server_node.resources | default([{}]) | first)
+         .status.capacity['nvidia.com/gpu'] | default(0) }}
+
+- name: Look for the namespace
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Namespace
+    name: "{{ llama_server_namespace }}"
+  register: llama_server_ns
+  check_mode: false
+
+- name: Create the namespace
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ llama_server_namespace }}"
+
+# From the workstation file, generated on the first run of either this role or
+# open_webui, so the key survives a reload of revenant and both clusters agree.
+- name: Settle the API key
+  ansible.builtin.set_fact:
+    llama_server_api_key: >-
+      {{ lookup('ansible.builtin.password', llama_server_key_file,
+                chars=['ascii_letters', 'digits'], length=48) }}
+  no_log: true
+
+# Applied every run, so the Secret always matches the file. A dry run does not
+# create the namespace, so before a first install the API refuses everything
+# inside it with a 404; hence the guards here and below.
+- name: Write the API key Secret
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ llama_server_key_secret }}"
+        namespace: "{{ llama_server_namespace }}"
+      type: Opaque
+      stringData:
+        api-key: "{{ llama_server_api_key }}"
+  no_log: true
+  when: not ansible_check_mode or llama_server_ns.resources | length > 0
+
+- name: Apply the server
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition: "{{ lookup('template', 'llama_server.yaml.j2') | from_yaml_all | list }}"
+    apply: true
+  when: not ansible_check_mode or llama_server_ns.resources | length > 0
+
+- name: Wait for the server to become available
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Deployment
+    name: "{{ llama_server_name }}"
+    namespace: "{{ llama_server_namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: "{{ llama_server_wait_timeout }}"
+  when: not ansible_check_mode

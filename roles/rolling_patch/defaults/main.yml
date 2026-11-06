@@ -1,0 +1,18 @@
+---
+rolling_patch_longhorn_namespace: longhorn-system
+
+# Longhorn lifts its instance-manager PDB only after it sees the cordon, so the
+# first eviction can be refused on a healthy cluster.
+rolling_patch_drain_timeout: 300
+rolling_patch_drain_retries: 5
+rolling_patch_drain_delay: 30
+
+rolling_patch_reboot_timeout: 900
+
+# Node Ready and etcd health, polled: 60 x 10s.
+rolling_patch_ready_retries: 60
+rolling_patch_ready_delay: 10
+
+# Replica rebuilds copy data, so this scales with what is stored.
+rolling_patch_volume_retries: 180
+rolling_patch_volume_delay: 10

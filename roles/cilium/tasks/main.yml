@@ -1,8 +1,4 @@
 # Install Cilium, then wait for the nodes it networks to become Ready.
-#
-# Same shape as the chart installs in roles/observability and roles/clabernetes:
-# context named explicitly, chart version pinned in group_vars, workload
-# requirements from charts/values/, facts about this cluster passed as values.
 ---
 - name: Read the nodes
   kubernetes.core.k8s_info:
@@ -11,14 +7,8 @@
   register: cilium_nodes
   check_mode: false
 
-# Checked before installing, for the reason roles/clabernetes refuses the
-# superseded CRD: the conflicting state installs cleanly and fails later.
-#
-# k3s_server_args is declared, not reconciled (docs/ARCHITECTURE.md). A host
-# installed before --flannel-backend=none was added still runs flannel, and a
-# second CNI on top gives pods addresses from one plugin and routes from the
-# other. The result is intermittent, and it is reported as a networking fault
-# rather than as two CNIs.
+# Two CNIs install cleanly and then fail intermittently, looking like a generic
+# networking fault, so a node still on flannel is refused up front.
 - name: Refuse to install onto a node that k3s networks with flannel
   ansible.builtin.assert:
     that:
@@ -45,9 +35,8 @@
          | map(attribute='metadata.name') | list }}
 
 # ---- LoadBalancer addressing ----------------------------------------------------
-# Pools are declared as host offsets; the network is the nodes' own, from facts,
-# so no routable address is committed. Settled before anything is installed, so
-# a malformed pool fails the run with nothing half-applied.
+# Pools are host offsets on the nodes' own network (from facts), so no address is
+# committed. Validated before any install so a bad pool leaves nothing half-applied.
 
 - name: Settle the cluster's LAN network
   ansible.builtin.set_fact:
@@ -63,9 +52,8 @@
          | unique | list }}
   when: lb_pools | length > 0
 
-# One address per host offset, accumulated as a real list. A single Jinja
-# expression with a loop statement renders to TEXT that only looks like a list,
-# and the collision check below would then compare characters.
+# Accumulated per loop item: a Jinja for-loop renders text that only looks like
+# a list, and the collision check would then compare characters.
 - name: Settle every address the pools hold
   ansible.builtin.set_fact:
     cilium_pool_addresses: >-
@@ -111,19 +99,11 @@
   when: lb_pools | length > 0
 
 # ---- Gateway API CRDs -------------------------------------------------------------
-# BEFORE the chart. Cilium's Gateway controller only starts if it finds these
-# CRDs when the operator starts; installed afterwards, Gateways are accepted by
-# the API and programmed by nothing, and the symptom is a Gateway that never
-# reports an address.
-#
-# Server-side apply because the CRDs carry schemas larger than the annotation a
-# client-side apply writes ("metadata.annotations: Too long").
-#
-# Fetched by a task, not with the `url` lookup. A lookup runs inside Ansible's
-# forked worker, and on a macOS workstation Python's URL handling asks the
-# system for its proxy settings, which aborts in a forked process: the run
-# stops with "A worker was found in a dead state" and nothing else. A module
-# runs in a fresh interpreter and has no such problem.
+# Before the chart: the Gateway controller starts only if these CRDs exist when
+# the operator does, else Gateways never get an address.
+# Server-side apply, since the schemas overflow the client-side annotation.
+# Fetched by a module, not the `url` lookup, which crashes a forked worker on
+# macOS ("A worker was found in a dead state").
 - name: Fetch the Gateway API CRDs
   ansible.builtin.uri:
     url: "{{ cilium_gateway_api_crds_url }}"
@@ -152,9 +132,8 @@
     chart_version: "{{ cilium_version }}"
     release_namespace: "{{ cilium_namespace }}"
     create_namespace: false
-    # The file carries what the workload requires. The values below are facts
-    # about this cluster's shape and appear nowhere in the file, so the two
-    # sources never set the same key.
+    # The file holds workload requirements; the values below hold cluster shape.
+    # The two never set the same key.
     values_files:
       - "{{ role_path }}/../../charts/values/cilium.yaml"
     values: >-
@@ -188,13 +167,8 @@
       gatewayAPI:
         enabled: true
 
-# helm's wait covers the release's own workloads. The nodes' Ready condition is
-# the thing this role exists to produce, so it is waited on directly: it turns
-# True only once the CNI has written its configuration and kubelet has accepted
-# it. roles/k3s_server and roles/kubeadm_control_plane both deliberately stop
-# short of it.
-#
-# Every node of the cluster, not only the host this layer runs on.
+# helm's wait covers only the release. Node Ready, which the k3s and kubeadm
+# roles deliberately stop short of, is waited on here for every cluster node.
 - name: Wait for every node to report Ready
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"
@@ -212,11 +186,8 @@
   delay: "{{ cilium_node_ready_delay }}"
 
 # ---- LoadBalancer pools and L2 announcements ----------------------------------------
-# After the chart, which installs the CRDs these are instances of.
-#
-# CiliumLoadBalancerIPPool is cilium.io/v2 and CiliumL2AnnouncementPolicy is
-# still cilium.io/v2alpha1. They genuinely differ; matching them "for
-# consistency" breaks one.
+# After the chart, which installs these CRDs. The apiVersions genuinely differ
+# (v2 and v2alpha1); aligning them breaks one.
 
 - name: Declare the LoadBalancer pools
   kubernetes.core.k8s:
@@ -229,14 +200,11 @@
         name: "{{ item.name }}"
       spec:
         blocks:
-          # start/stop rather than a cidr: a reserved slice of the LAN, not a
-          # subnet of its own.
+          # start/stop: a reserved slice of the LAN, not a subnet of its own.
           - start: "{{ cilium_lan_prefix }}.{{ item.first }}"
             stop: "{{ cilium_lan_prefix }}.{{ item.last }}"
-        # A labelled pool serves only Services carrying its label; an unlabelled
-        # pool serves only Services WITHOUT the label. Together the pools
-        # partition every Service, so no Service can draw a labelled pool's
-        # address by accident. An absent selector would match everything.
+        # Labelled and unlabelled pools partition Services, so none draws a
+        # labelled pool's address by accident; no selector would match all.
         serviceSelector: >-
           {{ {'matchLabels': {lb_pool_label: item.label}}
              if item.label is defined else
@@ -245,10 +213,8 @@
   loop_control:
     label: "{{ item.name }}"
 
-# nodeSelector DELIBERATELY ABSENT. Cilium's upstream example excludes
-# control-plane nodes, and every node here is one: copied verbatim it selects
-# nothing, services show an EXTERNAL-IP, and nothing ever answers ARP for it.
-# Found on k8s-aio, where it read as a routing fault.
+# No nodeSelector: upstream's example excludes control-plane nodes, which here is
+# every node, so Services get an EXTERNAL-IP that nothing answers ARP for.
 - name: Announce LoadBalancer addresses on the LAN
   kubernetes.core.k8s:
     context: "{{ kubeconfig_context }}"
@@ -259,15 +225,13 @@
       metadata:
         name: lan
       spec:
-        # The LAN interface only, from facts. Unset, Cilium may also announce on
-        # cilium_host and other cluster-internal interfaces.
+        # Unset, Cilium may also announce on cilium_host and internal interfaces.
         interfaces: "{{ cilium_node_interfaces | map('regex_replace', '^', '^') | map('regex_replace', '$', '$') | list }}"
         loadBalancerIPs: true
         externalIPs: false
   when: cilium_l2_announcements
 
-# The address is asked of the cluster rather than stored, as roles/observability
-# does for its endpoints, so the report stays right when DHCP moves the node.
+# Asked of the cluster rather than stored, so it stays right when DHCP moves the node.
 - name: Report the Hubble UI
   ansible.builtin.debug:
     msg: "hubble ui       http://{{ cilium_node_ip }}:{{ hubble_ui_node_port }}"

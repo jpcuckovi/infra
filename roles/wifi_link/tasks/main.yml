@@ -1,28 +1,13 @@
-# Disable power save on every wireless interface this host carries.
-#
-# Composed only by hosts in wifi_hosts. A wired machine needs none of these
-# tasks — not a subset of them with different values — which is the test for a
-# separate role rather than a `when:` inside base.
-#
-# The failure this exists to prevent: phantom's link dropped at 02:47 with
-# `brcmf_cyw_external_auth: External authentication failed`, and the box stayed
-# up and healthy, serving its registry to nobody, for three and a half hours.
-# Power save is the most common cause of a wireless drop that never recovers,
-# because a sleeping radio misses the reassociation it needed to answer.
+# Disables power save on every wireless interface of a wifi_hosts member. A
+# sleeping radio can miss a reassociation and leave the host up but unreachable.
 ---
 - name: Install the wireless tools
   ansible.builtin.apt:
     name: "{{ wifi_link_packages }}"
     state: present
 
-# /sys/class/net/<iface>/wireless exists if and only if the interface is
-# wireless, on every driver and every kernel. That is why it is used here rather
-# than matching on names: `wlan0` is a brcmfmac convention, systemd's predictable
-# naming gives `wlp2s0`, and this estate has both.
-#
-# follow: true because the entries under /sys/class/net are symlinks into
-# /sys/devices — without it the search never descends and finds nothing, on a
-# host where every interface is wireless.
+# A `wireless` directory marks a wireless interface on any driver, unlike names.
+# follow is required because /sys/class/net entries are symlinks.
 - name: Discover the wireless interfaces
   ansible.builtin.find:
     paths: /sys/class/net
@@ -62,6 +47,7 @@
     owner: root
     group: root
     mode: "0644"
+  register: wifi_link_unit
 
 - name: Enable and start power-save suppression per interface
   ansible.builtin.systemd_service:
@@ -72,7 +58,17 @@
   loop: "{{ wifi_link_managed }}"
   loop_control:
     label: "{{ item }}"
-  # Under --check the unit above was only simulated, so systemd has no
-  # wifi-powersave@ template to instantiate and this fails on a host where
-  # nothing is wrong. Same idiom, and same reason, as the registry's start task.
+  # Under --check the template unit was never written, so this would fail.
   when: not ansible_check_mode
+
+# An already-enabled unit is left alone by `enabled: true`, so a changed
+# [Install] section needs a reenable to create its new links.
+- name: Re-enable power-save suppression after the unit's install targets change
+  ansible.builtin.command: "systemctl reenable wifi-powersave@{{ item }}.service"
+  loop: "{{ wifi_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - wifi_link_unit is changed

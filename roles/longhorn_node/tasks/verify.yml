@@ -1,9 +1,5 @@
-# Gates for Longhorn node readiness.
-#
-# The mount gate is the one that matters most. A data path that is a plain
-# directory on the root filesystem looks exactly like a working one until
-# Longhorn fills the boot drive, so the gate asserts the path is its own mount,
-# of the labelled filesystem.
+# Gates for Longhorn node readiness. The data path must be its own mount, since
+# a plain directory looks fine until Longhorn fills the boot drive.
 ---
 - name: Read the Longhorn data path mount
   ansible.builtin.command: >-

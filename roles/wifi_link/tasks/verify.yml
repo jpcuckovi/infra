@@ -1,9 +1,5 @@
-# Gates for the wireless link.
-#
-# Asserts the RADIO's state, not the unit's. A unit that is enabled and active
-# proves systemd ran `iw`; it does not prove the setting took, and after a
-# driver reload the difference is the whole question. `iw ... get power_save`
-# asks the interface.
+# Gates for the wireless link. Asserts the radio's state rather than the unit's,
+# since a driver reload can undo the setting after the unit ran.
 ---
 - name: Discover the wireless interfaces
   ansible.builtin.find:
@@ -50,10 +46,7 @@
       reloaded after the unit last ran.
     success_msg: "power save off: {{ wifi_link_managed | join(', ') }}"
   vars:
-    # `iw get power_save` prints "Power save: on" or "Power save: off". Matched
-    # on the whole word so that "off" never matches inside another token, and
-    # searched case-insensitively because the label has changed case between
-    # iw releases.
+    # Case-insensitive because the label's case has changed between iw releases.
     wifi_link_on: >-
       {{ wifi_link_state.results
          | selectattr('stdout', 'search', '(?i)power save:\s*on\b')

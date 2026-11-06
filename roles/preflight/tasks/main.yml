@@ -1,23 +1,8 @@
-# Host-layer preconditions. Runs before anything is changed.
-#
-# This role exists to preserve one property of the shell scripts it replaces:
-# their error messages. `die "API_VIP is unset — copy cluster.env.example to
-# cluster.env and fill it in"` tells the reader what to do; an Ansible
-# undefined-variable traceback tells them a template failed. Every assert here
-# carries a fail_msg written for whoever hits it at 1am.
-#
-# Nothing in this file changes state, so it is safe under --check and runs in
-# full there — unlike the command-shaped tasks it guards.
+# Host-layer preconditions, run before anything changes and safe under --check.
+# Each fail_msg says what to do, as the replaced shell scripts' errors did.
 ---
-# Facts are read as ansible_facts['name'] throughout, never as the bare
-# ansible_<name> form. INJECT_FACTS_AS_VARS, which creates those top-level
-# aliases, is deprecated and goes away in ansible-core 2.24.
-#
-# Worth migrating ahead of the removal rather than after it: bare facts do not
-# fail loudly when the alias disappears, they become undefined INSIDE assert
-# conditions. Every gate in this repository then fails with a variable error, on
-# hosts that are perfectly healthy, and the message names neither the fact nor
-# the deprecation.
+# Facts are read as ansible_facts['name']: the bare ansible_<name> aliases go away
+# in ansible-core 2.24 and would turn every gate into an undefined-variable error.
 - name: Assert the target is Debian-family
   ansible.builtin.assert:
     that:
@@ -49,21 +34,9 @@
       rather than this machine.
   when: "'k3s_servers' in group_names or 'kubeadm_clusters' in group_names"
 
-# Kubelet refuses to start without a memory cgroup, and on a board where the
-# controller is absent the failure arrives as a k3s that never becomes Ready,
-# with the cause several layers below anything the playbook touches.
-#
-# Read from /sys/fs/cgroup/cgroup.controllers rather than by grepping
-# /proc/cmdline. On a Raspberry Pi the running command line is assembled from a
-# firmware-injected prefix plus a file selected through `os_prefix` in
-# config.txt — so /boot/firmware/cmdline.txt is frequently NOT the file in use,
-# and a cmdline grep tests a boot parameter rather than the capability it was
-# supposed to produce. The controllers file is the capability itself, and it is
-# the same check on every distribution and board.
-#
-# For the record, because the advice is everywhere and is wrong here:
-# `cgroup_enable=memory cgroup_memory=1` is Raspberry Pi OS guidance. Ubuntu's
-# Pi kernels enable the memory controller by default and need no cmdline edit.
+# Read from cgroup.controllers, not /proc/cmdline: on a Pi, os_prefix in
+# config.txt often selects a file other than cmdline.txt. Ubuntu's Pi kernels
+# need no cgroup_memory edit; that advice is for Raspberry Pi OS.
 - name: Read the available cgroup controllers
   ansible.builtin.slurp:
     src: /sys/fs/cgroup/cgroup.controllers

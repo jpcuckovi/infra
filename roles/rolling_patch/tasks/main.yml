@@ -1,0 +1,131 @@
+---
+# Kubernetes API tasks run on the workstation; apt and reboot run on the node.
+
+- name: Assert no Longhorn volume is degraded before draining
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: longhorn.io/v1beta2
+    kind: Volume
+    namespace: "{{ rolling_patch_longhorn_namespace }}"
+  register: rolling_patch_volumes_before
+  failed_when: >-
+    rolling_patch_volumes_before.resources
+    | selectattr('status.robustness', 'in', ['degraded', 'faulted']) | list | length > 0
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+- name: Drain {{ inventory_hostname }}
+  kubernetes.core.k8s_drain:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ inventory_hostname }}"
+    state: drain
+    delete_options:
+      ignore_daemonsets: true
+      delete_emptydir_data: true
+      wait_timeout: "{{ rolling_patch_drain_timeout }}"
+  register: rolling_patch_drain
+  # A refused eviction (PDB) fails the module, but a wait_timeout only warns;
+  # treat both as failure so nothing reboots with pods still on the node.
+  failed_when: >-
+    rolling_patch_drain.failed | default(false)
+    or rolling_patch_drain.warnings | default([])
+    | select('search', 'timeout reached') | list | length > 0
+  retries: "{{ rolling_patch_drain_retries }}"
+  delay: "{{ rolling_patch_drain_delay }}"
+  until: rolling_patch_drain is succeeded
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+# dist, not safe: a new kernel is a new package, which safe holds back.
+# kubelet/kubeadm/kubectl are held by roles/kubeadm_node, so they don't move.
+- name: Upgrade packages on {{ inventory_hostname }}
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: dist
+  register: rolling_patch_apt
+  retries: 3
+  delay: 30
+  until: rolling_patch_apt is succeeded
+
+# A fast reboot can finish inside the node-monitor grace period, so the Node
+# never goes NotReady and a plain Ready check passes on stale status. The
+# kubelet reports a new bootID only once it is actually back.
+- name: Record the boot ID of {{ inventory_hostname }}
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: v1
+    kind: Node
+    name: "{{ inventory_hostname }}"
+  register: rolling_patch_node_before
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+- name: Reboot {{ inventory_hostname }}
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ rolling_patch_reboot_timeout }}"
+    msg: "Rebooting for patches (ansible, roles/rolling_patch)"
+
+- name: Wait for {{ inventory_hostname }} to rejoin Ready
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: v1
+    kind: Node
+    name: "{{ inventory_hostname }}"
+  register: rolling_patch_node_after
+  until:
+    - rolling_patch_node_after.resources | default([]) | length == 1
+    - rolling_patch_node_after.resources[0].status.nodeInfo.bootID
+      != rolling_patch_node_before.resources[0].status.nodeInfo.bootID
+    - rolling_patch_node_after.resources[0].status.conditions
+      | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == 'True'
+  retries: "{{ rolling_patch_ready_retries }}"
+  delay: "{{ rolling_patch_ready_delay }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+# The next node's reboot takes its etcd member down; this one must be back first.
+# Asked of etcd itself on its metrics listener, which has no stale-status problem.
+- name: Wait for etcd on {{ inventory_hostname }} to be healthy
+  ansible.builtin.uri:
+    url: http://127.0.0.1:2381/health
+    return_content: true
+  register: rolling_patch_etcd
+  until: rolling_patch_etcd.json.health | default('false') == 'true'
+  retries: "{{ rolling_patch_ready_retries }}"
+  delay: "{{ rolling_patch_ready_delay }}"
+
+- name: Uncordon {{ inventory_hostname }}
+  kubernetes.core.k8s_drain:
+    context: "{{ kubeconfig_context }}"
+    name: "{{ inventory_hostname }}"
+    state: uncordon
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+# Otherwise the next node's drain blocks on Longhorn's last-replica policy.
+- name: Wait for Longhorn volumes to be healthy again
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: longhorn.io/v1beta2
+    kind: Volume
+    namespace: "{{ rolling_patch_longhorn_namespace }}"
+  register: rolling_patch_volumes_after
+  until: >-
+    rolling_patch_volumes_after.resources | default([])
+    | selectattr('status.robustness', 'in', ['degraded', 'faulted']) | list | length == 0
+  retries: "{{ rolling_patch_volume_retries }}"
+  delay: "{{ rolling_patch_volume_delay }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"

@@ -1,0 +1,9 @@
+# ups_main: the power domain of the one large UPS. Not in necropolis.yml,
+# because phantom and wraith draw from it too.
+
+# ---- nut -------------------------------------------------------------------
+
+# The host with the USB cable serves the UPS; every other member is a client.
+nut_server_host: spectre
+nut_server_address: "{{ nut_server_host }}.lan"
+nut_mode: "{{ 'netserver' if inventory_hostname == nut_server_host else 'netclient' }}"

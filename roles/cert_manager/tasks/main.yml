@@ -10,8 +10,7 @@
   delegate_to: localhost
   become: false
 
-# regenerate: never — an existing key is kept whatever its parameters, because
-# replacing it is replacing the root.
+# An existing key is kept whatever its parameters: replacing it replaces the root.
 - name: Generate the CA key, once
   community.crypto.openssl_privatekey:
     path: "{{ cert_manager_ca_key }}"
@@ -29,9 +28,8 @@
   delegate_to: localhost
   become: false
 
-# Only when absent. The certificate module's own idempotency would reissue a
-# root whose parameters drifted from these defaults; a root is not something to
-# reissue by accident.
+# Only when absent, since the module would otherwise reissue a root whose
+# parameters drifted from these defaults.
 - name: Issue the CA certificate, once
   when: not cert_manager_ca_crt_stat.stat.exists
   delegate_to: localhost
@@ -83,16 +81,14 @@
     release_namespace: "{{ cert_manager_namespace }}"
     create_namespace: true
     values:
-      # The chart manages its CRDs, and keeps them on uninstall: deleting the
-      # CRDs would delete every Certificate in the cluster with them.
+      # Kept on uninstall, since deleting the CRDs deletes every Certificate.
       crds:
         enabled: true
         keep: true
     wait: true
     wait_timeout: "10m"
 
-# The key leaves the workstation here — cert-manager has to sign with it. The
-# workstation copy stays authoritative and is what survives a rebuild.
+# cert-manager must sign with the key; the workstation copy stays authoritative.
 - name: Import the root CA for cert-manager
   kubernetes.core.k8s:
     context: "{{ kubeconfig_context }}"
@@ -110,8 +106,7 @@
   no_log: true
   when: not ansible_check_mode or cert_manager_ca_crt_stat.stat.exists
 
-# No SelfSigned bootstrap issuer, on purpose: the root is external to the
-# cluster, which is what makes it durable.
+# No SelfSigned bootstrap issuer: the root is deliberately external.
 - name: Declare the CA ClusterIssuer
   kubernetes.core.k8s:
     context: "{{ kubeconfig_context }}"

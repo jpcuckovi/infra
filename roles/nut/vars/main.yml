@@ -1,5 +1,4 @@
-# Derived from nut_mode. Not settings: each restates the mode as the question a
-# task actually asks.
+# Derived from nut_mode; not settings.
 ---
 # Whether a UPS is cabled to this host, and so whether the driver and upsd run.
 nut_local_ups: "{{ nut_mode != 'netclient' }}"

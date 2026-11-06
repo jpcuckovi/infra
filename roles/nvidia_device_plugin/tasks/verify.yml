@@ -1,9 +1,5 @@
-# Gates for GPU scheduling and GPU telemetry.
-#
-# Two questions, asked separately: can the cluster SCHEDULE onto the card, and
-# can anything SEE what the card is doing. A host can pass the first and fail
-# the second, and the second is what makes remote-writing this cluster's metrics
-# worth anything.
+# Gates for GPU scheduling and GPU telemetry, checked separately because a host
+# can pass the first and fail the second.
 ---
 - name: Read the node's advertised capacity
   kubernetes.core.k8s_info:
@@ -73,10 +69,8 @@
       0 of 0 ready, and the install reports success having scheduled nothing.
     success_msg: "device plugin rolled out: {{ nvidia_ds_census | join(', ') }}"
   vars:
-    # The chart ships TWO DaemonSets under this label — the plugin and the MPS
-    # control daemon. The second is gated on nvidia.com/mps.capable and sits at
-    # 0 by design whenever sharing is off, which is why this counts DaemonSets
-    # that scheduled something rather than requiring exactly one to exist.
+    # The label also matches the MPS daemon, which is at 0 when sharing is off,
+    # so only DaemonSets that scheduled something are counted.
     nvidia_ds_all: "{{ nvidia_ds_gate.resources | default([]) }}"
     nvidia_ds_scheduled: >-
       {{ nvidia_ds_all
@@ -92,10 +86,8 @@
          | zip(nvidia_ds_all | map(attribute='status.numberReady', default=0) | map('string'))
          | map('join', '=') | list }}
 
-# Asked of Prometheus rather than of the exporter, because the exporter being
-# healthy proves nothing about whether anything is scraping it. The failure this
-# catches is scrapeTimeout > interval, which makes Prometheus drop the entire
-# DCGM job — the exporter stays green and the metrics simply never exist.
+# Asked of the metrics store, not the exporter: scrapeTimeout > interval drops
+# the whole DCGM job while the exporter stays healthy.
 - name: Ask Prometheus which DCGM series it holds
   ansible.builtin.uri:
     url: "http://{{ metrics_alias }}:{{ victoriametrics_node_port }}/api/v1/label/__name__/values"

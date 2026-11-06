@@ -1,0 +1,16 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/awx.
+---
+apiVersion: awx.ansible.com/v1beta1
+kind: AWX
+metadata:
+  name: {{ awx_name }}
+  namespace: {{ awx_namespace }}
+spec:
+  service_type: ClusterIP
+  postgres_storage_class: {{ awx_postgres_storage_class }}
+  postgres_data_volume_init: true
+  postgres_storage_requirements:
+    requests:
+      storage: {{ awx_postgres_storage_size }}
+

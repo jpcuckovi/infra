@@ -1,8 +1,5 @@
-# Gates for the NVIDIA host stack.
-#
-# The last one is the point of the whole role: it checks that k3s picked the
-# runtime up. Everything before it can pass on a host where the GPU is
-# nonetheless unusable from a container.
+# Gates for the NVIDIA host stack. The last one, that k3s picked up the
+# runtime, is the one that proves the GPU is usable from a container.
 ---
 - name: Read the driver version
   ansible.builtin.command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
@@ -44,14 +41,8 @@
     success_msg: "{{ nvidia_ctk_gate.stdout_lines | first | default('nvidia-ctk present') | trim }}"
 
 # --- the versions are what they say they are ---------------------------------
-# Everything above asks whether the stack WORKS. These ask whether it is the
-# stack this repository declared, which is a different question and was
-# previously asked by nothing.
-#
-# The driver assert above compares a MINIMUM major (570) — deliberately, because
-# that floor is a property of Blackwell rather than of the chosen package. It
-# therefore passes on any driver newer than the floor, which is most of them.
-# It cannot detect drift and was never meant to.
+# The driver gate above checks only the hardware's minimum major, so drift from
+# the declared version is caught here.
 - name: Read which packages are held
   ansible.builtin.command: apt-mark showhold
   register: nvidia_holds
@@ -67,13 +58,8 @@
   failed_when: false
   check_mode: false
 
-# `apt-mark showhold` prints one package name per line and nothing else, so the
-# membership test is a list operation rather than a pattern match against a
-# status string. Asking a question that has a structural answer structurally is
-# the difference between a gate and a guess — dpkg's `db:Status-Abbrev` encodes
-# the same fact as three positional characters, and reading it would have meant
-# matching 'h' at an offset.
-- name: Assert the driver and toolkit are held at their installed versions
+# `apt-mark showhold` lists one name per line, so this is a list membership test.
+- name: Assert the packages that must not move are held
   ansible.builtin.assert:
     that:
       - nvidia_unheld | length == 0
@@ -89,14 +75,24 @@
 
       roles/nvidia_runtime applies the hold, so this failing means that task was
       skipped or something released it:  sudo apt-mark showhold
-    success_msg: "held: {{ nvidia_pinned_packages | join(', ') }}"
+    success_msg: "held: {{ nvidia_held_packages | join(', ') }}"
   vars:
     nvidia_unheld: >-
-      {{ nvidia_pinned_packages | reject('in', nvidia_holds.stdout_lines) | list }}
+      {{ nvidia_held_packages | reject('in', nvidia_holds.stdout_lines) | list }}
 
-# Only meaningful when a version was named. Under `latest` there is nothing to
-# compare against — the declaration is "whatever the reload installed", and the
-# hold above is what makes that a real constraint rather than a shrug.
+# The other direction: a leftover hold would freeze the driver while its kernel
+# moves on, and the GPU would vanish at a later reboot.
+- name: Assert the driver follows its branch
+  ansible.builtin.assert:
+    that:
+      - nvidia_driver_package not in nvidia_holds.stdout_lines
+    fail_msg: >-
+      {{ nvidia_driver_package }} is held, but nvidia_driver_held is false.
+      Rerun the main playbook to release it, or:  sudo apt-mark unhold {{ nvidia_driver_package }}
+    success_msg: "{{ nvidia_driver_package }} follows its branch"
+  when: not nvidia_driver_held | bool
+
+# Passes trivially under `latest`, where the hold is the only constraint.
 - name: Assert the installed versions match the declared ones
   ansible.builtin.assert:
     that:
@@ -116,8 +112,7 @@
       versions match declaration
       (driver {{ nvidia_driver_version }}, toolkit {{ nvidia_toolkit_version }})
   vars:
-    # `dpkg-query -f='${Package}=${Version}'` yields name=version per line, so
-    # this becomes a dict lookup rather than positional field-splitting.
+    # name=version lines become a dict.
     nvidia_installed: >-
       {{ dict(nvidia_pkg_versions.stdout_lines | default([])
               | map('split', '=', 1) | list) }}
@@ -130,15 +125,8 @@
       {{ true if nvidia_toolkit_version == 'latest'
          else nvidia_installed_toolkit == nvidia_toolkit_version }}
 
-# THE gate. Everything above can pass on a host where the GPU is still unusable
-# from a container, because the question is not whether the toolkit exists but
-# whether k3s noticed it.
-#
-# k3s regenerates this file from its own template on every start, so its
-# contents are evidence of what k3s decided rather than of anything this
-# repository wrote. If the toolkit was installed AFTER k3s first started, the
-# runtime is absent here and stays absent until k3s is restarted — which is
-# exactly the ordering playbooks/_layers.yml asserts, checked from the far side.
+# k3s regenerates this config on every start, so it shows what k3s decided. A
+# toolkit installed after k3s started is absent here until k3s restarts.
 - name: Read the containerd configuration k3s generated
   ansible.builtin.find:
     paths: "{{ nvidia_containerd_dir }}"

@@ -1,24 +1,11 @@
-# Keeping a wired host's link from parking itself.
-#
-# The counterpart to wifi_link, and it exists for the same reason that role
-# does: a link property that lives in the LIVE interface rather than in any
-# persistent configuration, reapplied by a template unit bound to the device.
-# The two roles differ in which setting they suppress and in nothing else.
-#
-# Nothing here names a driver or an interface. phantom answers to eth0 because
-# the Pi's bcmgenet predates systemd's predictable naming; a machine with a PCIe
-# NIC gets enp13s0 or similar. Both are discovered.
+# Keeps a wired link from parking itself in EEE idle; the counterpart to
+# wifi_link. Interfaces are discovered, never named.
 ---
-# Discovered from /sys/class/net rather than declared, so a host that gains or
-# renames a NIC needs no inventory edit. Override in host_vars only to pin a
-# subset — a machine with two Ethernet ports where only one carries the LAN, or
-# one whose second NIC does not support EEE at all.
+# Empty means discover from /sys/class/net. Set in host_vars only to pin a
+# subset, such as the one port of two that carries the LAN.
 wired_link_interfaces: []
 
-# ethtool belongs to this role, not to base_packages. base carries what every
-# machine needs; this is what a CABLED machine needs, and a wireless-only host
-# should not install a wired tool to satisfy a role it does not compose. The
-# same division wifi_link draws around iw.
+# Here, not in base_packages: only cabled machines need it (as wifi_link does with iw).
 wired_link_packages:
   - ethtool
 

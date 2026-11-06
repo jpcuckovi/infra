@@ -1,8 +1,5 @@
-# Gates for Cilium.
-#
-# Each asks the cluster rather than helm. A deployed release says the chart
-# rendered; it does not say the agent runs on every node, that kube-proxy
-# replacement took, or that flannel is absent.
+# Gates for Cilium. Each asks the cluster, since a deployed helm release only
+# proves the chart rendered.
 ---
 - name: Read the Cilium agent DaemonSet
   kubernetes.core.k8s_info:
@@ -13,9 +10,7 @@
   register: cilium_ds
   check_mode: false
 
-# numberReady against desiredNumberScheduled rather than a literal node count,
-# and desired must be non-zero: a DaemonSet ready 0 of 0 is "ready" to every
-# check that compares only the two numbers.
+# desired must be non-zero: a DaemonSet ready 0 of 0 otherwise passes.
 - name: Assert the agent is ready on every node
   ansible.builtin.assert:
     that:
@@ -72,9 +67,8 @@
   register: cilium_hubble_ui_svc
   check_mode: false
 
-# The published port is a contract with workstation bookmarks, so it is checked
-# against the pin rather than trusted to the chart: a port the chart allocated
-# would still work today and move on the next reinstall.
+# Checked against the pin: a chart-allocated port works today and moves on the
+# next reinstall, breaking bookmarks.
 - name: Assert the Hubble UI is published on its fixed NodePort
   ansible.builtin.assert:
     that:
@@ -146,16 +140,14 @@
       no ready Cilium agent — see the DaemonSet gate above.
     success_msg: "Ready: {{ cluster_hosts | join(', ') }}"
   vars:
-    # By query, not with `contains` and a two-key dict. A condition carries
-    # timestamps, a reason and a message as well, so a dict of only type and
-    # status equals none of them and every node reads as not Ready.
+    # Not `contains` with a two-key dict: conditions carry extra fields, so such
+    # a dict equals none of them and every node reads as not Ready.
     cilium_ready: >-
       {{ cilium_verify_nodes.resources
          | community.general.json_query("[?status.conditions[?type=='Ready' && status=='True']].metadata.name") }}
     cilium_not_ready: "{{ cluster_hosts | difference(cilium_ready) }}"
 
-# Cilium records a pool whose range overlaps another pool as conflicted, and
-# allocates nothing from it. The Service simply never gets an address.
+# An overlapping pool is marked conflicted and silently allocates nothing.
 - name: Read the LoadBalancer pools
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"
@@ -180,12 +172,11 @@
     success_msg: "pools: {{ cilium_pool_names | join(', ') }}, no conflicts"
   vars:
     cilium_pool_names: "{{ cilium_pools.resources | map(attribute='metadata.name') | list }}"
+    # json_query, not `contains` with a two-key dict: conditions carry extra
+    # fields, so such a dict never matches and a conflict would go unreported.
     cilium_conflicted: >-
       {{ cilium_pools.resources
-         | selectattr('status.conditions', 'defined')
-         | selectattr('status.conditions', 'contains',
-                      {'type': 'cilium.io/PoolConflict', 'status': 'True'}) | list
-         | map(attribute='metadata.name') | list }}
+         | community.general.json_query("[?status.conditions[?type=='cilium.io/PoolConflict' && status=='True']].metadata.name") }}
   when: lb_pools | length > 0
 
 - name: Read the Cilium GatewayClass
@@ -198,8 +189,7 @@
   check_mode: false
   when: cilium_gateway_api
 
-# Cilium creates the class only when its Gateway controller started, which it
-# does only if the Gateway API CRDs existed when the operator came up.
+# The class exists only if the Gateway API CRDs predated the operator's start.
 - name: Assert Cilium's GatewayClass is accepted
   ansible.builtin.assert:
     that:

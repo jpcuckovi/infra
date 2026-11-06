@@ -1,8 +1,5 @@
-# Converge a cluster node to the state a clabernetes topology needs.
-#
-# Ordering is load-bearing in one place: the extra-modules package, where one is
-# needed, must be installed before modprobe is attempted. Everything else is
-# independent.
+# Converges a cluster node for clabernetes topologies. The extra-modules package,
+# when needed, must be installed before modprobe runs.
 ---
 - name: Install the extra kernel modules package
   ansible.builtin.apt:
@@ -14,9 +11,8 @@
   delay: 30
   until: clabernetes_modules_pkg is succeeded
 
-# Rebuild the dependency index so modprobe can find what was just unpacked.
-# Without it a freshly installed module is on disk and unloadable, which reads as
-# "the package did not help" rather than "the index is stale".
+# Without a fresh index a newly installed module is unloadable, which looks like
+# the package did not help.
 - name: Refresh the module dependency index
   ansible.builtin.command: depmod -a
   changed_when: false

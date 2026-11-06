@@ -1,10 +1,5 @@
-# Gates for the wired link.
-#
-# Asserts the PHY's state, not the unit's. A unit that is enabled and active
-# proves systemd ran `ethtool`; it does not prove the setting survived the last
-# link renegotiation, and since EEE is negotiated fresh every time the link comes
-# up, that difference is the whole question. `ethtool --show-eee` asks the
-# interface.
+# Gates for the wired link. Asks the PHY via ethtool, not the unit, since EEE
+# is renegotiated whenever the link comes up.
 ---
 - name: Discover the hardware-backed interfaces
   ansible.builtin.find:
@@ -66,14 +61,8 @@
       after the unit last ran — a reseated cable or a switch reboot is enough.
     success_msg: "EEE off: {{ wired_link_managed | join(', ') }}"
   vars:
-    # `ethtool --show-eee` prints "EEE status: disabled", "enabled - active",
-    # "enabled - inactive", or "not supported". Only the two `enabled` forms are
-    # failures: "not supported" means the hardware cannot park the link and
-    # there is nothing to suppress.
-    #
-    # Anchored on the status line rather than searching the whole output,
-    # because the block below it lists the EEE link modes both ends advertise
-    # and those strings contain the word regardless of the negotiated state.
+    # Only "enabled" fails ("not supported" has nothing to suppress). Anchored on
+    # the status line, since the advertised-modes block below also says enabled.
     wired_link_on: >-
       {{ wired_link_state.results
          | selectattr('stdout', 'search', '(?i)EEE status:\s*enabled')

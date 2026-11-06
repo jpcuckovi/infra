@@ -1,9 +1,5 @@
-# Gates for Longhorn.
-#
-# The disk gate asks Longhorn where each node's disk is, not only whether it is
-# schedulable: a disk registered at the default path on the ROOT filesystem is
-# schedulable too, and fills the boot drive. roles/longhorn_node's own gate
-# checks the mount; this one checks Longhorn is using it.
+# Gates for Longhorn. The disk path is checked too, because a disk on the root
+# filesystem is also schedulable and would fill the boot drive.
 ---
 - name: Read Longhorn's nodes
   kubernetes.core.k8s_info:
@@ -52,9 +48,7 @@
   register: longhorn_storageclasses
   check_mode: false
 
-# Exactly one default. Two defaults make every unqualified PVC ambiguous, and
-# Kubernetes resolves it by picking the newest, which is not a decision anyone
-# made.
+# With two defaults, Kubernetes silently gives unqualified PVCs the newest one.
 - name: Assert longhorn is the only default StorageClass
   ansible.builtin.assert:
     that:
@@ -64,9 +58,8 @@
       expected exactly longhorn.
     success_msg: "default StorageClass: longhorn"
   vars:
-    # The query needs both quote styles, so it is held as a plain YAML value
-    # and passed by name. Escaped inside a Jinja string, the backslashes reach
-    # JMESPath literally and it rejects the expression.
+    # Held as a plain value because escaped quotes inside Jinja reach JMESPath
+    # literally and it rejects the expression.
     longhorn_default_query: >-
       [?metadata.annotations."storageclass.kubernetes.io/is-default-class"=='true'].metadata.name
     longhorn_defaults: >-

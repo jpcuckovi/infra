@@ -1,0 +1,100 @@
+# Gates for Open WebUI. The chart defines no probes, so a Ready pod only means the
+# container started; health is asked of the app through the Gateway instead.
+---
+- name: Read the Open WebUI StatefulSet
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: StatefulSet
+    name: "{{ open_webui_fullname }}"
+    namespace: "{{ open_webui_namespace }}"
+  register: open_webui_sts
+  check_mode: false
+
+- name: Assert Open WebUI is running
+  ansible.builtin.assert:
+    that:
+      - open_webui_sts.resources | length == 1
+      - open_webui_sts.resources[0].status.readyReplicas | default(0) == 1
+    fail_msg: >-
+      {{ open_webui_fullname }} has no ready replica in {{ open_webui_namespace }}. Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ open_webui_namespace }} describe statefulset/{{ open_webui_fullname }}
+    success_msg: "{{ open_webui_fullname }} running"
+
+- name: Request Open WebUI's health over HTTPS, verifying against the workstation CA
+  ansible.builtin.uri:
+    url: "{{ open_webui_url }}/health"
+    ca_path: "{{ gateway_ca_crt }}"
+    validate_certs: true
+  register: open_webui_health
+  failed_when: false
+  check_mode: false
+
+- name: Assert Open WebUI answers through the Gateway
+  ansible.builtin.assert:
+    that:
+      - open_webui_health.status == 200
+    fail_msg: >-
+      {{ open_webui_url }}/health returned {{ open_webui_health.status }}
+      ({{ open_webui_health.msg | default('no response') }}). A first start
+      downloads the embedding model before serving, so a fresh install may need
+      a few more minutes. Otherwise check:
+        kubectl --context {{ kubeconfig_context }} -n {{ open_webui_namespace }} logs {{ open_webui_fullname }}-0
+    success_msg: "{{ open_webui_url }} healthy"
+
+# The two clusters each hold a copy of the key; this proves necropolis's copy is
+# the workstation's, which roles/llama_server also writes to revenant.
+- name: Read the API key Secret
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Secret
+    name: "{{ open_webui_key_secret }}"
+    namespace: "{{ open_webui_namespace }}"
+  register: open_webui_key
+  no_log: true
+  check_mode: false
+
+- name: Assert the Secret holds the workstation's key
+  ansible.builtin.assert:
+    that:
+      - open_webui_key.resources | length == 1
+      - >-
+        (open_webui_key.resources[0].data[open_webui_key_secret_key] | b64decode)
+        == lookup('ansible.builtin.file', llama_server_key_file)
+    fail_msg: >-
+      {{ open_webui_key_secret }} is missing or differs from {{ llama_server_key_file }}.
+      Rerun the necropolis playbook to rewrite it.
+    success_msg: "{{ open_webui_key_secret }} matches the workstation key"
+  no_log: true
+
+# From inside the pod, with the URL and key it was given, so DNS, the NodePort and
+# the key are tested along the path a chat takes. Python, because the image is a
+# Python app and has no promise of curl. Open WebUI keeps its own copy of the
+# connection in its database after first start, which this does not read.
+- name: Ask llama-server for its models from the Open WebUI pod
+  kubernetes.core.k8s_exec:
+    context: "{{ kubeconfig_context }}"
+    namespace: "{{ open_webui_namespace }}"
+    pod: "{{ open_webui_fullname }}-0"
+    container: open-webui
+    command: >-
+      python3 -c "import os, urllib.request as u;
+      r = u.Request(os.environ['OPENAI_API_BASE_URL'] + '/models',
+      headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY']});
+      print(u.urlopen(r, timeout=10).status)"
+  register: open_webui_llm
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Assert the pod reaches llama-server with the key
+  ansible.builtin.assert:
+    that:
+      - open_webui_llm.stdout | default('') | trim == '200'
+    fail_msg: >-
+      {{ open_webui_llm_url }}/models did not answer 200 from the Open WebUI pod:
+      {{ (open_webui_llm.stderr | default('') | trim).splitlines() | last | default('no output') }}.
+      A refused or timed-out connection usually means revenant or its llama-server
+      is down (playbooks/revenant/llm.yml); 401 means the two clusters hold
+      different keys; a name error means {{ open_webui_llm_host }} does not resolve
+      from inside the cluster.
+    success_msg: "llama-server reachable at {{ open_webui_llm_url }} with the key"

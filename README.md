@@ -4,7 +4,7 @@ Ansible provisioning for a six-machine home lab: three single-node k3s hosts
 and a three-node bare-metal kubeadm cluster. Hosts are inventory entries,
 capabilities are roles, and every capability carries its own verification.
 
-There are 24 roles, and 22 of them have a `tasks/verify.yml` that checks the
+There are 29 roles, and 26 of them have a `tasks/verify.yml` that checks the
 result through the system's own interface.
 
 ## What it builds
@@ -12,7 +12,7 @@ result through the system's own interface.
 | Host                            | What it is for                                                                     | State                       |
 | ------------------------------- | ---------------------------------------------------------------------------------- | --------------------------- |
 | `phantom`                       | Container registry, observability and long-term metrics. The durable machine       | Managed                     |
-| `revenant`                      | GPU work, network labs under clabernetes, Kubernetes failure injection. Cilium CNI | Managed. Reloaded routinely |
+| `revenant`                      | GPU work, network labs under clabernetes, Kubernetes failure injection. Cilium CNI | Managed                     |
 | `wraith`                        | A single-node k3s running the control side of a zero-trust lab                     | Managed                     |
 | `spectre`, `cadaver`, `banshee` | `necropolis`: one kubeadm HA cluster on three identical mini PCs                   | Built and running           |
 
@@ -22,9 +22,11 @@ last because it depends on nothing.
 
 `necropolis` is three control-plane nodes with stacked etcd, a kube-vip
 address for the API, Cilium replacing kube-proxy, Longhorn on a dedicated disk
-per node, cert-manager and a Gateway. All three nodes are schedulable. One UPS
-feeds the cluster: the node it is cabled to serves it with NUT and the others
-shut down on its word.
+per node, cert-manager and a Gateway. It also runs AWX, the upstream of Ansible
+Automation Platform, and a HashiCorp Vault holding the secrets AWX's jobs use,
+both behind that Gateway. All three nodes are schedulable. One UPS
+feeds the cluster, `phantom` and `wraith`: the node it is cabled to serves it
+with NUT, and every other host it powers shuts down on its word.
 
 ## Why it exists
 
@@ -60,10 +62,13 @@ restated as comments in every host playbook.
 | Host base            | `preflight`, `base`, `wired_link`, `wifi_link`, `nut`                             |
 | Kubernetes           | `containerd`, `k3s_server`, `kubeadm_node`, `kubeadm_control_plane`, `kubeconfig` |
 | Network and storage  | `cilium`, `longhorn_node`, `longhorn`, `cert_manager`, `gateway`                  |
-| GPU                  | `nvidia_runtime`, `nvidia_device_plugin`                                          |
+| GPU                  | `nvidia_runtime`, `nvidia_device_plugin`, `llama_server` (optional)               |
 | Registry             | `registry`, `registry_mirror`                                                     |
-| Observability        | `observability`, `victoriametrics`                                                |
+| Observability        | `observability`, `victoriametrics`, `uptime_kuma`                                 |
 | Network lab runtimes | `containerlab`, `clabernetes_host`, `clabernetes`                                 |
+| Automation           | `awx`, `vault`                                                                    |
+| Chat front end       | `open_webui`                                                                      |
+| Maintenance          | `rolling_patch`                                                                   |
 
 ## Verification
 

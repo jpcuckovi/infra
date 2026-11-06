@@ -1,8 +1,5 @@
-# Workstation preconditions for the cluster layer.
-#
-# The cluster-layer play runs with connection: local, so these tools must exist
-# on the machine driving Ansible, not on the target. Checked separately from the
-# host layer because the failure mode is different and so is the fix.
+# Workstation preconditions for the cluster layer, which runs with
+# connection: local, so these tools must exist on the controller.
 ---
 - name: Locate helm on the controller
   ansible.builtin.command: helm version --short
@@ -105,31 +102,15 @@
       helm {{ infra_helm_version.stdout | default('') | trim }}
       (major {{ infra_helm_major }})
   vars:
-    # Parsed with regex_replace and split rather than regex_search.
-    # regex_search returns None when the pattern does not match, and the
-    # surrounding expression then dereferences it — so a version string in an
-    # unexpected shape crashes the gate instead of failing it, and the traceback
-    # names a filter plugin rather than helm. The previous form did exactly that
-    # when handed `v4.2.4+g3900f43`.
-    #
-    # Every step below is total: regex_replace always returns a string, split
-    # always returns a list, and default(..., true) covers the empty case. A
-    # version this cannot parse reports major 0 and fails the assert with the
-    # raw string quoted, which is the diagnosis.
+    # regex_replace and split, not regex_search, which returns None on no match
+    # and crashed the gate on `v4.2.4+g3900f43`. Unparseable versions report 0.
     infra_helm_major: >-
       {{ infra_helm_version.stdout | default('') | trim
          | regex_replace('^[^0-9]*', '')
          | split('.') | first | default('0', true) }}
 
-# The cluster layer addresses the cluster by kubeconfig context, and every module
-# in it fails without one — but it fails from inside kubernetes.core, as
-# "Invalid kube-config file. Expected object with name <ctx> in .../contexts
-# list", which names neither the role that creates the context nor the reason it
-# is missing.
-#
-# It is missing for exactly one reason worth distinguishing: on a FIRST build
-# under --check, roles/kubeconfig's merge tasks are skipped, so the context this
-# play then asks for was never written. That is expected and not a fault.
+# Without the context kubernetes.core fails with a misleading "Invalid
+# kube-config file" error. A first build under --check is the expected cause.
 - name: Read the workstation kubeconfig contexts
   ansible.builtin.command: kubectl config get-contexts -o name
   register: infra_kube_contexts
@@ -186,6 +167,5 @@
       and this plugin publishes none. It skips a signature check on a binary
       that will run here, which is worth deciding rather than pasting past.
     success_msg: "helm-diff present"
-  # Asserted rather than assumed, because its absence degrades a claim instead
-  # of breaking a run: everything still works, the idempotency gate just stops
-  # meaning anything, and nothing in a green run says so.
+  # Asserted because its absence breaks no run; it only makes the changed=0
+  # idempotency claim meaningless.

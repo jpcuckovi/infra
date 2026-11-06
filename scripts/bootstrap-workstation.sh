@@ -1,42 +1,17 @@
 #!/usr/bin/env bash
-# Rebuild the workstation side of this repository's prerequisites.
-#
-# Everything here is user-scoped: a virtualenv under $HOME and a helm plugin.
-# Nothing needs sudo, and nothing outside $HOME is touched.
-#
-# What it deliberately does NOT do is install helm or kubectl. Those come from a
-# package manager this repository has no business driving, and a script that
-# silently brew-installs a binary is a script that has to be read before it can
-# be trusted. They are checked and reported instead.
-#
-# The success criterion is not "the commands ran" — it is that
-# roles/preflight/tasks/controller.yml would now pass. That file is the contract;
-# this script exists to satisfy it, and re-checks it at the end.
-#
-#   ./scripts/bootstrap-workstation.sh
-#
-# Safe to re-run. Pass --recreate to delete and rebuild the venv from scratch,
-# which is the answer when it is corrupt rather than merely incomplete.
+# Rebuild the workstation prerequisites (a venv under $HOME and a helm plugin),
+# without sudo, until roles/preflight/tasks/controller.yml would pass.
+# helm and kubectl are only checked, never installed. Safe to re-run;
+# --recreate rebuilds a corrupt venv from scratch.
 set -euo pipefail
 
 VENV="${VENV:-$HOME/.venv}"
 RECREATE=0
 [[ "${1:-}" == "--recreate" ]] && RECREATE=1
 
-# Pinned deliberately, and these three are the whole Python dependency.
-#
-# `ansible` rather than `ansible-core`: the collections this repository uses —
-# kubernetes.core, ansible.posix, community.general — ship bundled inside the
-# ansible package at versions that release together. Installing ansible-core
-# alone leaves requirements.yml unsatisfied and produces "couldn't resolve module"
-# for modules that are plainly documented.
-#
-# kubernetes and jmespath must live in the SAME interpreter as ansible, which is
-# the entire reason this is one venv rather than three pip invocations against
-# whatever python happens to be first on PATH. kubernetes.core imports the
-# kubernetes library from the interpreter Ansible itself runs under; a brew
-# ansible with a pip-installed kubernetes puts them in different interpreters and
-# reports "No module named 'kubernetes'" on a machine where it is plainly there.
+# `ansible`, not `ansible-core`, because only the former bundles the collections
+# in requirements.yml. kubernetes and jmespath must share ansible's interpreter,
+# hence one venv.
 PINS=(
   "ansible==14.3.1"
   "kubernetes==36.0.3"
@@ -86,28 +61,22 @@ fi
 
 # --- helm-diff ---------------------------------------------------------------
 #
-# Without it kubernetes.core.helm cannot tell an upgrade that changes nothing
-# from one that does — `helm upgrade` cuts a new revision either way — so the
-# chart tasks report `changed` on every run and the changed=0 acceptance gate in
-# README.md becomes unreachable. An acceptance gate nobody can satisfy is one
-# nobody reads.
+# Without it kubernetes.core.helm reports every chart as changed, so a second
+# run can never reach changed=0.
 if command -v helm >/dev/null 2>&1; then
   if helm plugin list 2>/dev/null | grep -qE '^diff\s'; then
     ok "helm-diff present"
   else
     say "installing helm-diff"
-    # --verify=false because helm 4 verifies plugin provenance by default and
-    # this plugin publishes none. That skips a signature check on a binary that
-    # runs here, which is a real decision — it is the plugin the Ansible warning
-    # itself points at, and the alternative is an unreachable acceptance gate.
+    # helm 4 verifies plugin provenance and this plugin publishes none; skipping
+    # the signature check is a deliberate trade for a reachable changed=0 gate.
     helm plugin install https://github.com/databus23/helm-diff --verify=false
   fi
 fi
 
 # --- prove it ----------------------------------------------------------------
 #
-# The same three questions roles/preflight/tasks/controller.yml asks. If this
-# block passes, the cluster layer will run.
+# The same checks roles/preflight/tasks/controller.yml makes.
 
 say "verifying against the preflight contract"
 "$VENV/bin/python3" -c 'import kubernetes' 2>/dev/null \

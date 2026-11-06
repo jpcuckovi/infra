@@ -1,0 +1,33 @@
+# Serves the named model behind a ClusterIP Service. Composed only by
+# playbooks/revenant/llm.yml, so a converge neither installs nor removes it.
+---
+- name: Assert the requested state is known
+  ansible.builtin.assert:
+    that:
+      - llama_server_state in ['present', 'absent']
+    fail_msg: "llama_server_state must be present or absent, not {{ llama_server_state }}."
+    quiet: true
+
+# Named individually, because removal must work with no model named. The
+# namespace stays with its API key Secret; the key itself is on the workstation.
+# Waits, so the GPU is free once the run reports success.
+- name: Remove the server
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: absent
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ llama_server_namespace }}"
+    name: "{{ llama_server_name }}"
+    wait: true
+    wait_timeout: 300
+  loop:
+    - { api_version: apps/v1, kind: Deployment }
+    - { api_version: v1, kind: Service }
+  loop_control:
+    label: "{{ item.kind }}"
+  when: llama_server_state == 'absent'
+
+- name: Install the server
+  ansible.builtin.include_tasks: present.yml
+  when: llama_server_state == 'present'

@@ -1,74 +1,62 @@
-# necropolis — the cluster's identity, shared by its three nodes.
-#
-# Here rather than in three host_vars files because none of these values
-# belongs to a machine. The nodes themselves need no host_vars at all: their
-# addresses and interfaces are facts, and nothing else differs between them.
+# necropolis: the cluster's identity, shared by its three nodes. The nodes need
+# no host_vars, since their addresses and interfaces are facts.
 
 # ---- cluster identity ------------------------------------------------------
-# Names the cluster, so it outlives any one node. Unlike every k3s host in the
-# estate, this is NOT named for a machine: three machines form it, and one of
-# them is called spectre, which is exactly the confusion a machine-named
-# context would create.
+# Named for the cluster, not a node; one node is called spectre.
 kubeconfig_context: necropolis
 
 # ---- control plane ---------------------------------------------------------
-# The API endpoint's NAME. Its address is the VIP kube-vip holds, and lives in
-# DNS as an A record — the same mechanism as registry.lan — so no address is
-# committed and moving the VIP is a DNS edit. Resolved on the node at run time.
+# A DNS A record for the kube-vip VIP, so no address is committed.
 kubeadm_control_plane_endpoint: necropolis.lan
 
-# Cluster-internal ranges, read by kubeadm_control_plane (the init config) and
-# by cilium (its IPAM pool). Stated here once so the two cannot disagree: a pod
-# CIDR in kubeadm that Cilium does not allocate from leaves pods without
-# routes. Neither may overlap the LAN.
+# Read by both kubeadm and Cilium IPAM so they cannot disagree. Neither may
+# overlap the LAN.
 kubeadm_control_plane_pod_subnet: 10.244.0.0/16
 kubeadm_control_plane_service_subnet: 10.96.0.0/12
 
-# The nodes this cluster is made of (see group_vars/all.yml). The cluster layer
-# runs on one of them; Cilium's L2 policy must name every node's LAN interface,
-# and Longhorn must see every node's disk.
 cluster_hosts: "{{ groups['necropolis'] }}"
 
-# ---- nut -------------------------------------------------------------------
+# ---- base ------------------------------------------------------------------
+# Raised for cEOS as on revenant. Every node gets it because the scheduler may
+# place a whole lab on one node.
+base_sysctl:
+  fs.inotify.max_user_instances: "32768"
+  fs.inotify.max_user_watches: "1048576"
 
-# One UPS feeds all three nodes and is cabled, over USB, to exactly one of
-# them. That node serves the UPS and the other two watch it over the network.
-# Which node holds the cable is a fact about the room, so it is named here, and
-# moving the cable is a change to this one line.
-nut_server_host: spectre
-nut_server_address: "{{ nut_server_host }}.lan"
-nut_mode: "{{ 'netserver' if inventory_hostname == nut_server_host else 'netclient' }}"
+# ---- observability ---------------------------------------------------------
+# Required and unique across the estate.
+prometheus_external_labels:
+  cluster: necropolis
+
+# Jaeger, Grafana and the discovery contract exist once, on phantom.
+observability_jaeger_enabled: false
+observability_grafana_enabled: false
+observability_write_discovery_contract: false
+
+# Must be right at first install, because a StatefulSet's volume claim cannot
+# be changed in place.
+prometheus_storage_class: longhorn
+
+# ---- nut -------------------------------------------------------------------
+# Nothing here: the UPS server is set for the whole power domain in ups_main.yml.
 
 # ---- cilium ----------------------------------------------------------------
 
-# The VIP, not a node: with kube-proxy replaced, Cilium cannot reach the API
-# through the `kubernetes` Service it is about to program, and pointing it at
-# one node would undo the HA the VIP exists for. Resolved by
-# kubeadm_control_plane in the host layer of the same run.
+# The VIP, not a node, so Cilium reaches the API without kube-proxy and
+# without undoing the HA.
 cilium_k8s_service_host: "{{ kubeadm_control_plane_vip }}"
 cilium_pod_cidr: "{{ kubeadm_control_plane_pod_subnet }}"
 
-# Two across three nodes: survives losing one, without a third that could not
-# schedule during a single-node outage anyway.
+# Two replicas survive losing one node.
 cilium_operator_replicas: 2
 
-# Nodes answer ARP for LoadBalancer addresses on the LAN — how a Service or the
-# Gateway gets an address a workstation can reach, with no load balancer
-# appliance in front.
+# Nodes answer ARP for LoadBalancer addresses, so no load balancer appliance
+# is needed.
 cilium_l2_announcements: true
 cilium_gateway_api: true
 
-# LoadBalancer pools, as HOST OFFSETS within the nodes' own /24. The network
-# itself is a gathered fact, so no routable address is committed (the same rule
-# that keeps ansible_host out of inventory). roles/cilium asserts the /24.
-#
-#   .8x   machines and kube-vip: nodes, the API VIP, a spare
-#   .9x   what Cilium hands out
-#
-# `gateway` is .90 alone and serves only the Service carrying its label, so no
-# other LoadBalancer can ever take the Gateway's address. `general` serves every
-# Service WITHOUT that label. The VIP is in neither: kube-vip owns it, and two
-# components answering ARP for one address is the failure to avoid.
+# Host offsets within the nodes' /24: .8x for nodes and the VIP, .9x for
+# Cilium. The VIP is in no pool, since kube-vip already answers ARP for it.
 lb_pools:
   - name: gateway
     first: 90
@@ -79,17 +67,34 @@ lb_pools:
     last: 99
 
 # ---- gateway ---------------------------------------------------------------
-# The HTTPS front door for UIs, on the `gateway` pool's address. Each hostname
-# needs a DNS record pointing at that address; hubble.lan is the first.
-#
-# No Grafana here: the estate's one Grafana is phantom's, and grafana.lan is a
-# CNAME to phantom.lan. No Longhorn UI either, yet: it has no authentication
-# and can delete volumes, which is a different exposure from Hubble's
-# read-only flow view.
+# HTTPS front door for UIs; each hostname needs a DNS record. The Longhorn UI
+# is excluded because it has no authentication and can delete volumes.
 gateway_pool: gateway
+
+# Named here so the awx, vault and open_webui roles reach the same hostnames
+# they are routed on.
+awx_hostname: awx.lan
+vault_hostname: vault.lan
+open_webui_hostname: seance.lan
+
 gateway_routes:
   - name: hubble
     hostname: hubble.lan
     namespace: kube-system
     service: hubble-ui
+    port: 80
+  - name: awx
+    hostname: "{{ awx_hostname }}"
+    namespace: awx
+    service: awx-service
+    port: 80
+  - name: vault
+    hostname: "{{ vault_hostname }}"
+    namespace: vault
+    service: vault
+    port: 8200
+  - name: open-webui
+    hostname: "{{ open_webui_hostname }}"
+    namespace: open-webui
+    service: seance-open-webui
     port: 80

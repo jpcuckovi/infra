@@ -1,0 +1,12 @@
+# Shared by main.yml and verify.yml. Required rather than defaulted, so a rerun
+# cannot quietly change which model is served.
+---
+- name: Assert a known model was named
+  ansible.builtin.assert:
+    that:
+      - llama_server_model is defined
+      - llama_server_model in llama_server_models
+    fail_msg: >-
+      Name a model with -e llama_server_model=<name>, one of:
+      {{ llama_server_models.keys() | join(', ') }}.
+    quiet: true

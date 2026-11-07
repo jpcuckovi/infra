@@ -377,6 +377,53 @@ has several constraints that are easy to get wrong:
   else for workloads to run.
 - **kubelet, kubeadm and kubectl are held**, so no single node moves to a new minor
   version on its own. Upgrades go through a pin change and kubeadm's upgrade.
+- **Each member snapshots itself nightly.** `etcd_snapshot` runs etcdctl and
+  etcdutl inside the local etcd container, the only place either exists, and
+  keeps a snapshot only after etcdutl has read it back. All three members do it,
+  so losing one node does not lose the backups. They stay on the nodes, though:
+  nothing yet copies them off the cluster. The gate checks the newest snapshot's
+  age rather than the service state, because a timer-driven oneshot is inactive
+  between runs by design.
+
+## Patching the kubeadm cluster
+
+`playbooks/necropolis/patch.yml` patches necropolis one node at a time through
+`rolling_patch`. It runs from the workstation rather than as an AWX job, because
+AWX runs on necropolis: draining the node that hosts the job pod would evict the
+job partway through its own run.
+
+- **The run starts only if the cluster can lose a node.** A pre-flight play
+  checks that every Node is Ready and asks etcd, through the local etcd
+  container, for the health of every member. Quorum is two of three, so
+  rebooting a node while another member is already down stops the control
+  plane. Both checks count against the `necropolis` inventory group rather than
+  the play's hosts, so a `--limit` canary still refuses to start on a degraded
+  cluster. `any_errors_fatal` ends the whole run on a failure, instead of
+  dropping the failing host and patching the others.
+- **A node with nothing to install is not touched.** Pending upgrades are
+  counted from freshly refreshed package lists before the drain. A node with
+  none, and no reboot already pending, leaves the run there. A pending reboot
+  left by an earlier unattended upgrade still counts, because that node is
+  running old code.
+- **Drained whenever packages change, rebooted only when asked.** Package
+  scripts restart services, so any upgrade happens on a drained node. The
+  reboot follows only if `/var/run/reboot-required` exists, which
+  update-notifier's hooks write when a kernel or core library is installed. The
+  upgrade is `dist`, not `safe`, because a new kernel is a new package that
+  `safe` holds back. kubelet, kubeadm and kubectl are held, so they do not move.
+- **A drain timeout is a failure.** The drain module fails on a refused
+  eviction but only warns on a timeout, so both are treated as failure and
+  nothing reboots with pods still on the node. Longhorn lifts its
+  instance-manager disruption budget only after it sees the cordon, so the
+  first eviction can be refused on a healthy cluster, and the drain retries.
+- **A node is back when it proves it.** A fast reboot can finish inside the
+  node-monitor grace period, so the Node never reports NotReady and a plain
+  Ready check passes on stale status. The wait requires a new kubelet boot ID as
+  well as Ready, and the node's etcd member must then report healthy on its own
+  metrics listener before the next node starts.
+- **Storage gates both ends.** No Longhorn volume may be degraded before a
+  drain, and every volume must be healthy again before the next node's drain,
+  which would otherwise block on Longhorn's last-replica policy.
 
 ## Storage
 
@@ -626,6 +673,16 @@ consumer. Its AppArmor profile once looped on revenant and filled the kernel aud
 backlog until logins blocked, leaving the host up but unreachable. A loaded
 profile outlives its service, so it is unloaded before the package is purged, and
 the gate checks the loaded profile rather than the package.
+
+With journald as the store, its cap is the log bound that matters, and
+`log_retention` declares it (2G) rather than leaving journald's default of 10% of
+the filesystem capped at 4G, which differs by disk and was never chosen. The
+gate checks that journald started after its drop-in was written, since a cap
+journald has not read exists only on disk, and that the journal is within it.
+logrotate stays for the plain files left under `/var/log`, mostly apt's and
+dpkg's. A service that writes its own files declares a snippet in
+`log_retention_logrotate_files`, and a snippet removed from that list is deleted
+from the host.
 
 Cgroup support is read from `/sys/fs/cgroup/cgroup.controllers` rather than the
 kernel command line, because on a Pi the boot configuration can select a command

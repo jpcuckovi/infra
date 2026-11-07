@@ -1,6 +1,36 @@
 ---
 # Kubernetes API tasks run on the workstation; apt and reboot run on the node.
 
+# Decided before the drain, so a node with nothing to install is never
+# disturbed. A reboot-required left by an earlier unattended upgrade still
+# counts, since that node is running an old kernel or library.
+- name: Refresh the package lists on {{ inventory_hostname }}
+  ansible.builtin.apt:
+    update_cache: true
+  register: rolling_patch_cache
+  retries: 3
+  delay: 30
+  until: rolling_patch_cache is succeeded
+
+# A simulation against the lists just refreshed; the || true ignores grep's
+# exit 1 on a count of zero.
+- name: Count pending upgrades on {{ inventory_hostname }}  # noqa: command-instead-of-module risky-shell-pipe
+  ansible.builtin.shell: apt-get -s -o Debug::NoLocking=1 dist-upgrade | grep -c '^Inst ' || true
+  register: rolling_patch_pending
+  changed_when: false
+  check_mode: false
+
+- name: Check for a reboot already pending on {{ inventory_hostname }}
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: rolling_patch_reboot_pending
+
+- name: End the run early when nothing is pending on {{ inventory_hostname }}
+  ansible.builtin.meta: end_host
+  when:
+    - rolling_patch_pending.stdout | int == 0
+    - not rolling_patch_reboot_pending.stat.exists
+
 - name: Assert no Longhorn volume is degraded before draining
   kubernetes.core.k8s_info:
     context: "{{ kubeconfig_context }}"
@@ -42,14 +72,22 @@
 
 # dist, not safe: a new kernel is a new package, which safe holds back.
 # kubelet/kubeadm/kubectl are held by roles/kubeadm_node, so they don't move.
+# The lists were refreshed above, before the drain.
 - name: Upgrade packages on {{ inventory_hostname }}
   ansible.builtin.apt:
-    update_cache: true
     upgrade: dist
   register: rolling_patch_apt
   retries: 3
   delay: 30
   until: rolling_patch_apt is succeeded
+
+# Written by update-notifier's hooks when a kernel or core library is
+# installed. Without it the upgrade applied in place, and the node stays up;
+# the drain above still covered services restarted by package scripts.
+- name: Check for a reboot needed after patching {{ inventory_hostname }}
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: rolling_patch_reboot_required
 
 # A fast reboot can finish inside the node-monitor grace period, so the Node
 # never goes NotReady and a plain Ready check passes on stale status. The
@@ -61,6 +99,7 @@
     kind: Node
     name: "{{ inventory_hostname }}"
   register: rolling_patch_node_before
+  when: rolling_patch_reboot_required.stat.exists
   delegate_to: localhost
   become: false
   vars:
@@ -70,6 +109,7 @@
   ansible.builtin.reboot:
     reboot_timeout: "{{ rolling_patch_reboot_timeout }}"
     msg: "Rebooting for patches (ansible, roles/rolling_patch)"
+  when: rolling_patch_reboot_required.stat.exists
 
 - name: Wait for {{ inventory_hostname }} to rejoin Ready
   kubernetes.core.k8s_info:
@@ -86,6 +126,7 @@
       | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == 'True'
   retries: "{{ rolling_patch_ready_retries }}"
   delay: "{{ rolling_patch_ready_delay }}"
+  when: rolling_patch_reboot_required.stat.exists
   delegate_to: localhost
   become: false
   vars:

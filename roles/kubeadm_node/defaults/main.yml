@@ -14,6 +14,12 @@ kubeadm_node_packages:
   - kubeadm
   - kubectl
 
+# From the same repository, but neither pinned nor held: cri-tools versions on
+# its own (1.36.0 beside kubelet 1.36.5), and as a client it carries no skew
+# risk. The per-minor repository keeps it on the cluster's minor.
+kubeadm_node_tools:
+  - cri-tools   # crictl, the CRI client the runbook and etcd snapshots use
+
 # The bridge sysctls below do not exist until br_netfilter is loaded.
 kubeadm_node_modules:
   - overlay

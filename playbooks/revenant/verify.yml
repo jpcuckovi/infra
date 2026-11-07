@@ -8,6 +8,7 @@
 
     host_roles:
       - base
+      - log_retention
       - wired_link
       - nut
       - nvidia_runtime

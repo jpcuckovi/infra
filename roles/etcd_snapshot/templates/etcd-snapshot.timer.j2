@@ -1,0 +1,13 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/etcd_snapshot.
+[Unit]
+Description=Schedule etcd snapshots
+
+[Timer]
+OnCalendar={{ etcd_snapshot_schedule }}
+# A run missed while the node was down happens at the next boot.
+Persistent=true
+RandomizedDelaySec={{ etcd_snapshot_randomized_delay }}
+
+[Install]
+WantedBy=timers.target

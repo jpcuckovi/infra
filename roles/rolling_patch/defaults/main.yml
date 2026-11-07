@@ -1,6 +1,10 @@
 ---
 rolling_patch_longhorn_namespace: longhorn-system
 
+# The inventory group holding every node of the cluster. The pre-flight checks
+# count against it, not the play's hosts, so --limit cannot shrink them.
+rolling_patch_group: necropolis
+
 # Longhorn lifts its instance-manager PDB only after it sees the cordon, so the
 # first eviction can be refused on a healthy cluster.
 rolling_patch_drain_timeout: 300

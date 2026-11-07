@@ -59,6 +59,24 @@ The other targets (`revenant`, `wraith`, `necropolis`) each have the same
 `main.yml` and `verify.yml` pair under `playbooks/`. `playbooks/site.yml` runs
 every target in dependency order.
 
+## Patching necropolis
+
+`playbooks/necropolis/patch.yml` patches the cluster one node at a time, from
+the workstation, with the `necropolis` kubeconfig context reachable. It drains
+nothing unless every node is Ready, every etcd member is healthy and no
+Longhorn volume is degraded. A node with no pending upgrades and no pending
+reboot is skipped, and a node reboots only when the upgrade asks for one.
+
+One node goes first as a canary. The cluster's gates are checked, and then the
+rest are patched; the canary is skipped on the second run, since nothing is
+pending on it:
+
+```bash
+~/.venv/bin/ansible-playbook playbooks/necropolis/patch.yml --limit banshee
+~/.venv/bin/ansible-playbook playbooks/necropolis/verify.yml
+~/.venv/bin/ansible-playbook playbooks/necropolis/patch.yml
+```
+
 ## Local LLM on revenant
 
 `playbooks/revenant/llm.yml` is optional and no other playbook runs it. Nothing

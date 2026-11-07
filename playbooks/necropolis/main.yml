@@ -7,11 +7,13 @@
     target: necropolis
 
     # wired_link early, since everything after it pulls packages across the
-    # link. kubeconfig last, because admin.conf exists only once the control
-    # plane forms. No registry_mirror: containerd's hosts.toml does that job.
+    # link. etcd_snapshot after kubeadm_control_plane, which creates the member
+    # it snapshots. kubeconfig last, because admin.conf exists only once the
+    # control plane forms. No registry_mirror: containerd's hosts.toml does that job.
     host_roles:
       - preflight
       - base
+      - log_retention
       - wired_link
       - nut
       - containerd
@@ -19,6 +21,7 @@
       - longhorn_node
       - clabernetes_host
       - kubeadm_control_plane
+      - etcd_snapshot
       - kubeconfig
 
     # cilium first (it also installs the Gateway API CRDs); longhorn before

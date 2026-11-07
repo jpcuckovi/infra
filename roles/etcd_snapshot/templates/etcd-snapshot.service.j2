@@ -1,0 +1,9 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/etcd_snapshot. Started by etcd-snapshot.timer, so it has no
+# [Install] section and reports `static`; between runs it is inactive.
+[Unit]
+Description=Take an etcd snapshot and keep the newest {{ etcd_snapshot_keep }}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/etcd-snapshot.sh

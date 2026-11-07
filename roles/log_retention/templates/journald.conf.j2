@@ -1,0 +1,10 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/log_retention.
+[Journal]
+# Persistent, which /var/log/journal already makes the default; stated so a
+# missing directory is recreated rather than silently falling back to RAM.
+Storage=persistent
+SystemMaxUse={{ log_retention_journal_max_use }}
+{% if log_retention_journal_max_age | length > 0 %}
+MaxRetentionSec={{ log_retention_journal_max_age }}
+{% endif %}

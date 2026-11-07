@@ -1,0 +1,104 @@
+# Gates for log retention. Each asks journald or logrotate what they are doing,
+# because a drop-in on disk proves nothing until the daemon has read it.
+---
+# journald reads its configuration only at start, so the drop-in is live exactly
+# when the daemon started after the file was last written.
+- name: Read the journald drop-in
+  ansible.builtin.stat:
+    path: "{{ log_retention_journald_dropin }}"
+  register: log_retention_dropin_stat
+  check_mode: false
+
+- name: Read when journald last started
+  ansible.builtin.command: >-
+    systemctl show systemd-journald.service
+    --property=ActiveEnterTimestamp --timestamp=unix --value
+  register: log_retention_journald_started
+  changed_when: false
+  check_mode: false
+
+- name: Assert journald has read the drop-in
+  ansible.builtin.assert:
+    that:
+      - log_retention_dropin_stat.stat.exists
+      - log_retention_started_at | float >= log_retention_dropin_stat.stat.mtime
+    fail_msg: >-
+      {{ log_retention_journald_dropin }}
+      {{ 'was written after journald last started' if log_retention_dropin_stat.stat.exists else 'is missing' }}
+      on {{ inventory_hostname }}.
+
+      A drop-in journald has not read is a cap that exists only on disk: the
+      journal keeps growing to journald's own default of up to 4G. Rerun this
+      host's playbook, or `sudo systemctl restart systemd-journald`.
+    success_msg: "journald started after its drop-in was written"
+  vars:
+    log_retention_started_at: >-
+      {{ log_retention_journald_started.stdout | trim | regex_replace('^@', '') | default('0', true) }}
+
+# The cap is what was promised; the usage is what was delivered. Measured by
+# journald itself, which counts what the files occupy on disk: summing their
+# byte sizes overstates it and failed a host journald reported within its cap.
+- name: Read the journal's disk usage
+  ansible.builtin.command: journalctl --disk-usage
+  register: log_retention_journal_usage
+  changed_when: false
+  check_mode: false
+
+- name: Assert the journal is within its cap
+  ansible.builtin.assert:
+    that:
+      - log_retention_journal_used | length > 0
+      - (log_retention_journal_used | human_to_bytes) <= (log_retention_journal_max_use | human_to_bytes)
+    fail_msg: >-
+      journald on {{ inventory_hostname }} reports
+      '{{ log_retention_journal_usage.stdout | trim }}' against a cap of
+      {{ log_retention_journal_max_use }}. journald trims at rotation, so a
+      freshly lowered cap can lag; `sudo journalctl
+      --vacuum-size={{ log_retention_journal_max_use }}` applies it now.
+    success_msg: "journal {{ log_retention_journal_used }} of {{ log_retention_journal_max_use }}"
+  vars:
+    log_retention_journal_used: >-
+      {{ log_retention_journal_usage.stdout
+         | regex_search('take up ([0-9.]+[BKMGTPE]?)', '\1')
+         | default([''], true) | first }}
+
+# --- logrotate ---------------------------------------------------------------
+# A parse error in any snippet makes the whole run exit non-zero, and the
+# timer keeps firing as if nothing were wrong.
+- name: Parse the logrotate configuration
+  ansible.builtin.command: logrotate --debug /etc/logrotate.conf
+  register: log_retention_logrotate_parse
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Read the logrotate units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+  register: log_retention_logrotate_units
+  check_mode: true
+  loop:
+    - logrotate.timer
+    - logrotate.service
+
+- name: Assert logrotate is scheduled and its last run succeeded
+  ansible.builtin.assert:
+    that:
+      - log_retention_logrotate_parse.rc == 0
+      - log_retention_timer.ActiveState == 'active'
+      - log_retention_timer.UnitFileState == 'enabled'
+      - log_retention_service.Result == 'success'
+    fail_msg: >-
+      logrotate on {{ inventory_hostname }}: configuration
+      {{ 'parses' if log_retention_logrotate_parse.rc == 0 else 'does not parse' }},
+      timer {{ log_retention_timer.ActiveState }}/{{ log_retention_timer.UnitFileState }},
+      last run {{ log_retention_service.Result }}.
+
+      The timer firing proves only that systemd started the run. Check
+      `sudo logrotate --debug /etc/logrotate.conf` for the snippet at fault and
+      `journalctl -u logrotate` for the last run.
+      {{ log_retention_logrotate_parse.stderr | default('') | regex_findall('(?m)^error:.*$') | join(' ') }}
+    success_msg: "logrotate scheduled, config parses, last run succeeded"
+  vars:
+    log_retention_timer: "{{ log_retention_logrotate_units.results[0].status }}"
+    log_retention_service: "{{ log_retention_logrotate_units.results[1].status }}"

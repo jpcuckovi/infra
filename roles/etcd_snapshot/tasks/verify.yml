@@ -1,0 +1,70 @@
+# Gates for etcd snapshots. A scheduled timer proves only that a run will be
+# attempted; the snapshots on disk prove that runs succeed.
+---
+- name: Read the etcd snapshot units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+  register: etcd_snapshot_units
+  check_mode: true
+  loop:
+    - etcd-snapshot.timer
+    - etcd-snapshot.service
+
+# The service is a oneshot the timer starts: inactive between runs and static,
+# so its last Result is the thing to read, not its state.
+- name: Assert snapshots are scheduled and the last one succeeded
+  ansible.builtin.assert:
+    that:
+      - etcd_snapshot_timer.ActiveState == 'active'
+      - etcd_snapshot_timer.UnitFileState == 'enabled'
+      - etcd_snapshot_service.Result == 'success'
+    fail_msg: >-
+      etcd-snapshot on {{ inventory_hostname }}: timer
+      {{ etcd_snapshot_timer.ActiveState }}/{{ etcd_snapshot_timer.UnitFileState }},
+      last run {{ etcd_snapshot_service.Result }}.
+
+      A timer that is not active and enabled takes no snapshots and says
+      nothing. A last run other than success is in
+      `journalctl -u etcd-snapshot`; "No running etcd container" there means
+      the member itself is down.
+    success_msg: "snapshots scheduled, last run succeeded"
+  vars:
+    etcd_snapshot_timer: "{{ etcd_snapshot_units.results[0].status }}"
+    etcd_snapshot_service: "{{ etcd_snapshot_units.results[1].status }}"
+
+- name: Find the snapshots
+  ansible.builtin.find:
+    paths: "{{ etcd_snapshot_dir }}"
+    patterns: backup_*.db
+  register: etcd_snapshot_files
+  check_mode: false
+
+# Each snapshot was checked with etcdutl before it was moved here, so a fresh,
+# non-empty file is a usable one. The count proves the pruning runs.
+- name: Assert a recent snapshot exists and pruning keeps the count
+  ansible.builtin.assert:
+    that:
+      - etcd_snapshot_files.matched > 0
+      - etcd_snapshot_age_hours | float <= etcd_snapshot_max_age_hours | float
+      - etcd_snapshot_newest.size > 0
+      - etcd_snapshot_files.matched <= etcd_snapshot_keep | int
+    fail_msg: >-
+      {{ etcd_snapshot_dir }} on {{ inventory_hostname }} holds
+      {{ etcd_snapshot_files.matched }} snapshot(s), keep is
+      {{ etcd_snapshot_keep }};
+      {{ ('newest is ' ~ (etcd_snapshot_newest.path | basename) ~ ', '
+           ~ (etcd_snapshot_age_hours | float | round(1)) ~ 'h old, '
+           ~ etcd_snapshot_newest.size ~ ' bytes')
+         if etcd_snapshot_files.matched > 0 else 'there is none' }}.
+
+      Older than {{ etcd_snapshot_max_age_hours }}h means the nightly run has
+      been failing or not firing: `systemctl list-timers etcd-snapshot.timer`,
+      `journalctl -u etcd-snapshot`. More than keep means pruning failed.
+    success_msg: >-
+      {{ etcd_snapshot_files.matched }} snapshot(s), newest
+      {{ etcd_snapshot_age_hours | float | round(1) }}h old
+  vars:
+    etcd_snapshot_newest: >-
+      {{ etcd_snapshot_files.files | sort(attribute='mtime') | last | default({'path': '', 'size': 0, 'mtime': 0}) }}
+    etcd_snapshot_age_hours: >-
+      {{ (now().timestamp() - etcd_snapshot_newest.mtime | float) / 3600 }}

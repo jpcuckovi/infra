@@ -98,6 +98,18 @@
     group: root
     mode: "0644"
 
+# Here rather than in kubeadm_node, which installs crictl, because the socket is
+# this role's. Without it crictl tries several sockets in turn, warning on each.
+- name: Point crictl at containerd
+  ansible.builtin.copy:
+    dest: "{{ containerd_crictl_config }}"
+    content: |
+      runtime-endpoint: unix://{{ containerd_socket }}
+      image-endpoint: unix://{{ containerd_socket }}
+    owner: root
+    group: root
+    mode: "0644"
+
 # Now, not at play end: kubeadm_node follows, and verify reads the running config.
 - name: Apply containerd changes
   ansible.builtin.meta: flush_handlers

@@ -1,4 +1,18 @@
 ---
+# Once, before any node is touched: every node Ready and every etcd member
+# healthy. any_errors_fatal stops the whole run on a failure, rather than
+# dropping the host and patching the others.
+- name: Necropolis — Rolling Patch pre-flight
+  hosts: necropolis
+  gather_facts: false
+  any_errors_fatal: true
+  become: true
+  tasks:
+    - name: Check the cluster can lose one node
+      ansible.builtin.include_role:
+        name: rolling_patch
+        tasks_from: preflight
+
 - name: Necropolis — Rolling Patch
   hosts: necropolis
   serial: 1

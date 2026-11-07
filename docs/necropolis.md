@@ -97,7 +97,7 @@ unchanged: `registry.lan` is a distinct registry, never a mirror for docker.io.
 | `base`                  | existing        | Unchanged. Already carries rsyslog removal, inotify limits and chrony.                   |
 | `wired_link`            | existing        | Unchanged. Discovers the wired interface and suppresses EEE.                             |
 | `containerd`            | new             | Upstream tarball, templated config, `registry.lan` hosts.toml.                           |
-| `kubeadm_node`          | new             | Kernel modules, sysctls, swap off, held kubelet/kubeadm/kubectl packages.                |
+| `kubeadm_node`          | new             | Kernel modules, sysctls, swap off, held kubelet/kubeadm/kubectl packages, crictl.        |
 | `longhorn_node`         | new             | open-iscsi, NFS client, cryptsetup, modules, iscsid, multipath blacklist, the data disk. |
 | `kubeadm_control_plane` | new             | kube-vip, `kubeadm init`, control-plane joins, untaint, serving-CSR approval.            |
 | `kubeconfig`            | existing        | Gains a kubeadm mode: a different source path and server, the same merge. Values only.   |
@@ -144,6 +144,8 @@ now cover `kubeadm_clusters`, and it refuses a host in both `k3s_servers` and
   would silently leave `SystemdCgroup` false, and kubelet and containerd
   disagreeing about cgroup ownership fails pods with an error naming neither.
 - `config_path = "/etc/containerd/certs.d"` and the `registry.lan` hosts.toml.
+- `/etc/crictl.yaml` naming containerd's socket, since the socket is this
+  role's. Without it `crictl` tries several sockets in turn and warns on each.
 - Restart on config change only.
 
 **`kubeadm_node`**:
@@ -155,6 +157,10 @@ now cover `kubeadm_clusters`, and it refuses a host in both `k3s_servers` and
 - The pkgs.k8s.io apt repository for the pinned minor, keyring in
   `/etc/apt/keyrings`; kubelet, kubeadm and kubectl installed and **held**, so
   an unattended upgrade cannot step one node onto a different minor.
+- `cri-tools` (`crictl`) from the same repository, neither pinned nor held. It
+  versions on its own, so the kubelet pin cannot name it, and as a client it
+  carries no skew risk. The per-minor repository keeps it on the cluster's
+  minor. The upstream containerd tarball does not include it.
 - kubelet enabled. It crash-loops until `kubeadm init` or `join` writes its
   config; that is expected and not a failure.
 

@@ -45,17 +45,25 @@ say "installing pinned dependencies"
 # --- things this script will not install -------------------------------------
 
 say "checking tools this script does not manage"
+# The workstation is macOS or Ubuntu; only the install hint differs.
+install_hint() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    echo "brew install $1"
+  else
+    echo "sudo snap install $1 --classic"
+  fi
+}
 MISSING=0
 if command -v helm >/dev/null 2>&1; then
   ok "helm $(helm version --short 2>/dev/null || echo '(version unknown)')"
 else
-  warn "helm not found — install with: brew install helm"
+  warn "helm not found — install with: $(install_hint helm)"
   MISSING=1
 fi
 if command -v kubectl >/dev/null 2>&1; then
   ok "kubectl $(kubectl version --client -o json 2>/dev/null | "$VENV/bin/python3" -c 'import json,sys;print(json.load(sys.stdin)["clientVersion"]["gitVersion"])' 2>/dev/null || echo '(version unknown)')"
 else
-  warn "kubectl not found — install with: brew install kubectl"
+  warn "kubectl not found — install with: $(install_hint kubectl)"
   MISSING=1
 fi
 

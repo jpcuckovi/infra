@@ -1,0 +1,10 @@
+# Restarting the timer applies a changed schedule now rather than at the next
+# boot; daemon_reload makes systemd reread both unit files first. Skipped under
+# --check, where the units may only be simulated writes.
+---
+- name: Restart etcd snapshot timer
+  ansible.builtin.systemd_service:
+    name: etcd-snapshot.timer
+    state: restarted
+    daemon_reload: true
+  when: not ansible_check_mode

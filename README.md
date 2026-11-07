@@ -4,7 +4,7 @@ Ansible provisioning for a six-machine home lab: three single-node k3s hosts
 and a three-node bare-metal kubeadm cluster. Hosts are inventory entries,
 capabilities are roles, and every capability carries its own verification.
 
-There are 29 roles, and 26 of them have a `tasks/verify.yml` that checks the
+There are 32 roles, and 29 of them have a `tasks/verify.yml` that checks the
 result through the system's own interface.
 
 ## What it builds
@@ -57,18 +57,18 @@ cluster's API, once per cluster. `playbooks/_layers.yml` holds the mechanics of
 both, and asserts the ordering constraints between roles so they are not
 restated as comments in every host playbook.
 
-| Group                | Roles                                                                             |
-| -------------------- | --------------------------------------------------------------------------------- |
-| Host base            | `preflight`, `base`, `wired_link`, `wifi_link`, `nut`                             |
-| Kubernetes           | `containerd`, `k3s_server`, `kubeadm_node`, `kubeadm_control_plane`, `kubeconfig` |
-| Network and storage  | `cilium`, `longhorn_node`, `longhorn`, `cert_manager`, `gateway`                  |
-| GPU                  | `nvidia_runtime`, `nvidia_device_plugin`, `llama_server` (optional)               |
-| Registry             | `registry`, `registry_mirror`                                                     |
-| Observability        | `observability`, `victoriametrics`, `uptime_kuma`                                 |
-| Network lab runtimes | `containerlab`, `clabernetes_host`, `clabernetes`                                 |
-| Automation           | `awx`, `vault`                                                                    |
-| Chat front end       | `open_webui`                                                                      |
-| Maintenance          | `rolling_patch`                                                                   |
+| Group                | Roles                                                                                              |
+| -------------------- | -------------------------------------------------------------------------------------------------- |
+| Host base            | `preflight`, `base`, `log_retention`, `wired_link`, `wifi_link`, `nut`                             |
+| Kubernetes           | `containerd`, `k3s_server`, `kubeadm_node`, `kubeadm_control_plane`, `etcd_snapshot`, `kubeconfig` |
+| Network and storage  | `cilium`, `longhorn_node`, `longhorn`, `cert_manager`, `gateway`                                   |
+| GPU                  | `nvidia_runtime`, `nvidia_device_plugin`, `llama_server` (optional)                                |
+| Registry             | `registry`, `registry_mirror`                                                                      |
+| Observability        | `observability`, `victoriametrics`, `uptime_kuma`                                                  |
+| Network lab runtimes | `containerlab`, `clabernetes_host`, `clabernetes`                                                  |
+| Automation           | `awx`, `vault`                                                                                     |
+| Chat front end       | `open_webui`                                                                                       |
+| Maintenance          | `rolling_patch`                                                                                    |
 
 ## Verification
 

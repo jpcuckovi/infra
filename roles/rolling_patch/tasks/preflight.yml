@@ -1,0 +1,67 @@
+# Run once before any node is drained: the rollout takes one etcd member down
+# at a time, which quorum survives only if the other two are healthy first.
+# Checks the whole cluster from the inventory group rather than the play's
+# hosts, so a --limit canary still refuses to start on a degraded cluster.
+---
+- name: Read every Node
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    api_version: v1
+    kind: Node
+  register: rolling_patch_nodes
+  run_once: true
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+- name: Assert every node is Ready before patching
+  ansible.builtin.assert:
+    that:
+      - rolling_patch_not_ready | length == 0
+    fail_msg: >-
+      Not Ready or missing: {{ rolling_patch_not_ready | join(', ') }}.
+      Draining another node now would leave the cluster with one healthy
+      member; bring these back first.
+    success_msg: "all {{ groups[rolling_patch_group] | length }} nodes Ready"
+  run_once: true
+  vars:
+    rolling_patch_ready: >-
+      {{ rolling_patch_nodes
+         | community.general.json_query("resources[?status.conditions[?type=='Ready' && status=='True']].metadata.name") }}
+    rolling_patch_not_ready: "{{ groups[rolling_patch_group] | difference(rolling_patch_ready) }}"
+
+# Asked of etcd through the local container, so it does not depend on the API
+# server; --cluster checks every member, not only this node's.
+- name: Ask etcd for the health of every member
+  ansible.builtin.shell: >-
+    crictl exec "$(crictl ps -q --name '^etcd$')"
+    etcdctl --endpoints=https://127.0.0.1:2379
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt
+    --cert=/etc/kubernetes/pki/etcd/server.crt
+    --key=/etc/kubernetes/pki/etcd/server.key
+    endpoint health --cluster -w json
+  register: rolling_patch_etcd_cluster
+  run_once: true
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert every etcd member is healthy before patching
+  ansible.builtin.assert:
+    that:
+      - rolling_patch_etcd_cluster.rc == 0
+      - rolling_patch_etcd_members | length == groups[rolling_patch_group] | length
+      - rolling_patch_etcd_members | rejectattr('health') | list | length == 0
+    fail_msg: >-
+      etcd reports {{ rolling_patch_etcd_members | selectattr('health') | list | length }}
+      healthy of {{ rolling_patch_etcd_members | length }} members; expected
+      {{ groups[rolling_patch_group] | length }}.
+      {{ rolling_patch_etcd_cluster.stderr | default('') }}
+
+      Quorum is 2 of 3. Rebooting a node now could leave one member and stop
+      the control plane. The runbook's etcd section covers a missing member.
+    success_msg: "all {{ rolling_patch_etcd_members | length }} etcd members healthy"
+  run_once: true
+  vars:
+    rolling_patch_etcd_members: "{{ rolling_patch_etcd_cluster.stdout | default('[]', true) | from_json }}"

@@ -9,6 +9,7 @@
 
     host_roles:
       - base
+      - log_retention
       - wired_link
       - nut
       - containerd
@@ -16,6 +17,7 @@
       - longhorn_node
       - clabernetes_host
       - kubeadm_control_plane
+      - etcd_snapshot
 
     cluster_roles:
       - cilium

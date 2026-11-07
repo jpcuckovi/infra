@@ -1,0 +1,75 @@
+# Install a nightly snapshot of the local etcd member, and take the first one
+# now so the verify gate has something to read straight after a converge.
+---
+- name: Assert the snapshot count keeps at least one
+  ansible.builtin.assert:
+    that:
+      - etcd_snapshot_keep | int >= 1
+    fail_msg: >-
+      etcd_snapshot_keep is {{ etcd_snapshot_keep }}. It must be at least 1:
+      pruning keeps the newest N, so 0 would delete the snapshot just taken
+      along with every other.
+    success_msg: "keeping {{ etcd_snapshot_keep }} snapshots"
+
+- name: Look for a local etcd static pod
+  ansible.builtin.stat:
+    path: "{{ etcd_snapshot_manifest }}"
+  register: etcd_snapshot_manifest_stat
+
+# A fact the machine reports, not a group, so a node that leaves the control
+# plane stops qualifying without an inventory edit.
+- name: Assert this host runs an etcd member
+  ansible.builtin.assert:
+    that:
+      - etcd_snapshot_manifest_stat.stat.exists
+    fail_msg: >-
+      {{ inventory_hostname }} has no {{ etcd_snapshot_manifest }}, so it runs no
+      local etcd member and the nightly snapshot would fail every night. Compose
+      etcd_snapshot only on kubeadm control-plane nodes, after
+      kubeadm_control_plane.
+    success_msg: "local etcd member present"
+
+- name: Install the etcd snapshot script
+  ansible.builtin.template:
+    src: etcd-snapshot.sh.j2
+    dest: /usr/local/bin/etcd-snapshot.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the etcd snapshot units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - etcd-snapshot.service
+    - etcd-snapshot.timer
+  notify: Restart etcd snapshot timer
+
+- name: Enable and start the etcd snapshot timer
+  ansible.builtin.systemd_service:
+    name: etcd-snapshot.timer
+    state: started
+    enabled: true
+    daemon_reload: true
+  # Under --check the units were only simulated, so there is nothing to start.
+  when: not ansible_check_mode
+
+- name: Find existing snapshots
+  ansible.builtin.find:
+    paths: "{{ etcd_snapshot_dir }}"
+    patterns: backup_*.db
+  register: etcd_snapshot_existing
+
+# Only when there are none, so a later run reports changed=0. Starting a oneshot
+# waits for it to finish, so a failure surfaces here, with the journal to read.
+- name: Take the first snapshot
+  ansible.builtin.systemd_service:
+    name: etcd-snapshot.service
+    state: started
+  when:
+    - not ansible_check_mode
+    - etcd_snapshot_existing.matched == 0

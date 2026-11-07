@@ -1,0 +1,32 @@
+# How much log history each host keeps. journald is the log store (rsyslog is
+# removed by roles/base), so its cap is the bound that matters; logrotate covers
+# the few plain files still written under /var/log.
+---
+# Disk the persistent journal may use, in journald's units (K, M, G: powers of
+# 1024). Unset, journald takes 10% of the filesystem capped at 4G, so the bound
+# would differ by disk size and nobody chose it.
+log_retention_journal_max_use: 2G
+
+# Age past which journal entries are discarded, as a systemd time span ("8week",
+# "90day"). Empty means size alone decides, which keeps the longest history the
+# cap allows.
+log_retention_journal_max_age: ""
+
+# A drop-in, so the packaged journald.conf stays untouched and upgrades never
+# prompt about it. 60- matches base's sysctl drop-in.
+log_retention_journald_dropin: /etc/systemd/journald.conf.d/60-infra.conf
+
+# Plain log files this repository's services write, one logrotate snippet each.
+# Nothing needs one today: every service here logs to the journal, and kubelet
+# rotates /var/log/pods itself. Shape:
+#   - name: myservice                  # becomes /etc/logrotate.d/infra-myservice
+#     paths: [/var/log/myservice/*.log]
+#     frequency: daily                 # daily | weekly | monthly
+#     rotate: 7                        # rotated copies kept
+#     maxsize: 100M                    # optional: also rotate early past this size
+#     copytruncate: true               # optional: for writers that never reopen
+log_retention_logrotate_files: []
+
+# Snippets this role owns carry this prefix, so it can remove its own stale ones
+# without touching the ones packages install.
+log_retention_logrotate_prefix: infra-

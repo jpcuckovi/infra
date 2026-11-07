@@ -1,0 +1,80 @@
+# Bound the journal and keep logrotate running for the plain files left.
+---
+- name: Assert the journal cap is a size journald accepts
+  ansible.builtin.assert:
+    that:
+      - log_retention_journal_max_use is match('^[0-9]+[KMGT]$')
+    fail_msg: >-
+      log_retention_journal_max_use is '{{ log_retention_journal_max_use }}'.
+      It must be a whole number with a K, M, G or T suffix, such as 2G.
+      journald ignores a value it cannot parse and keeps its default, so the
+      mistake would otherwise show only as a cap that never changed.
+    success_msg: "journal cap {{ log_retention_journal_max_use }}"
+
+# --- journald ----------------------------------------------------------------
+- name: Create the journald drop-in directory
+  ansible.builtin.file:
+    path: "{{ log_retention_journald_dropin | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Bound the journal
+  ansible.builtin.template:
+    src: journald.conf.j2
+    dest: "{{ log_retention_journald_dropin }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+# --- logrotate ---------------------------------------------------------------
+# Present on every Ubuntu install, but nothing else here depends on it, so an
+# autoremove or a minimal image could drop it unnoticed.
+- name: Install logrotate
+  ansible.builtin.apt:
+    name: logrotate
+    state: present
+
+# validate runs logrotate's own parser over the rendered snippet, so a bad entry
+# is refused here rather than breaking the nightly run on the host.
+- name: Rotate the plain log files this repository's services write
+  ansible.builtin.template:
+    src: logrotate.j2
+    dest: "/etc/logrotate.d/{{ log_retention_logrotate_prefix }}{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: logrotate --debug %s
+  loop: "{{ log_retention_logrotate_files }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Find this role's logrotate snippets
+  ansible.builtin.find:
+    paths: /etc/logrotate.d
+    patterns: "{{ log_retention_logrotate_prefix }}*"
+    file_type: file
+  register: log_retention_snippets
+
+# Reconciled, not only declared: an entry removed from the list stops rotating
+# its files only once its snippet is gone.
+- name: Remove snippets no longer declared
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ log_retention_snippets.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: >-
+    (item.path | basename | regex_replace('^' ~ log_retention_logrotate_prefix, ''))
+    not in (log_retention_logrotate_files | map(attribute='name') | list)
+
+- name: Enable the logrotate timer
+  ansible.builtin.systemd_service:
+    name: logrotate.timer
+    state: started
+    enabled: true
+  # Under --check the package may only have been simulated.
+  when: not ansible_check_mode

@@ -1,0 +1,16 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/log_retention from log_retention_logrotate_files.
+{{ item.paths | join(' ') }} {
+    {{ item.frequency | default('daily') }}
+    rotate {{ item.rotate | default(7) }}
+{% if item.maxsize is defined %}
+    maxsize {{ item.maxsize }}
+{% endif %}
+    compress
+    delaycompress
+    missingok
+    notifempty
+{% if item.copytruncate | default(false) | bool %}
+    copytruncate
+{% endif %}
+}

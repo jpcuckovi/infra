@@ -96,3 +96,25 @@
       {{ kubeadm_node_packages
          | map('regex_replace', '$', ' ' ~ kubeadm_node_expected ~ ' hold')
          | difference(kubeadm_node_dpkg.stdout_lines | default([])) }}
+
+# Proves the binary and roles/containerd's /etc/crictl.yaml together: info
+# fails unless crictl is installed and reaches the runtime's socket.
+- name: Ask containerd for its status through crictl
+  ansible.builtin.command: crictl info
+  register: kubeadm_node_crictl
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert crictl reaches containerd
+  ansible.builtin.assert:
+    that:
+      - kubeadm_node_crictl.rc == 0
+    fail_msg: >-
+      crictl info failed (rc={{ kubeadm_node_crictl.rc }}):
+      {{ kubeadm_node_crictl.msg | default('') }}
+      {{ kubeadm_node_crictl.stderr | default('') }}
+
+      No such file means cri-tools is not installed. A connection error means
+      /etc/crictl.yaml names the wrong socket; roles/containerd writes it.
+    success_msg: "crictl reaches containerd"

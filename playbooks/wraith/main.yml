@@ -10,6 +10,7 @@
     host_roles:
       - preflight
       - base
+      - log_retention
       - wifi_link
       - nut
       - registry_mirror

@@ -1,0 +1,17 @@
+# journald reads its configuration only at start. Restarting it is safe on
+# systemd 259: services' stdout streams are held in the fd store and survive.
+# Skipped under --check, where the drop-in may only be a simulated write.
+---
+- name: Restart journald
+  ansible.builtin.systemd_service:
+    name: systemd-journald.service
+    state: restarted
+  when: not ansible_check_mode
+  notify: Vacuum the journal to its cap
+
+# A lowered cap otherwise takes effect only at the next rotation, so the gate
+# would see the old size for hours. Deletes only archived files, oldest first.
+- name: Vacuum the journal to its cap
+  ansible.builtin.command: "journalctl --vacuum-size={{ log_retention_journal_max_use }}"
+  changed_when: true
+  when: not ansible_check_mode

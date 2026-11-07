@@ -1,0 +1,23 @@
+# Nightly etcd snapshots on each kubeadm control-plane node, of its local member.
+# Snapshots stay on the node that took them; nothing copies them off-cluster.
+---
+# Snapshots kept; older ones are deleted. At least 1: the newest is the one
+# just taken, so there is no "keep none".
+etcd_snapshot_keep: 7
+
+# Daily at midnight, randomized by up to one hour so the three members do not
+# snapshot at the same moment.
+etcd_snapshot_schedule: "*-*-* 00:00:00"
+etcd_snapshot_randomized_delay: "1h"
+
+# Outside /var/lib/etcd, which `kubeadm reset` empties. Root-only, because a
+# snapshot holds every Secret in the cluster in readable form.
+etcd_snapshot_dir: /root/etcd-snapshots
+
+# The verify gate's limit on the newest snapshot's age: a day, plus the
+# randomized delay, plus an hour of slack.
+etcd_snapshot_max_age_hours: 26
+
+# The static pod manifest kubeadm writes on a control-plane node. Its presence
+# is what makes a host eligible; on a worker there is no local etcd to snapshot.
+etcd_snapshot_manifest: /etc/kubernetes/manifests/etcd.yaml

@@ -23,6 +23,10 @@ containerd_config_dir: /etc/containerd
 # containerd 2.x defaults this to '', so unset every hosts.toml is silently ignored.
 containerd_registry_config_path: /etc/containerd/certs.d
 
+# containerd's default listen address; config.toml.j2 does not change it.
+containerd_socket: /run/containerd/containerd.sock
+containerd_crictl_config: /etc/crictl.yaml
+
 # The tarball carries containerd and its shims only; runc comes from apt.
 containerd_packages:
   - runc

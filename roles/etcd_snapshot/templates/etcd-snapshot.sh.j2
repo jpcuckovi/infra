@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+{{ ansible_managed | comment }}
+# Rendered by roles/etcd_snapshot.
+#
+# Takes one etcd snapshot on this control-plane node, checks it, moves it to
+# BACKUP_DIR and keeps the newest BACKUP_COUNT. Run as root by a systemd timer,
+# so nothing here needs sudo; everything it prints lands in the unit's journal.
+#
+# etcdctl and etcdutl exist only in the etcd image, so both run inside the
+# local etcd container through crictl. The container sees the host only
+# through its hostPath mounts, which is why the snapshot is written under
+# /var/lib/etcd first and moved out afterwards.
+set -euo pipefail
+
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_COUNT={{ etcd_snapshot_keep | int }}
+BACKUP_DIR="{{ etcd_snapshot_dir }}"
+# Mounted from the host at the same path, the only writable place both sides see.
+CONTAINER_DIR="/var/lib/etcd"
+WORKING="${CONTAINER_DIR}/backup_${DATE}.db"
+
+# Paths inside the container; the runbook's etcd() helper uses the same.
+CACERT="/etc/kubernetes/pki/etcd/ca.crt"
+CERT="/etc/kubernetes/pki/etcd/server.crt"
+KEY="/etc/kubernetes/pki/etcd/server.key"
+
+# Anchored at both ends, so a container merely starting with "etcd" cannot match.
+ETCD_CONTAINER_ID=$(crictl ps -q --name '^etcd$')
+if [[ -z "${ETCD_CONTAINER_ID}" ]]; then
+  echo "No running etcd container on $(hostname); nothing to snapshot." >&2
+  echo "Check: crictl ps -a --name etcd, and the kubelet journal." >&2
+  exit 1
+fi
+
+# Runs however the script ends. If the save or the check fails, set -e stops
+# the script and this removes the working copy, so nothing is left in
+# /var/lib/etcd. On success the file was already moved, so rm -f does nothing.
+trap 'rm -f "${WORKING}"' EXIT
+
+# Reads from the local member only. etcdctl writes to a .part file and renames
+# it when complete, so a failed save never leaves a file under the final name.
+echo "Saving snapshot from container ${ETCD_CONTAINER_ID:0:12}"
+crictl exec "${ETCD_CONTAINER_ID}" etcdctl \
+  --cacert="${CACERT}" --cert="${CERT}" --key="${KEY}" \
+  --endpoints=https://127.0.0.1:2379 \
+  snapshot save "${WORKING}"
+
+# etcdutl, not etcdctl: it reads the file offline, so it needs no certificates.
+# Exits non-zero on a bad file, which stops the script before the move, and the
+# trap deletes the bad file.
+crictl exec "${ETCD_CONTAINER_ID}" etcdutl snapshot status "${WORKING}" -w table
+
+install -d -m 0700 "${BACKUP_DIR}"
+
+# Only a snapshot that passed the check gets here.
+mv "${WORKING}" "${BACKUP_DIR}/"
+
+# Newest first, so everything after the first BACKUP_COUNT lines is older than
+# the ones kept. BACKUP_COUNT is at least 1, so the snapshot just taken survives.
+ls -1t "${BACKUP_DIR}"/backup_*.db | tail -n +$((BACKUP_COUNT + 1)) | xargs -r rm -f
+
+echo "Snapshot saved: ${BACKUP_DIR}/backup_${DATE}.db"
+echo "Kept, newest first:"
+ls -1t "${BACKUP_DIR}"/backup_*.db

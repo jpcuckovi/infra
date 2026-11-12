@@ -1,0 +1,27 @@
+# Prepares this cluster to run AWX job pods: a namespace, a service account
+# limited to pods in it, and a long-lived token for AWX's container group.
+# Storing the token where AWX reads it is a manual step, kept out of this
+# repository like every other secret.
+---
+- name: Apply the AWX runner namespace, identity and permissions
+  kubernetes.core.k8s:
+    context: "{{ kubeconfig_context }}"
+    state: present
+    definition: "{{ lookup('template', 'awx_runner.yaml.j2') | from_yaml_all | list }}"
+    apply: true
+
+# The Secret is declared empty, so this waits for the controller rather than
+# returning before there is a token to hand over.
+- name: Wait for the token controller to fill the token
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Secret
+    namespace: "{{ awx_runner_namespace }}"
+    name: "{{ awx_runner_token_secret }}"
+  register: awx_runner_secret
+  until: >-
+    awx_runner_secret.resources | length == 1
+    and (awx_runner_secret.resources[0].data | default({})).token is defined
+  retries: "{{ awx_runner_wait_retries }}"
+  delay: "{{ awx_runner_wait_delay }}"
+  when: not ansible_check_mode

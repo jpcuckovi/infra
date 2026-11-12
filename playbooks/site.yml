@@ -2,7 +2,11 @@
 # built before the hosts that consume it. Adding a machine is an import line
 # here plus a playbooks/<host>/ directory, never a change to a role.
 
-# phantom first: it serves the registry and metrics store every other host uses.
+# lan_dns first: every host consumes a .lan name, and every record is derived
+# from inventory and facts, so none waits on a host being built.
+- import_playbook: lan_dns/main.yml
+
+# phantom next: it serves the registry and metrics store every other host uses.
 - import_playbook: phantom/main.yml
 
 - import_playbook: revenant/main.yml

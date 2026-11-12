@@ -54,7 +54,8 @@
       It must be an A record for the VIP: a free address on the nodes' subnet,
       outside the DHCP range, that nothing but kube-vip will ever answer for,
       and not any node's own address ({{ kubeadm_control_plane_node_ips | join(', ') }}).
-      Create or fix the record at the router.
+      roles/lan_dns publishes it from kubeadm_control_plane_vip_offset; run
+      playbooks/lan_dns/main.yml.
     success_msg: "{{ kubeadm_control_plane_endpoint }} -> {{ kubeadm_control_plane_vip }}"
   vars:
     kubeadm_control_plane_node_ips: >-

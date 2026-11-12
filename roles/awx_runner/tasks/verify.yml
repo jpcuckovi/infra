@@ -1,0 +1,116 @@
+# Gates for the AWX runner. The token is used the way AWX will use it: against
+# awx_runner_api_url, trusting only the cluster CA, so a pass also proves the
+# certificate carries that name.
+---
+- name: Read the runner token Secret
+  kubernetes.core.k8s_info:
+    context: "{{ kubeconfig_context }}"
+    kind: Secret
+    namespace: "{{ awx_runner_namespace }}"
+    name: "{{ awx_runner_token_secret }}"
+  register: awx_runner_secret
+  check_mode: false
+  no_log: true
+
+- name: Assert the token has been issued
+  ansible.builtin.assert:
+    that:
+      - awx_runner_secret.resources | length == 1
+      - (awx_runner_secret.resources[0].data | default({})).token is defined
+      - (awx_runner_secret.resources[0].data | default({}))['ca.crt'] is defined
+    fail_msg: >-
+      Secret {{ awx_runner_namespace }}/{{ awx_runner_token_secret }} is missing
+      or has no token. The token controller fills it within seconds of
+      creation. Check:
+        kubectl --context {{ kubeconfig_context }} -n {{ awx_runner_namespace }} describe secret {{ awx_runner_token_secret }}
+    success_msg: "runner token issued"
+
+# The CA goes to a file because the client takes a path. Removed at the end.
+# A scratch file on the workstation, so none of the three tasks counts as a
+# change: a verify run must still report changed=0.
+- name: Create a file for the cluster CA
+  ansible.builtin.tempfile:
+    suffix: .crt
+  register: awx_runner_ca_file
+  changed_when: false
+  check_mode: false
+
+- name: Write the cluster CA
+  ansible.builtin.copy:
+    content: "{{ awx_runner_secret.resources[0].data['ca.crt'] | b64decode }}"
+    dest: "{{ awx_runner_ca_file.path }}"
+    mode: "0600"
+  changed_when: false
+  check_mode: false
+
+# Each permission AWX needs, asked as the runner itself over plain HTTPS with
+# the bearer token, as AWX presents it. A missing permission would otherwise
+# surface mid-job as an error from AWX rather than from this cluster.
+# no_log because the request headers carry the token; the assert below reports.
+- name: Ask the API what the runner token may do
+  ansible.builtin.uri:
+    url: "{{ awx_runner_api_url }}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ awx_runner_secret.resources[0].data.token | b64decode }}"
+    ca_path: "{{ awx_runner_ca_file.path }}"
+    validate_certs: true
+    body_format: json
+    body:
+      apiVersion: authorization.k8s.io/v1
+      kind: SelfSubjectAccessReview
+      spec:
+        resourceAttributes:
+          namespace: "{{ item.namespace | default(awx_runner_namespace) }}"
+          resource: "{{ item.resource }}"
+          subresource: "{{ item.subresource | default('') }}"
+          verb: "{{ item.verb }}"
+    status_code: 201
+  loop:
+    - {resource: pods, verb: create, expect: true}
+    - {resource: pods, verb: delete, expect: true}
+    - {resource: pods, subresource: log, verb: get, expect: true}
+    - {resource: pods, subresource: attach, verb: create, expect: true}
+    # Least privilege: nothing outside the namespace.
+    - {resource: pods, verb: create, namespace: kube-system, expect: false}
+  register: awx_runner_reviews
+  changed_when: false
+  # Never fails here: no_log would hide why, so the assert reports it instead.
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Remove the cluster CA file
+  ansible.builtin.file:
+    path: "{{ awx_runner_ca_file.path }}"
+    state: absent
+  changed_when: false
+  check_mode: false
+
+- name: Assert the runner can do exactly what AWX needs
+  ansible.builtin.assert:
+    that:
+      - awx_runner_wrong | length == 0
+    fail_msg: >-
+      Permissions differ from what AWX's container group needs:
+      {{ awx_runner_wrong | join('; ') }}.
+      Check the Role in roles/awx_runner/templates/awx_runner.yaml.j2 and:
+        kubectl --context {{ kubeconfig_context }} -n {{ awx_runner_namespace }} describe role {{ awx_runner_service_account }}
+    success_msg: >-
+      runner token works at {{ awx_runner_api_url }}, with pod rights in
+      {{ awx_runner_namespace }} only
+  vars:
+    awx_runner_wrong: >-
+      {%- set wrong = [] -%}
+      {%- for r in awx_runner_reviews.results -%}
+        {%- if r.status | default(-1) != 201 -%}
+          {%- set _ = wrong.append('request to ' ~ awx_runner_api_url ~ ' failed: '
+                ~ (r.msg | default('no response'))) -%}
+        {%- elif (r.json.status.allowed | default(false)) != r.item.expect -%}
+          {%- set _ = wrong.append(r.item.verb ~ ' ' ~ r.item.resource
+                ~ ('/' ~ r.item.subresource if r.item.subresource is defined else '')
+                ~ ' in ' ~ (r.item.namespace | default(awx_runner_namespace))
+                ~ (' allowed' if not r.item.expect else ' denied')) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ wrong }}

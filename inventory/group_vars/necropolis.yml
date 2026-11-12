@@ -6,8 +6,11 @@
 kubeconfig_context: necropolis
 
 # ---- control plane ---------------------------------------------------------
-# A DNS A record for the kube-vip VIP, so no address is committed.
+# A DNS A record for the kube-vip VIP. roles/lan_dns publishes it at this host
+# offset within the nodes' /24, so no address is committed; kubeadm still
+# resolves the name at run time, so the record is the one place it is read.
 kubeadm_control_plane_endpoint: necropolis.lan
+kubeadm_control_plane_vip_offset: 85
 
 # Read by both kubeadm and Cilium IPAM so they cannot disagree. Neither may
 # overlap the LAN.
@@ -67,7 +70,8 @@ lb_pools:
     last: 99
 
 # ---- gateway ---------------------------------------------------------------
-# HTTPS front door for UIs; each hostname needs a DNS record. The Longhorn UI
+# HTTPS front door for UIs; roles/lan_dns publishes each route's hostname at
+# the Gateway's address. The Longhorn UI
 # is excluded because it has no authentication and can delete volumes.
 gateway_pool: gateway
 

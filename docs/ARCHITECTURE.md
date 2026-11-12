@@ -105,6 +105,25 @@ corrects itself and needs no alias. A consumer configured once and never
 regenerated fails silently when the service moves, and only telemetry going quiet
 reveals it. That is why there is a `traces.lan` and no Prometheus alias.
 
+**Every `.lan` name is published from code.** `roles/lan_dns` writes each name
+the estate uses to the UniFi console as a DNS policy, through the
+`nightlabs.unifi` collection, and derives every value: host names from facts,
+role aliases as CNAMEs to the host a group names, and cluster names as host
+offsets, the same arithmetic as the LoadBalancer pools. The consumers' alias
+variables are read from the same map the role publishes, so an alias cannot be
+declared without its record. Two aliases had existed only as variables, with no
+record behind them, and everything reading them failed quietly. The
+one value with no source in the estate is the console's own address, which
+infra needs before any record exists; it is kept on the workstation beside the
+API key, and the role publishes it as `console.lan`. Not `unifi.lan`: the
+console answers that name itself, with its own address on the asking segment,
+so a policy for it is stored but never served. The resolution gate found that,
+where the console's own list showed the record as present.
+
+**Rejected:** DHCP reservations that set a client's Local DNS Record. The
+Network app lists them beside the DNS policies, but the Integration API does
+not return them, so they can be neither created nor verified from code.
+
 ## Two layers per target
 
 Each target runs a host layer over SSH and a cluster layer from the workstation.
@@ -295,9 +314,13 @@ moment. The value is still enforced; only the timing is deferred.
 
 **Declared only: install-time configuration.** `k3s_server_args` is passed as
 `INSTALL_K3S_EXEC` and read once, when k3s is installed. Changing it configures
-the NEXT install and has no effect on a running server. Applying it to an
-existing one means `k3s-uninstall.sh` and a rebuild, which destroys the
-datastore and every local-path volume on the node.
+the NEXT install and has no effect on a running server. What applying it to an
+existing server costs depends on the flag. A flag that changes what the cluster
+is, such as the CNI, network policy or kube-proxy, means `k3s-uninstall.sh` and
+a rebuild, which destroys the datastore and every local-path volume on the node.
+A flag that only changes how the server presents itself, such as `--tls-san`,
+is applied by rerunning the installer at the pinned version with the declared
+arguments: that rewrites the k3s unit and restarts k3s, keeping its data.
 
 That is not a gap to be closed. A repository that silently reinstalled a
 Kubernetes server because a flag in a YAML file changed would be a worse tool
@@ -307,9 +330,12 @@ how it will be built again.
 
 The consequence is honest and worth stating: a host installed before a change to
 `k3s_server_args` keeps the arguments it was installed with, and `verify.yml`
-does not detect the difference. `roles/k3s_server/tasks/verify.yml` asserts the
+does not detect most differences. `roles/k3s_server/tasks/verify.yml` asserts the
 running version against `k3s_version`, because a version mismatch means the pin
-was never applied to anything, and deliberately stops there.
+was never applied to anything. It also reads the certificate the API serves and
+asserts every `--tls-san` name is on it, because a missing name breaks every
+client that reaches the API by that name, and the fix is a restart rather than a
+rebuild. The other flags are deliberately left unchecked.
 
 ## Pins are enforced, not declared
 
@@ -595,6 +621,16 @@ low-power idle drops a packet. Bulk transfers never idle and look healthy, but
 idle interactive traffic has no duplicate acknowledgements to trigger a fast
 retransmit, so recovery waits for a backed-off timeout and sessions freeze for
 seconds at a time.
+
+**Wired links also disable PCIe ASPM L1 on the NIC's link.** revenant's Intel
+I226-V once failed to wake from L1: the kernel logged "PCIe link lost, device
+now detached", and the host stayed off the network until a reboot, while the
+switch still showed the port up at a low speed. The unit is bound to the
+network device, as the EEE one is, because a re-probed NIC comes back with the
+kernel's default ASPM policy. It applies to every wired interface and skips one
+that is not PCIe-attached, such as the Pi's, so the role needs no list of
+chipsets. The gate reads the kernel's `l1_aspm` control rather than the unit's
+state.
 
 **Wireless links disable power save.** A sleeping radio misses reassociation, and
 a host once stayed up and healthy but unreachable for hours. The gate checks the

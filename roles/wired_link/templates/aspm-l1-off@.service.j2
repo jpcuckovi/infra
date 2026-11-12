@@ -1,0 +1,32 @@
+{{ ansible_managed | comment }}
+# Rendered by roles/wired_link. Edits here are overwritten on the next run.
+#
+# A systemd TEMPLATE unit, instantiated once per wired interface, beside
+# eee-off@. It turns off PCIe ASPM L1 on the link to the NIC behind %i.
+#
+# Intel's I225 and I226 can fail to wake from L1. The kernel then logs "PCIe
+# link lost, device now detached" and the interface is gone until a reboot,
+# while the PHY can hold a low-speed link to the switch, so the port looks up.
+#
+# BindsTo and WantedBy on the .device unit, as eee-off@ does: a re-probed NIC
+# gets a fresh link with the kernel's default ASPM policy, so the write has to
+# follow the device, not only the boot.
+#
+# Unlike eee-off@, a NIC with nothing to change is not an error. Only a
+# PCIe-attached NIC has a link/l1_aspm control; a Pi's on-chip NIC has none, and
+# for it this unit succeeds without doing anything.
+
+[Unit]
+Description=Disable PCIe ASPM L1 on the link to %i
+After=sys-subsystem-net-devices-%i.device
+BindsTo=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'test -e /sys/class/net/%i/device/link/l1_aspm || exit 0; echo 0 > /sys/class/net/%i/device/link/l1_aspm'
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device
+# Also at boot, for a device already present before systemd started.
+WantedBy=multi-user.target

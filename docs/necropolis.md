@@ -39,10 +39,11 @@ in inventory/hosts.yml lists the three nodes; `kubeadm_clusters` and
 `group_vars/necropolis.yml` carries the cluster's identity. The nodes have no
 host_vars.
 
-**The VIP lives in DNS, not in the repository.** `necropolis.lan` is an A
-record for the VIP, resolved on the node at run time and asserted before use.
-The same mechanism as `registry.lan` and `metrics.lan`: no address is
-committed, and moving the VIP is a DNS edit. The API server certificate
+**The VIP is an offset, read through DNS.** `necropolis.lan` is an A record
+for the VIP, which `roles/lan_dns` publishes at `kubeadm_control_plane_vip_offset`
+within the nodes' /24. kubeadm resolves the name on the node at run time and
+asserts it before use, so the record stays the one place the address is read.
+No address is committed, and moving the VIP is a change of offset. The API server certificate
 carries `necropolis.lan` as a SAN, so kubeconfigs name the cluster rather than
 an address.
 
@@ -113,11 +114,14 @@ the necropolis nodes fail the fork test against `k3s_server`.
    will not format a disk that carries anything. A drive that shipped with an
    OS on it is cleared by hand (`wipefs -a`) before the first run.
 2. A static address per node, outside the DHCP range.
-3. Router DNS: A records for `cadaver.lan`, `spectre.lan` and `banshee.lan`.
-4. Router DNS: `necropolis.lan` → one more free address outside the DHCP range,
-   on the same subnet as the nodes, that nothing else will ever answer for.
-5. `~/.ssh/config` entries for the three hostnames, with a `User` holding
+3. `kubeadm_control_plane_vip_offset` in `group_vars/necropolis.yml` names one
+   more free address outside the DHCP range, on the same subnet as the nodes,
+   that nothing else will ever answer for.
+4. `~/.ssh/config` entries for the three hostnames, with a `User` holding
    NOPASSWD sudo.
+5. A run of `playbooks/lan_dns/main.yml`, which publishes `cadaver.lan`,
+   `spectre.lan`, `banshee.lan` and `necropolis.lan` from the nodes' facts and
+   the offset.
 
 ## Phase 1: three prepared nodes
 
@@ -285,9 +289,8 @@ workstation, against the `necropolis` context.
 
 **Done by hand before the first run:**
 
-1. Router DNS: `hubble.lan`, `awx.lan` and `vault.lan` → the `.90` address.
-   `grafana.lan` → a CNAME to `phantom.lan` (the estate's one Grafana, at
-   `:30300`).
+1. A run of `playbooks/lan_dns/main.yml`, which publishes every hostname in
+   `gateway_routes` at the gateway pool's address.
 2. After the run that creates the CA: trust it in the macOS System keychain,
    once. The playbook prints the `security add-trusted-cert` command with
    the path. Firefox keeps its own store and needs it imported separately.

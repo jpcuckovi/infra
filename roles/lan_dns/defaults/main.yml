@@ -1,0 +1,27 @@
+# Defaults for publishing the estate's .lan names as DNS policies on the UniFi
+# console, through the nightlabs.unifi collection.
+
+# The console's address and API key. Neither can live in this repository, and
+# the address cannot come from DNS, because infra needs the console before any
+# record exists. One value per file, written by hand once (docs/OPERATIONS.md).
+lan_dns_unifi_dir: "{{ lookup('env', 'HOME') }}/.local/share/infra/unifi"
+lan_dns_unifi_host_file: "{{ lan_dns_unifi_dir }}/host"
+lan_dns_unifi_api_key_file: "{{ lan_dns_unifi_dir }}/api-key"
+
+# The console's factory certificate names no host this role connects by.
+lan_dns_unifi_validate_certs: false
+lan_dns_unifi_site: default
+
+lan_dns_domain: lan
+
+# Published from the host file above, so everything else can name the console.
+# Not `unifi`: the console answers that name itself, with its own address on
+# the asking segment, so a policy for it is stored but never served.
+lan_dns_console_name: "console.{{ lan_dns_domain }}"
+
+# The Network app's Auto TTL, so a record made here matches one made by hand.
+lan_dns_ttl_seconds: 0
+
+# Where the gates resolve each name: a lab host, since lab hosts are the
+# consumers, and the workstation sits on another segment.
+lan_dns_resolver_host: "{{ groups['all'] | first }}"

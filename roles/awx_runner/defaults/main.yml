@@ -1,0 +1,19 @@
+# Where AWX runs job pods on this cluster, and the identity it runs them as. AWX
+# itself lives on necropolis and reaches this cluster's API through a container
+# group, holding only the token this role creates.
+---
+awx_runner_namespace: awx-jobs
+awx_runner_service_account: awx-runner
+
+# A service-account-token Secret: the token controller fills it, and the token
+# does not expire. AWX keeps no kubeconfig, so the credential must be long-lived.
+awx_runner_token_secret: awx-runner-token
+
+# The address AWX uses. Its name must be on the API certificate, through a
+# --tls-san entry in the host's k3s_server_args.
+awx_runner_api_url: "https://{{ inventory_hostname }}.lan:6443"
+
+# A ceiling for the token controller filling the Secret, which normally takes
+# about a second.
+awx_runner_wait_retries: 12
+awx_runner_wait_delay: 5

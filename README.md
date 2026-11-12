@@ -4,17 +4,17 @@ Ansible provisioning for a six-machine home lab: three single-node k3s hosts
 and a three-node bare-metal kubeadm cluster. Hosts are inventory entries,
 capabilities are roles, and every capability carries its own verification.
 
-There are 32 roles, and 29 of them have a `tasks/verify.yml` that checks the
+There are 33 roles, and 30 of them have a `tasks/verify.yml` that checks the
 result through the system's own interface.
 
 ## What it builds
 
-| Host                            | What it is for                                                                     | State                       |
-| ------------------------------- | ---------------------------------------------------------------------------------- | --------------------------- |
-| `phantom`                       | Container registry, observability and long-term metrics. The durable machine       | Managed                     |
-| `revenant`                      | GPU work, network labs under clabernetes, Kubernetes failure injection. Cilium CNI | Managed                     |
-| `wraith`                        | A single-node k3s running the control side of a zero-trust lab                     | Managed                     |
-| `spectre`, `cadaver`, `banshee` | `necropolis`: one kubeadm HA cluster on three identical mini PCs                   | Built and running           |
+| Host                            | What it is for                                                                     | State             |
+| ------------------------------- | ---------------------------------------------------------------------------------- | ----------------- |
+| `phantom`                       | Container registry, observability and long-term metrics. The durable machine       | Managed           |
+| `revenant`                      | GPU work, network labs under clabernetes, Kubernetes failure injection. Cilium CNI | Managed           |
+| `wraith`                        | A single-node k3s running the control side of a zero-trust lab, and AWX job pods   | Managed           |
+| `spectre`, `cadaver`, `banshee` | `necropolis`: one kubeadm HA cluster on three identical mini PCs                   | Built and running |
 
 `phantom` is built first because it is the dependency root: every other host
 pulls images through its registry and writes metrics to it. `wraith` is built
@@ -66,7 +66,7 @@ restated as comments in every host playbook.
 | Registry             | `registry`, `registry_mirror`                                                                      |
 | Observability        | `observability`, `victoriametrics`, `uptime_kuma`                                                  |
 | Network lab runtimes | `containerlab`, `clabernetes_host`, `clabernetes`                                                  |
-| Automation           | `awx`, `vault`                                                                                     |
+| Automation           | `awx`, `vault`, `awx_runner`                                                                       |
 | Chat front end       | `open_webui`                                                                                       |
 | Maintenance          | `rolling_patch`                                                                                    |
 

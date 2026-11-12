@@ -1,0 +1,73 @@
+# Gates for the estate's .lan names, at two levels: the console holds each
+# record as an enabled policy with the right value, and a lab host resolves
+# each name to the right address. The second catches what the first cannot,
+# such as a paused record or a resolver that is not the console.
+---
+- name: Settle the records
+  ansible.builtin.include_tasks: records.yml
+
+- name: List the console's DNS policies
+  nightlabs.unifi.dns_policy_info:
+    host: "{{ lan_dns_unifi_host }}"
+    api_key: "{{ lookup('ansible.builtin.file', lan_dns_unifi_api_key_file) | trim }}"
+    validate_certs: "{{ lan_dns_unifi_validate_certs }}"
+    site: "{{ lan_dns_unifi_site }}"
+  register: lan_dns_policies
+
+- name: Assert each name is an enabled policy with the right value
+  ansible.builtin.assert:
+    that:
+      - lan_dns_policy | length == 1
+      - lan_dns_policy[0].type == item.type
+      - lan_dns_policy[0][lan_dns_value_key] | default('') == item.value
+      - lan_dns_policy[0].enabled
+    fail_msg: >-
+      {{ item.domain }} should be an enabled {{ item.type }} for {{ item.value }};
+      the console has {{ lan_dns_policy | first | default('no policy') }}.
+      Run playbooks/lan_dns/main.yml.
+    quiet: true
+  vars:
+    lan_dns_policy: "{{ lan_dns_policies.policies | selectattr('domain', 'equalto', item.domain) | list }}"
+    lan_dns_value_key: "{{ 'ipv4Address' if item.type == 'A_RECORD' else 'targetDomain' }}"
+  loop: "{{ lan_dns_records }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+# getent rather than dig: it asks the host's own resolver, the path every
+# consumer on that host takes. A few retries cover a change the console has
+# stored but not yet served.
+- name: Resolve each name from a lab host
+  ansible.builtin.command: "getent ahostsv4 {{ item.domain }}"
+  register: lan_dns_getent
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  retries: 3
+  delay: 5
+  until: lan_dns_getent.rc == 0
+  delegate_to: "{{ lan_dns_resolver_host }}"
+  loop: "{{ lan_dns_records }}"
+  loop_control:
+    label: "{{ item.domain }}"
+
+# A CNAME resolves through to its target, so the expected address is the
+# target record's value.
+- name: Assert each name resolves to its address
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - lan_dns_resolved == lan_dns_expected
+    fail_msg: >-
+      {{ item.item.domain }} resolves to '{{ lan_dns_resolved }}' from
+      {{ lan_dns_resolver_host }} (getent rc={{ item.rc }}); expected
+      {{ lan_dns_expected }}.
+    success_msg: "{{ item.item.domain }} -> {{ lan_dns_resolved }}"
+  vars:
+    lan_dns_resolved: "{{ ((item.stdout_lines | first | default('')).split() + [''])[0] }}"
+    lan_dns_expected: >-
+      {{ item.item.value if item.item.type == 'A_RECORD'
+         else (lan_dns_records | selectattr('domain', 'equalto', item.item.value)
+               | map(attribute='value') | first | default('no record for ' ~ item.item.value)) }}
+  loop: "{{ lan_dns_getent.results }}"
+  loop_control:
+    label: "{{ item.item.domain }}"

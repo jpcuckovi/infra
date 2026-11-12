@@ -3,13 +3,34 @@
 
 # ---- role aliases ----------------------------------------------------------
 # CNAMEs, not host names, so a service can move without editing its consumers.
-registry_alias: registry.lan
-metrics_alias: metrics.lan
-uptime_kuma_alias: uptime.lan
+# roles/lan_dns publishes each entry as a CNAME to the first host of `target`, a
+# group or a host. The *_alias variables consumers read are taken from this map,
+# so an alias cannot be declared without its record. Moving a service is a
+# change of `target`.
+dns_aliases:
+  registry:
+    name: registry.lan
+    target: registry_hosts
+  metrics:
+    name: metrics.lan
+    target: metrics_stores
+  uptime_kuma:
+    name: uptime.lan
+    target: phantom
+  # Jaeger. An alias is needed only where nothing regenerates the reference,
+  # so there is no Prometheus alias.
+  traces:
+    name: traces.lan
+    target: phantom
+  # The estate's one Grafana. Read by people, not by any role.
+  grafana:
+    name: grafana.lan
+    target: phantom
 
-# Requires a CNAME to the host serving Jaeger. An alias is needed only where
-# nothing regenerates the reference, so there is no prometheus_alias.
-traces_alias: traces.lan
+registry_alias: "{{ dns_aliases.registry.name }}"
+metrics_alias: "{{ dns_aliases.metrics.name }}"
+uptime_kuma_alias: "{{ dns_aliases.uptime_kuma.name }}"
+traces_alias: "{{ dns_aliases.traces.name }}"
 
 # ---- published ports -------------------------------------------------------
 # Fixed rather than allocated, so bookmarks and the endpoint contract survive

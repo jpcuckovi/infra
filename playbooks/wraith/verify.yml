@@ -9,10 +9,11 @@
     host_roles:
       - base
       - log_retention
-      - wifi_link
+      - wired_link
       - nut
       - registry_mirror
       - k3s_server
 
     cluster_roles:
       - observability
+      - awx_runner

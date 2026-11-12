@@ -18,3 +18,12 @@ k3s_ready_timeout: 180
 # Derived from the install arguments so the two cannot disagree. Without flannel
 # the node stays NotReady until a CNI exists, so the install waits for registration.
 k3s_bundled_cni: "{{ '--flannel-backend=none' not in k3s_server_args }}"
+
+# Extra names the API certificate must carry, from the same arguments. verify.yml
+# checks them against the certificate actually served.
+k3s_tls_sans: >-
+  {{ k3s_server_args | select('match', '^--tls-san=')
+     | map('regex_replace', '^--tls-san=', '') | list }}
+
+# k3s's default; the kubeconfig role restates it as kubeconfig_api_port.
+k3s_api_port: 6443

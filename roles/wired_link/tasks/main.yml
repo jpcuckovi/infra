@@ -1,6 +1,8 @@
 # Disable Energy-Efficient Ethernet on every wired interface (wired_hosts only).
 # EEE wake on bcmgenet drops a packet, and in idle interactive traffic that
 # becomes a multi-second RTO stall while bulk throughput looks healthy.
+# Also disable PCIe ASPM L1 on each NIC's link, which an Intel I226 can fail to
+# wake from, detaching the NIC until a reboot.
 ---
 - name: Install the wired tools
   ansible.builtin.apt:
@@ -87,3 +89,36 @@
   when:
     - not ansible_check_mode
     - wired_link_unit is changed
+
+- name: Install the ASPM L1 suppression unit
+  ansible.builtin.template:
+    src: aspm-l1-off@.service.j2
+    dest: "{{ wired_link_aspm_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: wired_link_aspm_unit
+
+# Every wired interface, PCIe or not: the unit itself skips a NIC with no
+# link/l1_aspm control, so the role needs no knowledge of the bus.
+- name: Enable and start ASPM L1 suppression per interface
+  ansible.builtin.systemd_service:
+    name: "aspm-l1-off@{{ item }}.service"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+# systemd_service has no reenable, so this one stays a command.
+- name: Re-enable ASPM L1 suppression after the unit's install targets change  # noqa: command-instead-of-module
+  ansible.builtin.command: "systemctl reenable aspm-l1-off@{{ item }}.service"
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - wired_link_aspm_unit is changed

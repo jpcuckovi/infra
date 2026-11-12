@@ -37,8 +37,8 @@ reporting ready.
   sudoer with NOPASSWD. Ansible has no way to supply a sudo password, and a
   renamed account keeps group-based sudo while silently losing the NOPASSWD
   entry that names it
-- DNS: `phantom.lan` and the role aliases `registry.lan` and `metrics.lan`,
-  resolving to whichever host serves them
+- The UniFi console's bootstrap files, read by `playbooks/lan_dns/`, which
+  publishes every `.lan` name (see "DNS names" below)
 
 ## Running a target
 
@@ -58,6 +58,51 @@ idempotency claim the shell scripts asserted but never demonstrated.
 The other targets (`revenant`, `wraith`, `necropolis`) each have the same
 `main.yml` and `verify.yml` pair under `playbooks/`. `playbooks/site.yml` runs
 every target in dependency order.
+
+## DNS names
+
+`playbooks/lan_dns/` publishes every `.lan` name the estate uses as a DNS
+policy on the UniFi console: `<host>.lan` for each inventory host, the role
+aliases in `group_vars/all.yml`, the necropolis Gateway hostnames and VIP, and
+`console.lan` for the console itself. `site.yml` runs it first. Names it does not
+derive are left untouched.
+
+It needs the `nightlabs.unifi` collection from `requirements.yml`, and two files
+on the workstation that cannot live in the repository:
+
+| File                                   | Contents                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------ |
+| `~/.local/share/infra/unifi/host`      | The console's IP address. Not a name: `console.lan` is created from it   |
+| `~/.local/share/infra/unifi/api-key`   | A Network API key, from Settings > Control Plane > Integrations          |
+
+The key is written into its file with an editor, so it never enters shell
+history. Install the collection, then create the directory and restrict both
+files once they are written:
+
+```bash
+~/.venv/bin/ansible-galaxy collection install -r requirements.yml
+mkdir -p ~/.local/share/infra/unifi
+chmod 600 ~/.local/share/infra/unifi/host ~/.local/share/infra/unifi/api-key
+```
+
+A name set as a client's Local DNS Record in the Network app is not a policy, so
+the console refuses to create the policy beside it. Before a host's name moves
+under the playbook, clear Local DNS Record on that client, keep Fixed IP Address,
+and run the playbook straight away. The role aliases point at `phantom.lan`, so
+phantom's name is moved last and without delay.
+
+The same four commands as a target, with `--check --diff` first to show what
+would change on the console:
+
+```bash
+~/.venv/bin/ansible-playbook playbooks/lan_dns/main.yml --check --diff
+~/.venv/bin/ansible-playbook playbooks/lan_dns/main.yml
+~/.venv/bin/ansible-playbook playbooks/lan_dns/verify.yml
+~/.venv/bin/ansible-playbook playbooks/lan_dns/main.yml
+```
+
+The gates check each name twice: the console holds it as an enabled policy with
+the right value, and the first inventory host resolves it to the right address.
 
 ## Patching necropolis
 
@@ -111,8 +156,7 @@ Removal needs no model name. It frees the GPU and memory, and keeps the weights:
 ## Open WebUI on necropolis
 
 Open WebUI is part of the necropolis cluster layer, the chat front end for
-revenant's llama-server. It needs a `seance.lan` DNS record for the Gateway's
-address, like `awx.lan`. The UI is on `https://seance.lan`.
+revenant's llama-server. The UI is on `https://seance.lan`.
 
 The first account created there becomes the administrator, so create it straight
 after the first install. Open WebUI copies the llama-server URL and key into its
@@ -124,9 +168,7 @@ its models from inside the pod, so they fail while revenant or its server is dow
 
 AWX is part of the necropolis cluster layer, so `playbooks/necropolis/main.yml`
 installs it and `playbooks/necropolis/verify.yml` checks it. Before the first
-run, `awx.lan` needs a DNS record for the Gateway's address, the same address as
-`hubble.lan`, which the gateway role prints at the end of each run. The
-workstation must also trust the necropolis CA, as described in phase 3 of
+run, the workstation must trust the necropolis CA, as described in phase 3 of
 `docs/necropolis.md`.
 
 The UI and API are on `https://awx.lan`. The operator generates the `admin`
@@ -150,9 +192,8 @@ kubectl --context necropolis -n awx rollout restart deployment awx-operator-cont
 
 ## Vault on necropolis
 
-Vault is part of the necropolis cluster layer, like AWX, and needs a `vault.lan`
-DNS record for the same Gateway address before its first run. The UI and API
-are on `https://vault.lan`.
+Vault is part of the necropolis cluster layer, like AWX. The UI and API are on
+`https://vault.lan`.
 
 The first run initializes Vault and writes its unseal key and root token to
 `~/.local/share/infra/vault/necropolis/init.json`. Every later run unseals

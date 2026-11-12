@@ -1,0 +1,6 @@
+# .lan acceptance gate: every derived name is an enabled policy on the console
+# and resolves to its address from a lab host.
+
+- import_playbook: main.yml
+  vars:
+    layer_mode: verify

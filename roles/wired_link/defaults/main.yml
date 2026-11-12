@@ -10,3 +10,4 @@ wired_link_packages:
   - ethtool
 
 wired_link_unit_path: /etc/systemd/system/eee-off@.service
+wired_link_aspm_unit_path: /etc/systemd/system/aspm-l1-off@.service

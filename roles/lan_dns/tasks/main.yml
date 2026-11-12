@@ -1,0 +1,27 @@
+# Publish every name in lan_dns_records as an enabled DNS policy. dns_policy
+# finds a record by its domain, so a record that already matches is left alone
+# and the run reports changed only for what it corrected.
+#
+# Names this role does not derive are never touched: a console record outside
+# lan_dns_records (a hand-made one, or a client's Local DNS Record) stays as it is.
+---
+- name: Settle the records
+  ansible.builtin.include_tasks: records.yml
+
+# A name still set as a client's Local DNS Record is not a policy, so it is not
+# found, and the console refuses the duplicate create. Clear that checkbox first.
+- name: Publish each name as a DNS policy
+  nightlabs.unifi.dns_policy:
+    host: "{{ lan_dns_unifi_host }}"
+    api_key: "{{ lookup('ansible.builtin.file', lan_dns_unifi_api_key_file) | trim }}"
+    validate_certs: "{{ lan_dns_unifi_validate_certs }}"
+    site: "{{ lan_dns_unifi_site }}"
+    domain: "{{ item.domain }}"
+    record_type: "{{ item.type }}"
+    ipv4_address: "{{ item.value if item.type == 'A_RECORD' else omit }}"
+    target_domain: "{{ item.value if item.type == 'CNAME_RECORD' else omit }}"
+    enabled: true
+    ttl_seconds: "{{ lan_dns_ttl_seconds }}"
+  loop: "{{ lan_dns_records }}"
+  loop_control:
+    label: "{{ item.domain }} -> {{ item.value }}"

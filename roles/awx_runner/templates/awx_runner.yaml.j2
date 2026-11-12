@@ -1,0 +1,55 @@
+# The namespace AWX's container group runs job pods in, and the identity it
+# uses. The Role is namespaced: the token can manage pods here and nowhere else.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ awx_runner_namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ awx_runner_service_account }}
+  namespace: {{ awx_runner_namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ awx_runner_service_account }}
+  namespace: {{ awx_runner_namespace }}
+rules:
+  # AWX creates one pod per job, watches it, and deletes it afterwards.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Job output is streamed from the pod's log and its attached stdin/stdout.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/attach", "pods/exec"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ awx_runner_service_account }}
+  namespace: {{ awx_runner_namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ awx_runner_service_account }}
+    namespace: {{ awx_runner_namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ awx_runner_service_account }}
+---
+# Empty as declared; the token controller adds the token and the cluster CA.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ awx_runner_token_secret }}
+  namespace: {{ awx_runner_namespace }}
+  annotations:
+    kubernetes.io/service-account.name: {{ awx_runner_service_account }}
+type: kubernetes.io/service-account-token

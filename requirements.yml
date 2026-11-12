@@ -1,5 +1,5 @@
-# Collections this repository relies on. All three ship bundled in the ansible
-# package in ~/.venv; this file states the dependency for a rebuild elsewhere.
+# Collections this repository relies on. The first three ship bundled in the
+# ansible package in ~/.venv; this file states the dependency for a rebuild elsewhere.
 # A Galaxy install lands in ~/.ansible/collections, which shadows the bundled
 # copy rather than upgrading it, so `collection list` will show both.
 
@@ -14,3 +14,9 @@ collections:
 
   - name: community.general
     version: ">=13.3.0"
+
+  # UniFi DNS policies, for roles/lan_dns. Not bundled and not on Galaxy, so
+  # it installs from git into ~/.ansible/collections.
+  - name: https://github.com/nightlabs-io/ansible-collection-unifi.git
+    type: git
+    version: v0.1.0

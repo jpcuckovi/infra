@@ -6,12 +6,13 @@
   vars:
     target: wraith
 
-    # wifi_link early: Wi-Fi power save has already dropped a host mid-run.
+    # wired_link early, because a host losing its link mid-run is worse than one
+    # that never had it.
     host_roles:
       - preflight
       - base
       - log_retention
-      - wifi_link
+      - wired_link
       - nut
       - registry_mirror
       - k3s_server
@@ -19,5 +20,8 @@
 
     # No cilium: enforcement lives with the application on revenant, so k3s
     # keeps flannel and the Pi's kernel avoids an eBPF dataplane.
+    # awx_runner: AWX on necropolis runs job pods here, so a job that drains a
+    # necropolis node does not evict itself.
     cluster_roles:
       - observability
+      - awx_runner

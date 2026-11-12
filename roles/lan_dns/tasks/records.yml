@@ -1,0 +1,140 @@
+# Settles lan_dns_records, every name this role owns, from inventory and facts.
+# Included by main.yml and verify.yml, so both work from the same list.
+#
+# Four sources, none of them a committed address:
+#   console         lan_dns_console_name, from the host file on the workstation
+#   host names      <host>.lan for every inventory host, from its facts
+#   role aliases    dns_aliases (group_vars/all.yml), CNAMEs to a host name
+#   cluster names   Gateway hostnames and the control-plane VIP, as host offsets
+#                   within the cluster's /24, the same arithmetic as lb_pools
+#
+# Each record is {domain, type, value}: value is the IPv4 address of an
+# A_RECORD or the target name of a CNAME_RECORD.
+---
+- name: Check the console's bootstrap files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ lan_dns_unifi_host_file }}"
+    - "{{ lan_dns_unifi_api_key_file }}"
+  register: lan_dns_bootstrap
+
+- name: Assert the console's bootstrap files exist
+  ansible.builtin.assert:
+    that:
+      - lan_dns_bootstrap.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Missing: {{ lan_dns_bootstrap.results | rejectattr('stat.exists')
+                  | map(attribute='item') | join(', ') }}.
+
+      {{ lan_dns_unifi_host_file }} holds the console's IP address and
+      {{ lan_dns_unifi_api_key_file }} a Network API key, one value per file.
+      docs/OPERATIONS.md has the steps.
+    success_msg: "console bootstrap files present"
+
+- name: Settle the console's address
+  ansible.builtin.set_fact:
+    lan_dns_unifi_host: "{{ lookup('ansible.builtin.file', lan_dns_unifi_host_file) | trim }}"
+
+# An address, not a name: the name is one of the records this role creates.
+- name: Assert the console's address is an IPv4 address
+  ansible.builtin.assert:
+    that:
+      - lan_dns_unifi_host is match('^\d{1,3}(\.\d{1,3}){3}$')
+    fail_msg: >-
+      {{ lan_dns_unifi_host_file }} holds '{{ lan_dns_unifi_host }}'. It must be
+      the console's IPv4 address, because {{ lan_dns_console_name }} is created
+      from it and cannot reach the console before it exists.
+    quiet: true
+
+# A host missing from the gathering play (unreachable) has no facts; its record
+# would otherwise fail later with an undefined-variable error naming no host.
+- name: Assert every host's address was gathered
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].ansible_facts.default_ipv4.address is defined
+    fail_msg: >-
+      No address was gathered for {{ item }}, so its record cannot be published.
+      Check that it is reachable over SSH.
+    quiet: true
+  loop: "{{ groups['all'] }}"
+
+- name: Settle the console record
+  ansible.builtin.set_fact:
+    lan_dns_records:
+      - domain: "{{ lan_dns_console_name }}"
+        type: A_RECORD
+        value: "{{ lan_dns_unifi_host }}"
+
+- name: Settle the host records
+  ansible.builtin.set_fact:
+    lan_dns_records: >-
+      {{ lan_dns_records + [{
+           'domain': item ~ '.' ~ lan_dns_domain,
+           'type': 'A_RECORD',
+           'value': hostvars[item].ansible_facts.default_ipv4.address}] }}
+  loop: "{{ groups['all'] }}"
+
+- name: Settle the role alias records
+  ansible.builtin.set_fact:
+    lan_dns_records: >-
+      {{ lan_dns_records + [{
+           'domain': item.value.name,
+           'type': 'CNAME_RECORD',
+           'value': (groups[item.value.target] | first
+                     if item.value.target in groups else item.value.target)
+                    ~ '.' ~ lan_dns_domain}] }}
+  loop: "{{ dns_aliases | dict2items }}"
+  loop_control:
+    label: "{{ item.value.name }}"
+
+# One host speaks for each cluster: the first of its cluster_hosts, which is the
+# host itself on a single-node cluster.
+- name: Settle the clusters
+  ansible.builtin.set_fact:
+    lan_dns_clusters: >-
+      {{ groups['all'] | map('extract', hostvars, 'cluster_hosts') | map('first') | unique | list }}
+
+- name: Settle the Gateway records
+  ansible.builtin.set_fact:
+    lan_dns_records: >-
+      {{ lan_dns_records
+         + (hostvars[item].gateway_routes
+            | map(attribute='hostname')
+            | map('community.general.dict_kv', 'domain')
+            | map('combine', {'type': 'A_RECORD', 'value': lan_dns_prefix ~ '.' ~ lan_dns_gateway_offset})
+            | list) }}
+  vars:
+    lan_dns_prefix: "{{ hostvars[item].ansible_facts.default_ipv4.network.rsplit('.', 1)[0] }}"
+    lan_dns_gateway_offset: >-
+      {{ (hostvars[item].lb_pools | selectattr('name', 'equalto', hostvars[item].gateway_pool) | first).first }}
+  loop: "{{ lan_dns_clusters }}"
+  when:
+    - hostvars[item].gateway_pool is defined
+    - hostvars[item].gateway_routes | default([]) | length > 0
+
+- name: Settle the control-plane VIP records
+  ansible.builtin.set_fact:
+    lan_dns_records: >-
+      {{ lan_dns_records + [{
+           'domain': hostvars[item].kubeadm_control_plane_endpoint,
+           'type': 'A_RECORD',
+           'value': lan_dns_prefix ~ '.' ~ hostvars[item].kubeadm_control_plane_vip_offset}] }}
+  vars:
+    lan_dns_prefix: "{{ hostvars[item].ansible_facts.default_ipv4.network.rsplit('.', 1)[0] }}"
+  loop: "{{ lan_dns_clusters }}"
+  when: hostvars[item].kubeadm_control_plane_vip_offset is defined
+
+# Two sources claiming one name would make its policy flip on every run.
+- name: Assert no name is claimed twice
+  ansible.builtin.assert:
+    that:
+      - lan_dns_duplicates | length == 0
+    fail_msg: >-
+      Claimed more than once: {{ lan_dns_duplicates | join(', ') }}. A role alias,
+      Gateway hostname or VIP name must not equal another record's name.
+    success_msg: "{{ lan_dns_records | length }} names to publish"
+  vars:
+    lan_dns_duplicates: >-
+      {{ lan_dns_records | map(attribute='domain') | community.general.counter
+         | dict2items | selectattr('value', 'gt', 1) | map(attribute='key') | list }}

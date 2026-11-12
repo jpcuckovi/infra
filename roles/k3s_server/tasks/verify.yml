@@ -73,6 +73,45 @@
       {{ (k3s_nodes_raw.stdout | from_json)['items']
          | map(attribute='status.nodeInfo.kubeletVersion') | list }}
 
+# The one install argument verified against the running server: a missing name
+# is cheap to read and cheap to fix (see ARCHITECTURE.md). Reads the certificate
+# k3s serves, not the file it was meant to write.
+- name: Read the names on the served API certificate
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      openssl s_client -connect 127.0.0.1:{{ k3s_api_port }} </dev/null 2>/dev/null
+      | openssl x509 -noout -ext subjectAltName
+    executable: /bin/bash
+  register: k3s_api_cert
+  changed_when: false
+  check_mode: false
+  when: k3s_tls_sans | length > 0
+
+- name: Assert the API certificate carries every --tls-san name
+  ansible.builtin.assert:
+    that:
+      - k3s_tls_sans_missing | length == 0
+    fail_msg: >-
+      The API certificate on {{ inventory_hostname }} lacks
+      {{ k3s_tls_sans_missing | join(', ') }}, which k3s_server_args asks for. The
+      arguments apply only at install, so a host installed before a name was
+      added still serves a certificate without it.
+
+      Adding a name needs no rebuild. Rerunning the installer at the pinned
+      version with the declared arguments rewrites the k3s unit and restarts k3s,
+      keeping the datastore and every volume; the restart bounces every pod on
+      the node. On {{ inventory_hostname }}:
+
+        curl -sfL {{ k3s_install_url }} | INSTALL_K3S_VERSION='{{ k3s_version }}' INSTALL_K3S_EXEC='server {{ k3s_server_args | join(" ") }}' sh -
+
+      Certificate names now: {{ k3s_cert_dns_names | join(', ') }}
+    success_msg: "API certificate names {{ k3s_tls_sans | join(', ') }}"
+  vars:
+    k3s_cert_dns_names: "{{ k3s_api_cert.stdout | regex_findall('DNS:([^,\\s]+)') }}"
+    k3s_tls_sans_missing: "{{ k3s_tls_sans | difference(k3s_cert_dns_names) }}"
+  when: k3s_tls_sans | length > 0
+
 - name: Read the storage classes
   ansible.builtin.command: "{{ k3s_binary_path }} kubectl get storageclass -o json"
   register: k3s_sc_raw

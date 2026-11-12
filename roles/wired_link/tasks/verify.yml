@@ -67,3 +67,38 @@
       {{ wired_link_state.results
          | selectattr('stdout', 'search', '(?i)EEE status:\s*enabled')
          | map(attribute='item') | list }}
+
+# The kernel's own control, not the unit's state. A NIC with no link/l1_aspm
+# file is not PCIe-attached and has no ASPM to check, so a failed read skips it.
+- name: Read the ASPM L1 state of each interface's link
+  ansible.builtin.command: "cat /sys/class/net/{{ item }}/device/link/l1_aspm"
+  register: wired_link_aspm
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: "{{ wired_link_managed }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assert ASPM L1 is off on every PCIe-attached wired interface
+  ansible.builtin.assert:
+    that:
+      - wired_link_aspm_on | length == 0
+    fail_msg: >-
+      ASPM L1 is still enabled on the link to {{ wired_link_aspm_on | join(', ') }}.
+
+      An Intel I225 or I226 can fail to wake from L1, and the kernel logs "PCIe
+      link lost, device now detached". The interface is then gone until a
+      reboot, while the switch may still show the port up at a low speed.
+
+      Check: systemctl status aspm-l1-off@<iface>, and `lspci -vv` on the NIC
+      for "ASPM L1 Enabled" under LnkCtl.
+    success_msg: >-
+      ASPM L1 off: {{ wired_link_aspm.results | selectattr('rc', 'equalto', 0)
+      | map(attribute='item') | join(', ') or 'no PCIe-attached interfaces' }}
+  vars:
+    wired_link_aspm_on: >-
+      {{ wired_link_aspm.results
+         | selectattr('rc', 'equalto', 0)
+         | rejectattr('stdout', 'equalto', '0')
+         | map(attribute='item') | list }}

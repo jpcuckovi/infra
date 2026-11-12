@@ -2,7 +2,7 @@
 # and the decision-plane services. See playbooks/wraith/main.yml for why.
 
 # ---- link ------------------------------------------------------------------
-# Wireless only (eth0 has no carrier); roles/wifi_link discovers the interface.
+# Wired, on eth0; roles/wired_link discovers the interface. The radio is unused.
 
 # ---- containerlab ----------------------------------------------------------
 # Pins live in roles/containerlab/defaults since only that role reads them. The
@@ -25,6 +25,9 @@ observability_write_discovery_contract: false
 # ---- k3s -------------------------------------------------------------------
 # Keeps bundled flannel: headquarters enforces no policy, so Cilium would be a
 # dependency for nothing. Install-time only (see ARCHITECTURE.md).
+# --tls-san because AWX reaches this API as wraith.lan to run job pods here, and
+# k3s puts only the bare hostname and addresses on its certificate.
 k3s_server_args:
   - "--secrets-encryption"
   - "--disable=traefik"
+  - "--tls-san=wraith.lan"

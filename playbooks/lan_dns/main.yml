@@ -1,0 +1,28 @@
+# The estate's .lan names, published as DNS policies on the UniFi console.
+# Estate-wide rather than per host: every record is derived from inventory and
+# facts, so this runs once from the workstation after gathering every host's
+# address. roles/lan_dns lists the sources.
+#
+# Parameters:
+#   layer_mode  `main` to apply, `verify` to run the gates
+
+- name: Gather every host's address
+  hosts: all
+  become: false
+  gather_facts: true
+  gather_subset:
+    - network
+  tasks: []
+
+# hosts: localhost rather than connection: local on a target, so the gates can
+# delegate to a lab host over SSH.
+- name: Publish the estate's .lan names
+  hosts: localhost
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: DNS names
+      ansible.builtin.include_role:
+        name: lan_dns
+        tasks_from: "{{ layer_mode | default('main') }}"
